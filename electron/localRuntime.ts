@@ -283,17 +283,18 @@ async function startLocalRuntimeProcess(
     await stopLocalRuntimeProcess(runtimeId)
   }
 
+  const child = spawn(resolved.binaryPath, getWhisperCppLaunchArgs(resolved), {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+  })
+
   localRuntimeStates.set(runtimeId, {
     status: 'starting',
+    process: child,
     launchConfigHash: configHash,
     binaryPath: resolved.binaryPath,
     baseUrl: resolved.baseUrl,
     lastLogs: [],
-  })
-
-  const child = spawn(resolved.binaryPath, getWhisperCppLaunchArgs(resolved), {
-    stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,
   })
 
   child.stdout.on('data', (data: Buffer) => {
@@ -322,15 +323,6 @@ async function startLocalRuntimeProcess(
         ? undefined
         : formatRuntimeExitError(code, signal, latestLog),
     })
-  })
-
-  localRuntimeStates.set(runtimeId, {
-    status: 'starting',
-    process: child,
-    launchConfigHash: configHash,
-    binaryPath: resolved.binaryPath,
-    baseUrl: resolved.baseUrl,
-    lastLogs: [],
   })
 
   try {
