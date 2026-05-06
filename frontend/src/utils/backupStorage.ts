@@ -15,6 +15,31 @@ import { getDefaultSettings } from './storageShared'
 export const CURRENT_BACKUP_VERSION = '3.0'
 export const CURRENT_BACKUP_SCHEMA_VERSION = 3
 
+function mergeProviderApiKeys(
+  current?: Record<string, ProviderConfigData>,
+  incoming?: Record<string, ProviderConfigData>,
+): Record<string, ProviderConfigData> | undefined {
+  if (!incoming) return current
+  if (!current) return incoming
+
+  const merged = { ...incoming }
+  for (const [vendor, cfg] of Object.entries(current)) {
+    if (!cfg.apiKey && !cfg.appKey && !cfg.accessKey) continue
+    if (!merged[vendor]) {
+      merged[vendor] = cfg
+    } else {
+      merged[vendor] = {
+        ...merged[vendor],
+        ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}),
+        ...(cfg.appKey ? { appKey: cfg.appKey } : {}),
+        ...(cfg.accessKey ? { accessKey: cfg.accessKey } : {}),
+        ...(cfg.apiToken ? { apiToken: cfg.apiToken } : {}),
+      }
+    }
+  }
+  return merged
+}
+
 export interface BackupData {
   version: string
   schemaVersion?: number
@@ -250,9 +275,14 @@ export async function importDataOverwrite(
   }
 
   const currentSettings = getSettings()
+  const mergedProviderConfigs = mergeProviderApiKeys(
+    currentSettings.providerConfigs,
+    normalized.settings.providerConfigs,
+  )
   saveSettings({
     ...normalized.settings,
     apiKey: currentSettings.apiKey || normalized.settings.apiKey,
+    providerConfigs: mergedProviderConfigs,
   })
 
   return {
