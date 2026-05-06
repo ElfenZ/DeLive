@@ -549,6 +549,7 @@ export async function generateSessionBriefing(
         { role: 'user', content: buildUserPrompt(session, promptLanguage, config.preferCorrectedText) },
       ],
     }),
+    signal: AbortSignal.timeout(120_000),
   })
 
   if (!response.ok) {
@@ -617,6 +618,7 @@ export async function askQuestionForSession(
         },
       ],
     }),
+    signal: AbortSignal.timeout(120_000),
   })
 
   if (!response.ok) {
@@ -770,6 +772,7 @@ export async function generateSessionMindMap(
         { role: 'user', content: buildMindMapUserPrompt(session, promptLanguage, config.preferCorrectedText) },
       ],
     }),
+    signal: AbortSignal.timeout(120_000),
   })
 
   if (!response.ok) {
