@@ -66,6 +66,18 @@ function loadIconFromPath(filePath: string): NativeImage | null {
   }
 }
 
+function resizeForTray(image: NativeImage): NativeImage {
+  if (process.platform !== 'darwin') return image
+
+  const size = image.getSize()
+  if (size.width <= 22 && size.height <= 22) return image
+
+  const resized = image.resize({ width: 16, height: 16 })
+  resized.setTemplateImage(true)
+  console.log(`[Tray] macOS: resized ${size.width}x${size.height} → 16x16 template`)
+  return resized
+}
+
 function loadTrayIcon(): NativeImage {
   const candidates = getIconCandidates()
   console.log('[Tray] 尝试加载图标，候选路径:', candidates)
@@ -74,14 +86,14 @@ function loadTrayIcon(): NativeImage {
     const image = loadIconFromPath(candidate)
     if (image) {
       console.log('[Tray] 图标加载成功:', candidate)
-      return image
+      return resizeForTray(image)
     }
   }
 
   console.log('[Tray] 文件路径均不可用，使用内嵌图标')
   const fallback = nativeImage.createFromDataURL(`data:image/png;base64,${EMBEDDED_ICON_32_BASE64}`)
   if (!fallback.isEmpty()) {
-    return fallback
+    return resizeForTray(fallback)
   }
 
   console.warn('[Tray] 内嵌图标也失败，使用空图标')
