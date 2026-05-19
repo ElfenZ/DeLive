@@ -282,6 +282,7 @@ export const zh = {
     langEs: '西班牙语',
     langFr: '法语',
     langDe: '德语',
+    langVi: '越南语',
   },
 
   // 录制控制

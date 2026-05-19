@@ -284,6 +284,7 @@ export const en: Translations = {
     langEs: 'Spanish',
     langFr: 'French',
     langDe: 'German',
+    langVi: 'Vietnamese',
   },
 
   // Recording controls
