@@ -122,7 +122,7 @@ export function FileDropZone({ onFilesSelected, disabled }: FileDropZoneProps) {
       {selectedFiles.length > 0 && (
         <div className="space-y-2">
           <p className="text-xs font-medium text-muted-foreground">
-            {t.file?.selectedFiles(selectedFiles.length)}
+            {t.file?.selectedFiles?.(selectedFiles.length) ?? `${selectedFiles.length} file(s) selected`}
           </p>
           {selectedFiles.map((file, index) => (
             <div
@@ -152,7 +152,7 @@ export function FileDropZone({ onFilesSelected, disabled }: FileDropZoneProps) {
           <div className="flex items-center gap-2 rounded-lg bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
             <Info className="h-3.5 w-3.5 shrink-0" />
             <span>
-              {t.file?.totalSizeAndDuration(formatFileSize(selectedFiles.reduce((s, f) => s + f.size, 0)), estimateDuration(selectedFiles.reduce((s, f) => s + f.size, 0)))}
+              {t.file?.totalSizeAndDuration?.(formatFileSize(selectedFiles.reduce((s, f) => s + f.size, 0)), estimateDuration(selectedFiles.reduce((s, f) => s + f.size, 0)))}
             </span>
           </div>
           <button
@@ -160,7 +160,7 @@ export function FileDropZone({ onFilesSelected, disabled }: FileDropZoneProps) {
             disabled={disabled}
             className="w-full rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
           >
-            {t.file?.startTranscription(selectedFiles.length)}
+            {t.file?.startTranscription?.(selectedFiles.length) ?? `Start Transcription (${selectedFiles.length})`}
           </button>
         </div>
       )}

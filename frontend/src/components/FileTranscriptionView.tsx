@@ -271,7 +271,7 @@ export function FileTranscriptionView() {
         {!hasApiKey && (
           <div className="rounded-lg border border-amber-200 bg-amber-50 dark:border-amber-900 dark:bg-amber-950/30 p-4">
             <p className="text-sm text-amber-800 dark:text-amber-200">
-              {t.file?.apiKeyWarning(selectedProvider ? getProviderName(selectedProvider, t) : selectedProviderId) || 'Please configure API Key'}
+              {t.file?.apiKeyWarning?.(selectedProvider ? getProviderName(selectedProvider, t) : selectedProviderId) || 'Please configure API Key'}
             </p>
           </div>
         )}
