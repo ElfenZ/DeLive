@@ -227,7 +227,7 @@ describe('WindowedBatchTranscriptionProvider — single-blob split (Issue #12)',
     await flushAsyncWork()
 
     expect(finalSpy).toHaveBeenCalled()
-    const committedText = finalSpy.mock.calls.map((c: [string]) => c[0]).join('')
+    const committedText = finalSpy.mock.calls.map((c: unknown[]) => c[0] as string).join('')
     expect(committedText).toContain('hello')
     expect(committedText).toContain('world')
   })
@@ -294,7 +294,7 @@ describe('WindowedBatchTranscriptionProvider — single-blob split (Issue #12)',
     await flushAsyncWork()
 
     expect(finalSpy).toHaveBeenCalled()
-    const committed = finalSpy.mock.calls.map((c: [string]) => c[0]).join('')
+    const committed = finalSpy.mock.calls.map((c: unknown[]) => c[0] as string).join('')
     expect(committed).toBe('안녕하세요')
   })
 })
