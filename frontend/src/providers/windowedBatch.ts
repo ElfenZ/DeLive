@@ -4,6 +4,37 @@ import { HypothesisBuffer, wordsToText } from '../utils/hypothesisBuffer'
 import type { TimestampedWord } from '../utils/hypothesisBuffer'
 import { BaseASRProvider } from './base'
 
+/**
+ * Split a single-blob transcription result into individual words so that
+ * HypothesisBuffer can perform word-level diff/commit.
+ *
+ * Many batch providers (whisper.cpp, LocalOpenAI, SiliconFlow, Cloudflare)
+ * return the entire transcription as one TimestampedWord with start=0, end=0.
+ * HypothesisBuffer.flush() requires word-level granularity to detect which
+ * parts of the transcription are stable across consecutive calls. Without
+ * splitting, flush() never commits anything and all text stays as "partial",
+ * which gets replaced when the audio window rolls over — causing the user to
+ * see previously transcribed text disappear.
+ */
+function splitSingleBlobResult(words: TimestampedWord[]): TimestampedWord[] {
+  if (words.length !== 1 || (words[0].start !== 0 && words[0].end !== 0)) {
+    return words
+  }
+
+  const text = words[0].text
+  if (!text.trim()) return words
+
+  const tokens = text.match(/\S+/g)
+  if (!tokens || tokens.length <= 1) return words
+
+  const wordDuration = 0.5
+  return tokens.map((token, i) => ({
+    start: i * wordDuration,
+    end: (i + 1) * wordDuration,
+    text: token,
+  }))
+}
+
 type WindowedBatchScheduleMode = 'interval' | 'debounce'
 
 export interface TimedProviderChunk<TChunk> {
@@ -193,7 +224,8 @@ export abstract class WindowedBatchTranscriptionProvider<TChunk> extends BaseASR
       const prompt = this.committedText.length > 0
         ? this.committedText.slice(-200)
         : undefined
-      const words = await this.transcribeWindow(chunks, config, prompt)
+      const rawWords = await this.transcribeWindow(chunks, config, prompt)
+      const words = splitSingleBlobResult(rawWords)
 
       this.hypothesis.insert(words, this.bufferTimeOffsetSec)
       const committed = isFinal
