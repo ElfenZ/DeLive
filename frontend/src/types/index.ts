@@ -232,6 +232,11 @@ export interface OpenApiConfig {
   token?: string
 }
 
+export interface CaptureSettings {
+  includeMicrophone?: boolean
+  microphoneDeviceId?: string
+}
+
 export type CloudBackupProviderType = 's3' | 'webdav'
 
 export interface S3BackupConfig {
@@ -284,6 +289,8 @@ export interface AppSettings {
   aiPostProcess?: AiPostProcessConfig
   // Open API
   openApi?: OpenApiConfig
+  // Capture settings
+  capture?: CaptureSettings
   // Cloud Backup
   cloudBackup?: CloudBackupConfig
 }

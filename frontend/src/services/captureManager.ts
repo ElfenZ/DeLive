@@ -7,6 +7,12 @@ export interface CaptureCallbacks {
   onDeviceChange: () => void
 }
 
+export interface CaptureAudioOptions {
+  includeMicrophone: boolean
+  microphoneDeviceId?: string
+  onMicrophoneUnavailable?: (reason: 'microphone-unavailable' | 'audio-context-unavailable') => void
+}
+
 type CapturePipelineCapabilities = Pick<ASRProviderCapabilities, 'audioInputMode' | 'audioProfile'>
 
 function resolvePreferredMimeTypes(profile?: ASRAudioProfileCapabilities): string[] {
@@ -44,6 +50,9 @@ export class CaptureManager {
   private mediaStream: MediaStream | null = null
   private mediaRecorder: MediaRecorder | null = null
   private audioProcessor: AudioProcessor | null = null
+  private mixedAudioContext: AudioContext | null = null
+  private sourceStreams: MediaStream[] = []
+  private sourceTrackEndedCleanup: Array<() => void> = []
   private deviceChangeCleanup: (() => void) | null = null
   private callbacks: CaptureCallbacks | null = null
   private _isRestarting = false
@@ -51,10 +60,11 @@ export class CaptureManager {
   async start(
     capabilities: CapturePipelineCapabilities,
     callbacks: CaptureCallbacks,
+    audioOptions: CaptureAudioOptions,
   ): Promise<MediaStream> {
     this.callbacks = callbacks
 
-    const stream = await this.requestDisplayAudio()
+    const stream = await this.requestDisplayAudio(audioOptions)
     this.mediaStream = stream
 
     await this.startPipeline(capabilities, stream)
@@ -68,8 +78,8 @@ export class CaptureManager {
    * Returns the MediaStream without starting any recording pipeline.
    * Call startWithStream() after provider connect to begin capturing.
    */
-  async acquireStream(): Promise<MediaStream> {
-    const stream = await this.requestDisplayAudio()
+  async acquireStream(audioOptions: CaptureAudioOptions): Promise<MediaStream> {
+    const stream = await this.requestDisplayAudio(audioOptions)
     this.mediaStream = stream
     return stream
   }
@@ -94,7 +104,10 @@ export class CaptureManager {
     return this._isRestarting
   }
 
-  async restartPipeline(capabilities: CapturePipelineCapabilities): Promise<MediaStream> {
+  async restartPipeline(
+    capabilities: CapturePipelineCapabilities,
+    audioOptions: CaptureAudioOptions,
+  ): Promise<MediaStream> {
     this._isRestarting = true
 
     this.stopPipeline()
@@ -104,7 +117,7 @@ export class CaptureManager {
     await new Promise((resolve) => setTimeout(resolve, 1000))
 
     try {
-      const stream = await this.requestDisplayAudio()
+      const stream = await this.requestDisplayAudio(audioOptions)
       this.mediaStream = stream
 
       await this.startPipeline(capabilities, stream)
@@ -119,7 +132,7 @@ export class CaptureManager {
    * 仅获取新的音频流（停掉旧流），不启动 MediaRecorder/AudioProcessor。
    * 用于需要在 provider connect 之后再启动 recorder 的场景（避免 WebM 头丢失）。
    */
-  async restartStreamOnly(): Promise<MediaStream> {
+  async restartStreamOnly(audioOptions: CaptureAudioOptions): Promise<MediaStream> {
     this._isRestarting = true
 
     this.stopPipeline()
@@ -129,7 +142,7 @@ export class CaptureManager {
     await new Promise((resolve) => setTimeout(resolve, 1000))
 
     try {
-      const stream = await this.requestDisplayAudio()
+      const stream = await this.requestDisplayAudio(audioOptions)
       this.mediaStream = stream
       return stream
     } catch (error) {
@@ -210,7 +223,7 @@ export class CaptureManager {
     return this.mediaStream
   }
 
-  private async requestDisplayAudio(): Promise<MediaStream> {
+  private async requestDisplayAudio(audioOptions: CaptureAudioOptions): Promise<MediaStream> {
     console.log('[CaptureManager] Requesting screen share...')
     const displayStream = await navigator.mediaDevices.getDisplayMedia({
       video: true,
@@ -231,8 +244,9 @@ export class CaptureManager {
 
     displayStream.getVideoTracks().forEach((track) => track.stop())
 
-    const audioStream = new MediaStream(audioTracks)
-    audioTracks[0].onended = () => {
+    const systemAudioStream = new MediaStream(audioTracks)
+    const audioStream = await this.mixMicrophoneIfAvailable(systemAudioStream, audioOptions)
+    audioStream.getAudioTracks()[0].onended = () => {
       if (this._isRestarting) {
         console.log('[CaptureManager] Audio track ended (ignored: restarting)')
         return
@@ -242,6 +256,88 @@ export class CaptureManager {
     }
 
     return audioStream
+  }
+
+  private async mixMicrophoneIfAvailable(
+    systemAudioStream: MediaStream,
+    audioOptions: CaptureAudioOptions,
+  ): Promise<MediaStream> {
+    this.sourceStreams = [systemAudioStream]
+
+    if (!audioOptions.includeMicrophone) {
+      return systemAudioStream
+    }
+
+    let microphoneStream: MediaStream | null = null
+
+    try {
+      microphoneStream = await navigator.mediaDevices.getUserMedia({
+        audio: this.buildMicrophoneConstraints(audioOptions.microphoneDeviceId),
+        video: false,
+      })
+    } catch (error) {
+      console.warn('[CaptureManager] Microphone capture unavailable, using system audio only:', error)
+      audioOptions.onMicrophoneUnavailable?.('microphone-unavailable')
+      return systemAudioStream
+    }
+
+    const AudioContextCtor = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+    if (!AudioContextCtor) {
+      console.warn('[CaptureManager] AudioContext unavailable, using system audio only')
+      microphoneStream.getTracks().forEach((track) => track.stop())
+      audioOptions.onMicrophoneUnavailable?.('audio-context-unavailable')
+      return systemAudioStream
+    }
+
+    const audioContext = new AudioContextCtor()
+    const destination = audioContext.createMediaStreamDestination()
+
+    const connectStream = (stream: MediaStream, label: string): MediaStreamAudioSourceNode | null => {
+      const tracks = stream.getAudioTracks()
+      if (tracks.length === 0) return null
+      const source = audioContext.createMediaStreamSource(new MediaStream(tracks))
+      source.connect(destination)
+      console.log(`[CaptureManager] Mixed ${label} audio track count:`, tracks.length)
+      return source
+    }
+
+    const systemSource = connectStream(systemAudioStream, 'system')
+    const microphoneSource = connectStream(microphoneStream, 'microphone')
+
+    if (!systemSource || !microphoneSource) {
+      microphoneStream.getTracks().forEach((track) => track.stop())
+      void audioContext.close()
+      return systemAudioStream
+    }
+
+    this.mixedAudioContext = audioContext
+    this.sourceStreams = [systemAudioStream, microphoneStream]
+    const mixedStream = destination.stream
+
+    const stopMixedStream = () => {
+      mixedStream.getTracks().forEach((track) => track.stop())
+    }
+
+    this.registerSourceTrackEndedHandlers(
+      [...systemAudioStream.getAudioTracks(), ...microphoneStream.getAudioTracks()],
+      stopMixedStream,
+    )
+
+    return mixedStream
+  }
+
+  private buildMicrophoneConstraints(microphoneDeviceId?: string): MediaTrackConstraints {
+    const constraints: MediaTrackConstraints = {
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false,
+    }
+
+    if (microphoneDeviceId) {
+      constraints.deviceId = { exact: microphoneDeviceId }
+    }
+
+    return constraints
   }
 
   private async startPipeline(
@@ -290,10 +386,36 @@ export class CaptureManager {
   }
 
   private stopStream(): void {
+    this.clearSourceTrackEndedHandlers()
     if (this.mediaStream) {
       this.mediaStream.getTracks().forEach((track) => track.stop())
       this.mediaStream = null
     }
+    for (const stream of this.sourceStreams) {
+      stream.getTracks().forEach((track) => track.stop())
+    }
+    this.sourceStreams = []
+    if (this.mixedAudioContext) {
+      void this.mixedAudioContext.close()
+      this.mixedAudioContext = null
+    }
+  }
+
+  private registerSourceTrackEndedHandlers(tracks: MediaStreamTrack[], onEnded: () => void): void {
+    this.clearSourceTrackEndedHandlers()
+
+    this.sourceTrackEndedCleanup = tracks.map((track) => {
+      const handler = () => onEnded()
+      track.addEventListener('ended', handler)
+      return () => track.removeEventListener('ended', handler)
+    })
+  }
+
+  private clearSourceTrackEndedHandlers(): void {
+    for (const cleanup of this.sourceTrackEndedCleanup) {
+      cleanup()
+    }
+    this.sourceTrackEndedCleanup = []
   }
 
   private listenDeviceChanges(): void {
@@ -331,5 +453,6 @@ export class CaptureManager {
         track.onended = null
       }
     }
+    this.clearSourceTrackEndedHandlers()
   }
 }

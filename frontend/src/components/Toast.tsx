@@ -1,9 +1,9 @@
 import { useEffect } from 'react'
-import { AlertCircle, CheckCircle, X } from 'lucide-react'
+import { AlertCircle, AlertTriangle, CheckCircle, X } from 'lucide-react'
 
 export interface ToastMessage {
   id: string
-  type: 'success' | 'error'
+  type: 'success' | 'error' | 'warning'
   message: string
 }
 
@@ -28,18 +28,22 @@ export function Toast({ toast, onClose }: ToastProps) {
       className={`
         flex items-center gap-3 px-4 py-3 rounded-lg shadow-lg backdrop-blur-sm border
         animate-in slide-in-from-right duration-300 fade-in
-        ${toast.type === 'error' 
-          ? 'bg-destructive/10 border-destructive/20 text-destructive-foreground dark:ring-1 dark:ring-white/[0.06]' 
+        ${toast.type === 'error'
+          ? 'bg-destructive/10 border-destructive/20 text-destructive-foreground dark:ring-1 dark:ring-white/[0.06]'
+          : toast.type === 'warning'
+          ? 'bg-warning/10 border-warning/30 text-foreground dark:ring-1 dark:ring-white/[0.06]'
           : 'bg-background border-border text-foreground dark:ring-1 dark:ring-white/[0.06]'
         }
       `}
     >
       {toast.type === 'error' ? (
         <AlertCircle className="w-5 h-5 text-destructive flex-shrink-0" />
+      ) : toast.type === 'warning' ? (
+        <AlertTriangle className="w-5 h-5 text-warning flex-shrink-0" />
       ) : (
         <CheckCircle className="w-5 h-5 text-success flex-shrink-0" />
       )}
-      <span className={`text-sm font-medium flex-1 ${toast.type === 'error' ? 'text-destructive' : ''}`}>
+      <span className={`text-sm font-medium flex-1 ${toast.type === 'error' ? 'text-destructive' : toast.type === 'warning' ? 'text-warning' : ''}`}>
         {toast.message}
       </span>
       <button

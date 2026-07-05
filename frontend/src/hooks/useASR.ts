@@ -6,10 +6,11 @@
  */
 
 import { useCallback, useRef, useEffect } from 'react'
+import { useUIStore } from '../stores/uiStore'
 import { useSettingsStore } from '../stores/settingsStore'
 import { useSessionStore } from '../stores/sessionStore'
 import { useTopicStore } from '../stores/topicStore'
-import { CaptureManager } from '../services/captureManager'
+import { CaptureManager, type CaptureAudioOptions } from '../services/captureManager'
 import { CaptionBridge } from '../services/captionBridge'
 import { ProviderSessionManager } from '../services/providerSession'
 import type { ASRVendor } from '../types/asr'
@@ -17,6 +18,7 @@ import type { ProviderConfigData } from '../types'
 
 interface UseASROptions {
   onError?: (message: string) => void
+  onWarning?: (message: string) => void
   onStarted?: () => void
   onFinished?: () => void
 }
@@ -29,6 +31,8 @@ export function useASR(options: UseASROptions = {}) {
   const lastRestartTimeRef = useRef(0)
   const selectedVendorRef = useRef<ASRVendor | null>(null)
   const stopRecordingRef = useRef<() => Promise<void>>(async () => {})
+  const microphoneWarningShownRef = useRef(false)
+  const activeCaptureAudioOptionsRef = useRef<CaptureAudioOptions | null>(null)
 
   const { settings } = useSettingsStore()
   const {
@@ -37,6 +41,24 @@ export function useASR(options: UseASROptions = {}) {
     startNewSession,
     endCurrentSession,
   } = useSessionStore()
+
+  const buildCaptureAudioOptions = useCallback((): CaptureAudioOptions => {
+    const captureSettings = settings.capture || {}
+    const t = useUIStore.getState().t
+
+    return {
+      includeMicrophone: captureSettings.includeMicrophone !== false,
+      microphoneDeviceId: captureSettings.microphoneDeviceId || '',
+      onMicrophoneUnavailable: () => {
+        if (microphoneWarningShownRef.current) {
+          return
+        }
+
+        microphoneWarningShownRef.current = true
+        options.onWarning?.(t.settings.microphoneUnavailableWarning)
+      },
+    }
+  }, [options, settings.capture])
 
   // ── 停止录制 ──────────────────────────────────────
 
@@ -47,6 +69,8 @@ export function useASR(options: UseASROptions = {}) {
     captureRef.current.stop()
     await providerSessionRef.current.disconnect()
     captionRef.current.clear()
+    microphoneWarningShownRef.current = false
+    activeCaptureAudioOptionsRef.current = null
 
     selectedVendorRef.current = null
     endCurrentSession()
@@ -138,13 +162,16 @@ export function useASR(options: UseASROptions = {}) {
       const setup = psm.resolveSetup(vendorId, settings)
       const needReconnect = setup.captureRestartStrategy === 'reconnect-session'
       const capture = captureRef.current
+      const audioOptions = activeCaptureAudioOptionsRef.current || buildCaptureAudioOptions()
+
+      await window.electronAPI?.prepareSourceCapture?.('reuse-if-available')
 
       if (needReconnect) {
         // WebM 流 provider（Soniox）：必须先获取新 stream，再 connect，最后启动 recorder
         // 确保新 WebSocket 接收到完整的 WebM 文件头
         await psm.disconnect()
 
-        const stream = await capture.restartStreamOnly()
+        const stream = await capture.restartStreamOnly(audioOptions)
 
         await psm.connect(vendorId, setup.connectConfig, buildProviderCallbacks())
 
@@ -159,6 +186,7 @@ export function useASR(options: UseASROptions = {}) {
       } else {
         const stream = await capture.restartPipeline(
           setup.providerInfo.capabilities,
+          audioOptions,
         )
 
         if (!psm.currentProvider) {
@@ -179,12 +207,14 @@ export function useASR(options: UseASROptions = {}) {
       captureRef.current.stop()
       await providerSessionRef.current.disconnect()
       endCurrentSession()
+      activeCaptureAudioOptionsRef.current = null
+      microphoneWarningShownRef.current = false
       setRecordingState('idle')
       options.onError?.('音频设备切换后重新捕获失败，录制已停止')
     } finally {
       isRestartingRef.current = false
     }
-  }, [settings, buildProviderCallbacks, endCurrentSession, setRecordingState, options])
+  }, [settings, buildCaptureAudioOptions, buildProviderCallbacks, endCurrentSession, setRecordingState, options])
 
   // ── 开始录制 ──────────────────────────────────────
 
@@ -206,13 +236,16 @@ export function useASR(options: UseASROptions = {}) {
     )
 
     const capture = captureRef.current
+    const audioOptions = buildCaptureAudioOptions()
+    activeCaptureAudioOptionsRef.current = audioOptions
 
     // Phase 1: Show source picker dialog BEFORE connecting to provider.
     // This prevents realtime providers (e.g. Volc) from timing out while the
     // user is choosing a desktop source.
     try {
       setRecordingState('starting')
-      await capture.acquireStream()
+      await window.electronAPI?.prepareSourceCapture?.('prompt')
+      await capture.acquireStream(audioOptions)
     } catch (error) {
       setRecordingState('idle')
       if (error instanceof Error) {
@@ -222,6 +255,7 @@ export function useASR(options: UseASROptions = {}) {
       } else {
         options.onError?.('获取音频源失败')
       }
+      activeCaptureAudioOptionsRef.current = null
       return
     }
 
@@ -273,12 +307,14 @@ export function useASR(options: UseASROptions = {}) {
       } else {
         options.onError?.('启动录制失败')
       }
+      activeCaptureAudioOptionsRef.current = null
     }
   }, [
     settings,
     setRecordingState,
     startNewSession,
     options,
+    buildCaptureAudioOptions,
     buildProviderCallbacks,
     restartCapture,
   ])
@@ -334,6 +370,8 @@ export function useASR(options: UseASROptions = {}) {
         captureRef.current.stop()
         await providerSessionRef.current.disconnect()
         endCurrentSession()
+        activeCaptureAudioOptionsRef.current = null
+        microphoneWarningShownRef.current = false
         setRecordingState('idle')
         options.onError?.('配置切换失败且无法恢复，录制已停止')
       }
@@ -395,6 +433,8 @@ export function useASR(options: UseASROptions = {}) {
         captureRef.current.stop()
         await providerSessionRef.current.disconnect()
         endCurrentSession()
+        activeCaptureAudioOptionsRef.current = null
+        microphoneWarningShownRef.current = false
         setRecordingState('idle')
         options.onError?.('Provider 切换失败且无法恢复，录制已停止')
       }

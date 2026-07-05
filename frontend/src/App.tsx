@@ -65,7 +65,7 @@ function App() {
   }, [recordingState])
 
   // Toast 管理
-  const addToast = useCallback((type: 'success' | 'error', message: string) => {
+  const addToast = useCallback((type: 'success' | 'error' | 'warning', message: string) => {
     const id = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
     setToasts((prev) => [...prev, { id, type, message }])
   }, [])
@@ -83,6 +83,7 @@ function App() {
   // ASR — lifted to App so global shortcut can reach it
   const { startRecording, stopRecording, switchConfig, switchProvider, getMediaStream } = useASR({
     onError: handleError,
+    onWarning: (message) => addToast('warning', message),
     onStarted: () => console.log('[App] Recording started'),
   })
 

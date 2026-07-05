@@ -42,6 +42,7 @@ const electronAPI: ElectronAPI = {
     ipcRenderer.invoke('local-runtime-stop', runtimeId, options),
 
   getDesktopSources: () => ipcRenderer.invoke('get-desktop-sources'),
+  prepareSourceCapture: (mode) => ipcRenderer.invoke('prepare-source-capture', mode),
   selectSource: (sourceId: string) => ipcRenderer.invoke('select-source', sourceId),
   cancelSourceSelection: () => ipcRenderer.invoke('cancel-source-selection'),
   onShowSourcePicker: (callback: () => void) => {

@@ -6,6 +6,8 @@ export interface DesktopSource {
   isScreen: boolean
 }
 
+export type SourceSelectionMode = 'prompt' | 'reuse-if-available'
+
 export interface UpdateInfo {
   version: string
   releaseDate?: string
@@ -276,6 +278,7 @@ export interface ElectronAPI {
   localRuntimeStart: (runtimeId: string, options?: LocalRuntimeLaunchOptions) => Promise<RuntimeCommandResult>
   localRuntimeStop: (runtimeId: string, options?: LocalRuntimeLaunchOptions) => Promise<RuntimeCommandResult>
   getDesktopSources: () => Promise<DesktopSource[]>
+  prepareSourceCapture: (mode: SourceSelectionMode) => Promise<void>
   selectSource: (sourceId: string) => Promise<boolean>
   cancelSourceSelection: () => Promise<void>
   onShowSourcePicker: (callback: () => void) => () => void

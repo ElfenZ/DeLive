@@ -150,6 +150,10 @@ export function getDefaultSettings(): AppSettings {
   return {
     apiKey: '',
     languageHints: ['zh', 'en'],
+    capture: {
+      includeMicrophone: true,
+      microphoneDeviceId: '',
+    },
     captionStyle: DEFAULT_CAPTION_STYLE,
     aiPostProcess: {
       enabled: false,

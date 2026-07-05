@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
-import { Settings, Check, Volume2, Palette, Bot, Globe, Cloud, HardDrive, Info, Subtitles } from 'lucide-react'
+import { Settings, Check, Volume2, Palette, Bot, Globe, Cloud, HardDrive, Info, Mic, Subtitles } from 'lucide-react'
 import { Button } from './ui'
 import { useUIStore } from '../stores/uiStore'
 import { useSettingsStore } from '../stores/settingsStore'
@@ -21,6 +21,7 @@ import { CloudBackupPanel } from './settings/CloudBackupPanel'
 import { DataManagementPanel } from './settings/DataManagementPanel'
 import { AboutPanel } from './settings/AboutPanel'
 import { CaptionSettingsPanel } from './settings/CaptionSettingsPanel'
+import { CaptureSettingsPanel } from './settings/CaptureSettingsPanel'
 import { ActionDialog } from './ActionDialog'
 import type { ASRProviderInfo, ProviderConfigData } from '../types'
 import { getMissingRequiredConfigLabels } from '../utils/providerConfig'
@@ -33,7 +34,7 @@ import {
 import { testProviderConfig } from '../utils/providerConfigTest'
 import { getDefaultSettings } from '../utils/storageShared'
 
-type SettingsGroup = 'provider' | 'appearance' | 'caption' | 'aiPostProcess' | 'openApi' | 'cloudBackup' | 'dataManagement' | 'about'
+type SettingsGroup = 'provider' | 'capture' | 'appearance' | 'caption' | 'aiPostProcess' | 'openApi' | 'cloudBackup' | 'dataManagement' | 'about'
 
 interface ApiKeyConfigProps {
   isOpen: boolean
@@ -44,6 +45,7 @@ interface ApiKeyConfigProps {
 
 const NAV_ITEMS: { id: SettingsGroup; icon: typeof Settings; labelKey: string }[] = [
   { id: 'provider', icon: Volume2, labelKey: 'groupProvider' },
+  { id: 'capture', icon: Mic, labelKey: 'groupCapture' },
   { id: 'appearance', icon: Palette, labelKey: 'groupAppearance' },
   { id: 'caption', icon: Subtitles, labelKey: 'groupCaption' },
   { id: 'aiPostProcess', icon: Bot, labelKey: 'groupAi' },
@@ -393,6 +395,14 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
                 setLanguage={setLanguage}
                 colorTheme={colorTheme}
                 setColorTheme={setColorTheme}
+              />
+            )}
+
+            {activeGroup === 'capture' && (
+              <CaptureSettingsPanel
+                t={t}
+                captureSettings={settings.capture || getDefaultSettings().capture || { includeMicrophone: true, microphoneDeviceId: '' }}
+                updateCaptureSettings={(capture) => updateSettings({ capture })}
               />
             )}
 

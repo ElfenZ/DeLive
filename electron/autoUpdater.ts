@@ -1,9 +1,6 @@
 import { dialog, type BrowserWindow } from 'electron'
-import { autoUpdater } from 'electron-updater'
 import { getElectronStrings } from './i18n'
-
-autoUpdater.autoDownload = false
-autoUpdater.autoInstallOnAppQuit = true
+import { getAutoUpdater, isMissingAppUpdateConfigError } from './updaterSupport'
 
 interface SetupAutoUpdaterOptions {
   getMainWindow: () => BrowserWindow | null
@@ -11,10 +8,15 @@ interface SetupAutoUpdaterOptions {
 }
 
 export function setupAutoUpdater(options: SetupAutoUpdaterOptions): void {
+  const autoUpdater = getAutoUpdater()
+  autoUpdater.autoDownload = false
+  autoUpdater.autoInstallOnAppQuit = true
+
   autoUpdater.on('error', (error) => {
     console.error('Auto-update error:', error)
 
     const isNoReleaseError =
+      isMissingAppUpdateConfigError(error) ||
       error.message.includes('404') ||
       /latest(?:-[a-z]+)?\.yml/i.test(error.message)
 

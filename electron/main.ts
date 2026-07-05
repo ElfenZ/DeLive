@@ -18,6 +18,7 @@ import { registerApiIpc } from './apiIpc'
 import { attachApiServer } from './apiServer'
 import { registerCloudBackupIpc } from './cloudBackup/cloudBackupIpc'
 import { refreshElectronLang, getElectronStrings } from './i18n'
+import { isAutoUpdateSupported } from './updaterSupport'
 
 installLogInterceptor()
 
@@ -50,11 +51,6 @@ const desktopSourceController = createDesktopSourceController({
 })
 
 const localRuntimeController = createLocalRuntimeController()
-
-function isAutoUpdateSupported(): boolean {
-  if (process.platform !== 'linux') return true
-  return Boolean(process.env.APPIMAGE)
-}
 
 function isTrayReady(): boolean {
   return tray !== null && !tray.isDestroyed()

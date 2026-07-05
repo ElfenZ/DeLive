@@ -1,6 +1,6 @@
-import { autoUpdater } from 'electron-updater'
 import type { BrowserWindow, IpcMain } from 'electron'
 import { assertTrustedSender } from './ipcSecurity'
+import { getAutoUpdater, isMissingAppUpdateConfigError } from './updaterSupport'
 
 interface RegisterUpdaterIpcOptions {
   ipcMain: IpcMain
@@ -19,6 +19,7 @@ export function registerUpdaterIpc(options: RegisterUpdaterIpcOptions): void {
       return { error: '当前安装方式不支持自动更新（Linux 仅 AppImage 支持）' }
     }
     try {
+      const autoUpdater = getAutoUpdater()
       const result = await autoUpdater.checkForUpdates()
       return {
         success: true,
@@ -26,6 +27,9 @@ export function registerUpdaterIpc(options: RegisterUpdaterIpcOptions): void {
       }
     } catch (error) {
       console.error('检查更新失败:', error)
+      if (isMissingAppUpdateConfigError(error)) {
+        return { error: '当前安装方式不支持自动更新' }
+      }
       return {
         error: error instanceof Error ? error.message : '检查更新失败',
       }
@@ -41,10 +45,14 @@ export function registerUpdaterIpc(options: RegisterUpdaterIpcOptions): void {
       return { error: '当前安装方式不支持自动更新（Linux 仅 AppImage 支持）' }
     }
     try {
+      const autoUpdater = getAutoUpdater()
       await autoUpdater.downloadUpdate()
       return { success: true }
     } catch (error) {
       console.error('下载更新失败:', error)
+      if (isMissingAppUpdateConfigError(error)) {
+        return { error: '当前安装方式不支持自动更新' }
+      }
       return {
         error: error instanceof Error ? error.message : '下载更新失败',
       }
@@ -61,6 +69,7 @@ export function registerUpdaterIpc(options: RegisterUpdaterIpcOptions): void {
       return
     }
     options.markQuitting()
+    const autoUpdater = getAutoUpdater()
     autoUpdater.quitAndInstall(false, true)
   })
 }

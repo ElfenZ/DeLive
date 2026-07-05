@@ -49,6 +49,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     languageHints: ['zh', 'en'],
     currentVendor: 'soniox',
     providerConfigs: {},
+    capture: getDefaultSettings().capture,
     captionStyle: defaultCaptionStyle,
     aiPostProcess: getDefaultSettings().aiPostProcess,
   },
@@ -85,6 +86,10 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       openApi: {
         ...defaultSettings.openApi,
         ...(settings.openApi || {}),
+      },
+      capture: {
+        ...defaultSettings.capture,
+        ...(settings.capture || {}),
       },
       cloudBackup: {
         ...defaultSettings.cloudBackup,

@@ -1,4 +1,5 @@
 import { desktopCapturer, session, type BrowserWindow, type IpcMain } from 'electron'
+import type { SourceSelectionMode } from '../shared/electronApi'
 
 // Electron 的 display media callback 类型在这里不稳定，沿用主进程旧实现的宽类型。
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -11,30 +12,73 @@ interface DesktopSourceControllerOptions {
 export function createDesktopSourceController(options: DesktopSourceControllerOptions) {
   let pendingDisplayMediaCallback: DisplayMediaCallback | null = null
   let lastSelectedSourceId: string | null = null
+  let sourceSelectionMode: SourceSelectionMode = 'prompt'
+
+  function resetSourceSelectionMode(): void {
+    sourceSelectionMode = 'prompt'
+  }
+
+  function resolvePendingCallback(result: unknown): void {
+    const callback = pendingDisplayMediaCallback
+    pendingDisplayMediaCallback = null
+    resetSourceSelectionMode()
+    callback?.(result)
+  }
+
+  async function tryReuseLastSource(callback: DisplayMediaCallback): Promise<boolean> {
+    if (!lastSelectedSourceId) {
+      return false
+    }
+
+    try {
+      const sources = await desktopCapturer.getSources({ types: ['screen', 'window'] })
+      const savedSource = sources.find((source) => source.id === lastSelectedSourceId)
+
+      if (!savedSource) {
+        console.log('[DisplayMedia] 上次选择的源已不可用，回退到选择器')
+        return false
+      }
+
+      console.log('[DisplayMedia] 自动复用上次选择的源:', lastSelectedSourceId)
+      resetSourceSelectionMode()
+      callback({ video: savedSource, audio: 'loopback' as const })
+      return true
+    } catch (error) {
+      console.error('[DisplayMedia] 自动复用源失败:', error)
+      return false
+    }
+  }
+
+  function promptForSourceSelection(callback: DisplayMediaCallback): void {
+    pendingDisplayMediaCallback = callback
+
+    const mainWindow = options.getMainWindow()
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      console.warn('[DisplayMedia] 主窗口不可用，取消本次源选择')
+      resolvePendingCallback({})
+      return
+    }
+
+    mainWindow.webContents.send('show-source-picker')
+  }
 
   function attachDisplayMediaHandler(): void {
     session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
-      if (lastSelectedSourceId) {
-        try {
-          const sources = await desktopCapturer.getSources({ types: ['screen', 'window'] })
-          const savedSource = sources.find((source) => source.id === lastSelectedSourceId)
-          if (savedSource) {
-            console.log('[DisplayMedia] 自动复用上次选择的源:', lastSelectedSourceId)
-            callback({ video: savedSource, audio: 'loopback' as const })
-            return
-          }
-          console.log('[DisplayMedia] 上次选择的源已不可用，显示选择器')
-        } catch (error) {
-          console.error('[DisplayMedia] 自动复用源失败:', error)
-        }
+      if (pendingDisplayMediaCallback) {
+        console.warn('[DisplayMedia] 收到新的 capture 请求，取消旧的待处理 callback')
+        resolvePendingCallback({})
       }
 
-      pendingDisplayMediaCallback = callback
-      const mainWindow = options.getMainWindow()
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('show-source-picker')
+      if (sourceSelectionMode === 'reuse-if-available' && await tryReuseLastSource(callback)) {
+        return
       }
+
+      promptForSourceSelection(callback)
     })
+  }
+
+  function prepareSourceCapture(mode: SourceSelectionMode): void {
+    sourceSelectionMode = mode
   }
 
   async function selectSource(sourceId: string): Promise<boolean> {
@@ -46,26 +90,22 @@ export function createDesktopSourceController(options: DesktopSourceControllerOp
 
       if (selectedSource) {
         lastSelectedSourceId = sourceId
-        pendingDisplayMediaCallback({ video: selectedSource, audio: 'loopback' as const })
-        pendingDisplayMediaCallback = null
+        resolvePendingCallback({ video: selectedSource, audio: 'loopback' as const })
         return true
       }
 
-      pendingDisplayMediaCallback({})
-      pendingDisplayMediaCallback = null
+      resolvePendingCallback({})
       return false
     } catch (error) {
       console.error('选择源失败:', error)
-      pendingDisplayMediaCallback?.({})
-      pendingDisplayMediaCallback = null
+      resolvePendingCallback({})
       return false
     }
   }
 
   function cancelSourceSelection(): void {
     if (pendingDisplayMediaCallback) {
-      pendingDisplayMediaCallback({})
-      pendingDisplayMediaCallback = null
+      resolvePendingCallback({})
     }
   }
 
@@ -87,6 +127,7 @@ export function createDesktopSourceController(options: DesktopSourceControllerOp
 
   return {
     attachDisplayMediaHandler,
+    prepareSourceCapture,
     selectSource,
     cancelSourceSelection,
     listDesktopSources,
@@ -99,6 +140,11 @@ interface RegisterDesktopSourceIpcOptions {
 }
 
 export function registerDesktopSourceIpc({ ipcMain, controller }: RegisterDesktopSourceIpcOptions): void {
+  ipcMain.removeHandler('prepare-source-capture')
+  ipcMain.handle('prepare-source-capture', (_event, mode: SourceSelectionMode) => {
+    controller.prepareSourceCapture(mode)
+  })
+
   ipcMain.removeHandler('select-source')
   ipcMain.handle('select-source', async (_event, sourceId: string) => {
     return controller.selectSource(sourceId)
