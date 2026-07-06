@@ -48,7 +48,7 @@ export function CommandPalette() {
     cmd.action()
     setOpen(false)
     setQuery('')
-  }, [])
+  }, [setOpen])
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -64,7 +64,7 @@ export function CommandPalette() {
     }
     document.addEventListener('keydown', handler)
     return () => document.removeEventListener('keydown', handler)
-  }, [open])
+  }, [open, setOpen])
 
   useEffect(() => {
     if (open) {

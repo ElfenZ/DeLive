@@ -146,11 +146,17 @@ export interface TranscriptPostProcess {
 }
 
 export interface TranscriptSourceMeta {
-  captureMode?: 'system-audio' | 'file' | 'mixed' | 'unknown'
+  captureMode?: 'system-audio' | 'microphone' | 'file' | 'mixed' | 'unknown'
   sourceId?: string
   sourceLabel?: string
   platform?: 'win32' | 'darwin' | 'linux' | 'unknown'
   providerMode?: 'realtime' | 'full-session-retranscription' | 'local-runtime' | 'unknown'
+  sourceKind?: 'recording-audio' | 'uploaded-audio'
+  audioPath?: string
+  audioMimeType?: string
+  audioFileName?: string
+  audioSize?: number
+  captureAudioSource?: 'system' | 'microphone' | 'mixed'
 }
 
 export type TranscriptSessionStatus = 'recording' | 'interrupted' | 'completed'
@@ -208,6 +214,14 @@ export interface ProviderConfigData {
 
 export type AiFeatureKey = 'briefing' | 'chat' | 'mindmap' | 'correction'
 
+export interface AiGlossaryEntry {
+  id: string
+  source: string
+  target: string
+  note?: string
+  enabled?: boolean
+}
+
 export interface AiPostProcessConfig {
   enabled?: boolean
   provider?: 'openai-compatible'
@@ -225,6 +239,8 @@ export interface AiPostProcessConfig {
   correctionMode?: 'quick' | 'review'
   preferCorrectedText?: 'auto' | 'original' | 'corrected'
   enableStreaming?: boolean
+  glossary?: AiGlossaryEntry[]
+  autoCorrectionDetection?: boolean
 }
 
 export interface OpenApiConfig {

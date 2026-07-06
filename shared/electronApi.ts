@@ -255,6 +255,53 @@ export interface CloudBackupIpcFileInfo {
   size: number
 }
 
+export interface RecordingArchiveSaveRequest {
+  sessionId: string
+  fileName: string
+  mimeType: string
+  data: ArrayBuffer
+}
+
+export interface RecordingArchiveSaveResult {
+  ok: boolean
+  sessionId?: string
+  path?: string
+  size?: number
+  mimeType?: string
+  fileName?: string
+  error?: string
+}
+
+export interface RecordingArchiveBeginRequest {
+  sessionId: string
+  sampleRate: number
+  channels: number
+  bitsPerSample: number
+}
+
+export interface RecordingArchiveAppendRequest {
+  sessionId: string
+  data: ArrayBuffer
+}
+
+export interface RecordingArchiveFinalizeRequest {
+  sessionId: string
+  fileName?: string
+}
+
+export interface RecordingArchiveRecoverySkippedItem {
+  sessionId: string
+  reason: 'missing-pcm' | 'missing-metadata' | 'empty-audio' | 'finalize-failed'
+  error?: string
+}
+
+export interface RecordingArchiveRecoverResult {
+  ok: boolean
+  recovered: RecordingArchiveSaveResult[]
+  skipped?: RecordingArchiveRecoverySkippedItem[]
+  error?: string
+}
+
 // ─── Core types ───
 
 export interface ElectronAPI {
@@ -268,6 +315,12 @@ export interface ElectronAPI {
   setAutoLaunch: (enable: boolean) => Promise<boolean>
   pickFilePath: (options?: FilePickerOptions) => Promise<string | null>
   pathExists: (targetPath: string) => Promise<boolean>
+  saveRecordingArchive: (request: RecordingArchiveSaveRequest) => Promise<RecordingArchiveSaveResult>
+  beginRecordingArchive: (request: RecordingArchiveBeginRequest) => Promise<RecordingArchiveSaveResult>
+  appendRecordingArchive: (request: RecordingArchiveAppendRequest) => Promise<RecordingArchiveSaveResult>
+  finalizeRecordingArchive: (request: RecordingArchiveFinalizeRequest) => Promise<RecordingArchiveSaveResult>
+  recoverRecordingArchives: () => Promise<RecordingArchiveRecoverResult>
+  revealRecordingArchive: (targetPath: string) => Promise<{ ok: boolean; error?: string }>
   localRuntimeGetStatus: (runtimeId: string, options?: LocalRuntimeLaunchOptions) => Promise<LocalRuntimeSnapshot>
   localRuntimeOpenModelsPath: (runtimeId: string) => Promise<PathOperationResult>
   localRuntimeListModels: (runtimeId: string) => Promise<string[]>

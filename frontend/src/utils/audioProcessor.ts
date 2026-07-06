@@ -8,6 +8,7 @@
 export interface AudioProcessorConfig {
   sampleRate?: number
   channels?: number
+  muted?: boolean
 }
 
 export class AudioProcessor {
@@ -15,11 +16,14 @@ export class AudioProcessor {
   private sourceNode: MediaStreamAudioSourceNode | null = null
   private workletNode: AudioWorkletNode | null = null
   private legacyProcessorNode: ScriptProcessorNode | null = null
+  private outputGainNode: GainNode | null = null
   private targetSampleRate: number
+  private muted: boolean
   private onAudioData: ((pcmData: ArrayBuffer) => void) | null = null
 
   constructor(config: AudioProcessorConfig = {}) {
     this.targetSampleRate = config.sampleRate || 16000
+    this.muted = config.muted === true
   }
 
   async start(
@@ -61,6 +65,11 @@ export class AudioProcessor {
       this.legacyProcessorNode = null
     }
 
+    if (this.outputGainNode) {
+      this.outputGainNode.disconnect()
+      this.outputGainNode = null
+    }
+
     if (this.sourceNode) {
       this.sourceNode.disconnect()
       this.sourceNode = null
@@ -93,7 +102,7 @@ export class AudioProcessor {
     }
 
     this.sourceNode!.connect(this.workletNode)
-    this.workletNode.connect(ctx.destination)
+    this.connectProcessorOutput(ctx, this.workletNode)
     console.log('[AudioProcessor] 已启动（AudioWorklet）')
   }
 
@@ -121,8 +130,24 @@ export class AudioProcessor {
     }
 
     this.sourceNode!.connect(this.legacyProcessorNode)
-    this.legacyProcessorNode.connect(ctx.destination)
+    this.connectProcessorOutput(ctx, this.legacyProcessorNode)
     console.log('[AudioProcessor] 已启动（ScriptProcessorNode 回退模式）')
+  }
+
+  private connectProcessorOutput(
+    ctx: AudioContext,
+    node: AudioWorkletNode | ScriptProcessorNode,
+  ): void {
+    if (!this.muted) {
+      node.connect(ctx.destination)
+      return
+    }
+
+    const gainNode = ctx.createGain()
+    gainNode.gain.value = 0
+    node.connect(gainNode)
+    gainNode.connect(ctx.destination)
+    this.outputGainNode = gainNode
   }
 
   // ── 共享工具方法（回退路径使用）──────────────────────

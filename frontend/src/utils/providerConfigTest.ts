@@ -9,6 +9,7 @@ import { ASSEMBLYAI_DEFAULT_MODEL } from '../types/asr/vendors/assemblyai'
 import { ELEVENLABS_DEFAULT_MODEL } from '../types/asr/vendors/elevenlabs'
 import { GLADIA_DEFAULT_MODEL } from '../types/asr/vendors/gladia'
 import { CLOUDFLARE_DEFAULT_MODEL } from '../types/asr/vendors/cloudflare'
+import { SONIOX_DEFAULT_MODEL } from '../types/asr/vendors/soniox'
 import { transcribeSiliconFlowAudio } from './siliconflow'
 
 type ProviderConfigTester = (config: ProviderConfigData) => Promise<void>
@@ -59,7 +60,7 @@ const providerConfigTesters: Partial<Record<ASRVendor, ProviderConfigTester>> = 
       ws.onopen = () => {
         ws.send(JSON.stringify({
           api_key: apiKey,
-          model: typeof config.model === 'string' && config.model.trim() ? config.model.trim() : 'stt-rt-v4',
+          model: typeof config.model === 'string' && config.model.trim() ? config.model.trim() : SONIOX_DEFAULT_MODEL,
           audio_format: 'auto',
           language_hints: Array.isArray(config.languageHints) && config.languageHints.length > 0
             ? config.languageHints

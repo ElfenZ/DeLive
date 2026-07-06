@@ -3,6 +3,7 @@ import {
   buildSessionSnapshot,
   buildSourceMeta,
   buildTranslatedTranscript,
+  hasPersistenceSnapshotContent,
   restoreStoredTokens,
 } from './sessionSnapshot'
 
@@ -64,6 +65,8 @@ describe('sessionSnapshot', () => {
         captureMode: 'system-audio',
         platform: 'win32',
         providerMode: 'realtime',
+        sourceKind: 'recording-audio',
+        captureAudioSource: 'system',
       },
       postProcess: {
         summary: 'Recap',
@@ -87,6 +90,8 @@ describe('sessionSnapshot', () => {
       captureMode: 'file',
       platform: 'linux',
       providerMode: 'full-session-retranscription',
+      sourceKind: 'uploaded-audio',
+      captureAudioSource: undefined,
     })
 
     expect(buildTranslatedTranscript('Bonjour', {
@@ -99,5 +104,18 @@ describe('sessionSnapshot', () => {
       mode: 'output-only',
       updatedAt: 123,
     })
+  })
+
+  it('treats linked source audio as persistable session content', () => {
+    expect(hasPersistenceSnapshotContent({
+      transcript: '',
+      sourceMeta: {
+        captureMode: 'system-audio',
+        platform: 'win32',
+        providerMode: 'realtime',
+        sourceKind: 'recording-audio',
+        audioPath: 'C:/Users/test/AppData/Roaming/DeLive/media/session/source-audio.wav',
+      },
+    })).toBe(true)
   })
 })

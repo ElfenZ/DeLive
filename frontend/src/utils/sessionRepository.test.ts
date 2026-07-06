@@ -92,6 +92,59 @@ describe('sessionRepository persistence strategy', () => {
     expect(sessionStorageMock.saveSessions).not.toHaveBeenCalled()
   })
 
+  it('recovers stale correction states on launch', async () => {
+    sessionStorageMock.getSessions.mockResolvedValue([
+      makeSession({
+        id: 'correcting-1',
+        status: 'completed',
+        transcript: 'alpha',
+        correction: {
+          status: 'correcting',
+          mode: 'quick',
+          requestedAt: 100,
+        },
+      }),
+      makeSession({
+        id: 'detecting-1',
+        status: 'completed',
+        transcript: 'beta',
+        correction: {
+          status: 'detecting',
+          mode: 'review',
+          requestedAt: 200,
+        },
+      }),
+    ])
+
+    const { sessionRepository } = await import('./sessionRepository')
+    const result = await sessionRepository.loadForLaunch()
+
+    expect(result.sessions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'correcting-1',
+        correction: expect.objectContaining({
+          status: 'error',
+          mode: 'quick',
+          error: expect.stringContaining('AI 纠错未完成'),
+        }),
+      }),
+      expect.objectContaining({
+        id: 'detecting-1',
+        correction: expect.objectContaining({
+          status: 'error',
+          mode: 'review',
+          error: expect.stringContaining('AI 纠错未完成'),
+        }),
+      }),
+    ]))
+    expect(sessionStorageMock.upsertSessions).toHaveBeenCalledTimes(1)
+    expect(sessionStorageMock.upsertSessions).toHaveBeenCalledWith(expect.arrayContaining([
+      expect.objectContaining({ id: 'correcting-1' }),
+      expect.objectContaining({ id: 'detecting-1' }),
+    ]))
+    expect(sessionStorageMock.saveSessions).not.toHaveBeenCalled()
+  })
+
   it('persists upgraded sessions on launch even without interruption', async () => {
     sessionStorageMock.getSessions.mockResolvedValue([
       makeSession({ id: 'legacy-1', schemaVersion: 1, tagIds: undefined }),

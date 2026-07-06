@@ -219,7 +219,7 @@ export const zh = {
     cloudProviders: '云端服务',
     localProviders: '本地模型',
     // Provider 名称 & 描述
-    soniox: 'Soniox V4',
+    soniox: 'Soniox V5',
     sonioxDesc: '高精度实时语音识别，支持 60+ 种语言，可选实时翻译',
     volc: '火山引擎',
     volcDesc: '字节跳动旗下语音识别服务，支持中文优化',

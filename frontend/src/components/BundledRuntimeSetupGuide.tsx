@@ -102,7 +102,7 @@ export function BundledRuntimeSetupGuide({
       setStatusState('error')
       setActionMessage(error instanceof Error ? error.message : t.bundledRuntime.getStatusFailed)
     }
-  }, [config, manager])
+  }, [config, manager, t.bundledRuntime.getStatusFailed, t.bundledRuntime.noRuntimeId])
 
   const handleLoadOfficialBinaryPresets = useCallback(async () => {
     setStatusState('loading')
@@ -120,7 +120,7 @@ export function BundledRuntimeSetupGuide({
       setStatusState('error')
       setActionMessage(error instanceof Error ? error.message : t.bundledRuntime.loadBinaryPresetFailed)
     }
-  }, [binaryDownloadUrl])
+  }, [binaryDownloadUrl, t.bundledRuntime])
 
   useEffect(() => {
     void refreshStatus()
@@ -134,7 +134,7 @@ export function BundledRuntimeSetupGuide({
     } catch (error) {
       setActionMessage(error instanceof Error ? error.message : t.bundledRuntime.getModelListFailed)
     }
-  }, [manager])
+  }, [manager, t.bundledRuntime.getModelListFailed])
 
   useEffect(() => {
     void refreshModels()
@@ -183,7 +183,7 @@ export function BundledRuntimeSetupGuide({
       onConfigPatch({ modelPath: matchedPath })
       setActionMessage(t.bundledRuntime.autoFixModelPath(matchedPath))
     }
-  }, [currentModelPath, modelFiles, modelPathExists, onConfigPatch])
+  }, [currentModelPath, modelFiles, modelPathExists, onConfigPatch, t.bundledRuntime])
 
   useEffect(() => {
     if (!modelDownloadUrl) {

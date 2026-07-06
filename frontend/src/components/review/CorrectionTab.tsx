@@ -53,6 +53,7 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
     startSessionQuickCorrection,
     startSessionReviewCorrection,
     updateSessionCorrection,
+    recoverStaleSessionCorrection,
     clearCorrectionStreamingText,
   } = useSessionStore()
 
@@ -61,6 +62,9 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
   )
   const storeStreamingText = useSessionStore(
     (s) => s.correctionStreamingText[session.id] || '',
+  )
+  const correctionInFlight = useSessionStore(
+    (s) => Boolean(s.correctionInFlight[session.id]),
   )
   const correction = liveSession?.correction ?? session.correction
   const correctionMode = settings.aiPostProcess?.correctionMode || 'quick'
@@ -82,6 +86,12 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
       setLocalStatus(storeStatus)
     }
   }, [storeStatus])
+
+  useEffect(() => {
+    if ((storeStatus === 'detecting' || storeStatus === 'correcting') && !correctionInFlight) {
+      recoverStaleSessionCorrection(session.id)
+    }
+  }, [correctionInFlight, recoverStaleSessionCorrection, session.id, storeStatus])
 
   useEffect(() => {
     if (!startTime || status === 'done' || status === 'error' || status === 'idle') return undefined
@@ -146,7 +156,9 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
   }, [session.id, detectSessionCorrectionIssues])
 
   const handleReviewCorrection = useCallback(async () => {
-    const accepted = localIssues.filter((i) => i.accepted)
+    const accepted = localIssues
+      .filter((i) => i.accepted)
+      .map((issue) => ({ ...issue, suggestedText: issue.suggestedText.trim() }))
     setLocalStatus('correcting')
     setLocalError(null)
     setStartTime(Date.now())
@@ -185,14 +197,26 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
   }, [session.id, updateSessionCorrection, clearCorrectionStreamingText])
 
   const toggleIssueAccepted = useCallback((issueId: string) => {
-    setLocalIssues((prev) =>
-      prev.map((i) => (i.id === issueId ? { ...i, accepted: !i.accepted } : i)),
-    )
-  }, [])
+    const nextIssues = localIssues.map((i) => (i.id === issueId ? { ...i, accepted: !i.accepted } : i))
+    setLocalIssues(nextIssues)
+    updateSessionCorrection(session.id, { issues: nextIssues })
+  }, [localIssues, session.id, updateSessionCorrection])
 
   const setAllAccepted = useCallback((accepted: boolean) => {
-    setLocalIssues((prev) => prev.map((i) => ({ ...i, accepted })))
-  }, [])
+    const nextIssues = localIssues.map((i) => ({ ...i, accepted }))
+    setLocalIssues(nextIssues)
+    updateSessionCorrection(session.id, { issues: nextIssues })
+  }, [localIssues, session.id, updateSessionCorrection])
+
+  const updateIssueSuggestion = useCallback((issueId: string, suggestedText: string) => {
+    const nextIssues = localIssues.map((issue) => (
+      issue.id === issueId
+        ? { ...issue, suggestedText, accepted: true }
+        : issue
+    ))
+    setLocalIssues(nextIssues)
+    updateSessionCorrection(session.id, { issues: nextIssues })
+  }, [localIssues, session.id, updateSessionCorrection])
 
   if (!hasTranscript) {
     return (
@@ -216,6 +240,7 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
   }
 
   const isProcessing = status === 'detecting' || status === 'correcting'
+  const hasEmptyAcceptedSuggestion = localIssues.some((issue) => issue.accepted && !issue.suggestedText.trim())
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -230,7 +255,7 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
             <button
               type="button"
               onClick={handleReset}
-              disabled={isProcessing}
+              disabled={isProcessing && correctionInFlight}
               className="inline-flex items-center gap-1.5 h-8 px-3 text-xs font-medium rounded-md border border-input bg-background hover:bg-accent transition-colors disabled:opacity-50"
             >
               <RotateCcw className="w-3.5 h-3.5" />
@@ -321,6 +346,7 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
             <div className="space-y-2">
               {localIssues.map((issue) => {
                 const isExpanded = expandedIssue === issue.id
+                const isAcceptedEmpty = issue.accepted && !issue.suggestedText.trim()
                 return (
                   <div
                     key={issue.id}
@@ -372,12 +398,47 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
                       )}
                     </div>
 
-                    {isExpanded && issue.reason && (
+                    {isExpanded && (
                       <div className="px-4 pb-3 pt-0">
-                        <p className="text-xs text-muted-foreground pl-8">
-                          <span className="font-medium">{p.correctionReason as string}:</span>{' '}
-                          {issue.reason}
-                        </p>
+                        <div className="pl-8 space-y-2">
+                          {issue.reason && (
+                            <p className="text-xs text-muted-foreground">
+                              <span className="font-medium">{p.correctionReason as string}:</span>{' '}
+                              {issue.reason}
+                            </p>
+                          )}
+                          <div className="grid gap-2 sm:grid-cols-[1fr_1fr]">
+                            <label className="space-y-1">
+                              <span className="text-xs font-medium text-muted-foreground">
+                                {isZh ? '原文' : 'Original'}
+                              </span>
+                              <input
+                                type="text"
+                                value={issue.originalText}
+                                readOnly
+                                className="h-9 w-full rounded-md border border-input bg-muted/50 px-3 text-xs font-mono text-muted-foreground"
+                              />
+                            </label>
+                            <label className="space-y-1">
+                              <span className="text-xs font-medium text-muted-foreground">
+                                {isZh ? '建议修改' : 'Suggestion'}
+                              </span>
+                              <input
+                                type="text"
+                                value={issue.suggestedText}
+                                onChange={(e) => updateIssueSuggestion(issue.id, e.target.value)}
+                                className={`h-9 w-full rounded-md border bg-background px-3 text-xs font-mono ${
+                                  isAcceptedEmpty ? 'border-destructive text-destructive' : 'border-input'
+                                }`}
+                              />
+                            </label>
+                          </div>
+                          {isAcceptedEmpty && (
+                            <p className="text-xs text-destructive">
+                              {isZh ? '已接受的问题必须填写建议修改内容。' : 'Accepted issues must have a suggestion.'}
+                            </p>
+                          )}
+                        </div>
                       </div>
                     )}
                   </div>
@@ -389,7 +450,8 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
               <button
                 type="button"
                 onClick={() => void handleReviewCorrection()}
-                className="inline-flex items-center gap-2 h-10 px-5 text-sm font-medium rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 transition-colors w-full justify-center"
+                disabled={hasEmptyAcceptedSuggestion}
+                className="inline-flex items-center gap-2 h-10 px-5 text-sm font-medium rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 transition-colors w-full justify-center disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <Zap className="w-4 h-4" />
                 {p.correctionApply as string}
@@ -399,6 +461,11 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
                   </span>
                 )}
               </button>
+              {hasEmptyAcceptedSuggestion && (
+                <p className="mt-2 text-center text-xs text-destructive">
+                  {isZh ? '请填写所有已接受问题的建议修改，或取消接受空建议。' : 'Fill every accepted suggestion or reject the empty ones.'}
+                </p>
+              )}
             </div>
           </div>
         )}

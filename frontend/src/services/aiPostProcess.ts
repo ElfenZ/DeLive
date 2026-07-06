@@ -468,10 +468,11 @@ function buildMindMapUserPrompt(
 
 export function isAiPostProcessConfigured(settings: AppSettings): boolean {
   const config = getAiConfig(settings)
+  const briefingModel = resolveModelForFeature(config, 'briefing')
   return Boolean(
     config.enabled
     && config.baseUrl?.trim()
-    && config.model?.trim(),
+    && briefingModel,
   )
 }
 

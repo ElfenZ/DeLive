@@ -10,7 +10,7 @@ import { useUIStore } from '../stores/uiStore'
 import { supportsProviderWorkload, type ASRProviderInfo } from '../types/asr/common'
 import { buildProviderConnectConfig, isProviderConfigured } from '../utils/providerConfig'
 import { getProviderName, getProviderDescription } from '../utils/providerI18n'
-import { getProviderLogo } from './icons/ProviderLogos'
+import { getProviderLogo } from './icons/getProviderLogo'
 import type { FileTranscriptionConfig } from '../types/fileTranscription'
 
 export function FileTranscriptionView() {

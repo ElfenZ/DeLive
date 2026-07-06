@@ -1,5 +1,6 @@
+import { SONIOX_DEFAULT_ASYNC_MODEL } from '../types/asr/vendors/soniox'
+
 const SONIOX_API_BASE = 'https://api.soniox.com/v1'
-const DEFAULT_ASYNC_MODEL = 'stt-async-v4'
 const POLL_INTERVAL_MS = 3000
 
 export interface SonioxFileInfo {
@@ -97,7 +98,7 @@ export async function createTranscription(
   params: SonioxCreateTranscriptionParams,
 ): Promise<SonioxTranscriptionInfo> {
   const body: Record<string, unknown> = {
-    model: params.model || DEFAULT_ASYNC_MODEL,
+    model: params.model || SONIOX_DEFAULT_ASYNC_MODEL,
   }
 
   if (params.fileId) body.file_id = params.fileId

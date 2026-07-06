@@ -6,8 +6,6 @@ import type { SVGProps } from 'react'
 import ggmlOrgLogo from '../../assets/ggml-org.png'
 
 type LogoProps = SVGProps<SVGSVGElement> & { size?: number }
-type AnyLogoProps = { size?: number; className?: string }
-
 const defaultSize = 20
 
 export function SonioxLogo({ size = defaultSize, className, ...props }: LogoProps) {
@@ -242,29 +240,4 @@ export function WhisperCppLogo({ size = defaultSize, className }: LogoProps) {
       style={{ objectFit: 'contain' }}
     />
   )
-}
-
-const PROVIDER_LOGO_MAP: Record<string, (props: AnyLogoProps) => JSX.Element> = {
-  soniox: SonioxLogo,
-  volc: VolcengineLogo,
-  groq: GroqLogo,
-  siliconflow: SiliconFlowLogo,
-  mistral: MistralLogo,
-  deepgram: DeepgramLogo,
-  assemblyai: AssemblyAILogo,
-  elevenlabs: ElevenLabsLogo,
-  gladia: GladiaLogo,
-  cloudflare: CloudflareLogo,
-  local_openai: OpenAILogo,
-  local_whisper_cpp: WhisperCppLogo,
-}
-
-export function getProviderLogo(
-  providerId: string,
-  size = defaultSize,
-  className?: string
-): JSX.Element | null {
-  const Logo = PROVIDER_LOGO_MAP[providerId]
-  if (!Logo) return null
-  return <Logo size={size} className={className} />
 }

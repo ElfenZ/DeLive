@@ -57,6 +57,7 @@ import {
   type VolcWord,
   type VolcUtterance,
 } from '../utils/volcFileApi'
+import { SONIOX_DEFAULT_ASYNC_MODEL } from '../types/asr/vendors/soniox'
 
 /* ─── Soniox result conversion ──────────────────────────────── */
 
@@ -189,7 +190,7 @@ async function executeSoniox(
   updateJob(jobId, { status: 'transcribing', progress: 40 })
   const transcription = await sonioxCreateTranscription(apiKey, {
     fileId: fileInfo.id,
-    model: config.model || 'stt-async-v4',
+    model: config.model || SONIOX_DEFAULT_ASYNC_MODEL,
     languageHints: config.languageHints,
     enableSpeakerDiarization: config.enableSpeakerDiarization,
     translation: config.translationEnabled && config.translationTargetLanguage
@@ -1081,6 +1082,7 @@ export function useFileTranscription() {
         const currentSessions = useSessionStore.getState().sessions
         sessionRepository.replaceAllSessions([completedSession, ...currentSessions])
         useSessionStore.setState({ sessions: [completedSession, ...currentSessions] })
+        void useSessionStore.getState().maybeAutoDetectSessionCorrection(session.id)
 
         updateJob(jobId, {
           status: 'completed',

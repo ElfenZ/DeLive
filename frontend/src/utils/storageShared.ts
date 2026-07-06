@@ -162,6 +162,8 @@ export function getDefaultSettings(): AppSettings {
       model: '',
       apiKey: '',
       promptLanguage: 'zh',
+      glossary: [],
+      autoCorrectionDetection: false,
     },
     openApi: {
       enabled: false,

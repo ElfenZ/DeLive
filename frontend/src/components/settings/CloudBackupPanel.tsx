@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useMemo } from 'react'
 import {
   Cloud,
   Check,
@@ -102,8 +102,8 @@ export function CloudBackupPanel({
   const [restoreStatus, setRestoreStatus] = useState<string | null>(null)
 
   const provider = cloudBackupConfig.provider || 's3'
-  const s3 = cloudBackupConfig.s3 || {} as Partial<S3BackupConfig>
-  const webdav = cloudBackupConfig.webdav || {} as Partial<WebDAVBackupConfig>
+  const s3 = useMemo(() => cloudBackupConfig.s3 || {} as Partial<S3BackupConfig>, [cloudBackupConfig.s3])
+  const webdav = useMemo(() => cloudBackupConfig.webdav || {} as Partial<WebDAVBackupConfig>, [cloudBackupConfig.webdav])
 
   const updateS3 = useCallback((updates: Partial<S3BackupConfig>) => {
     return updateCloudBackupConfig({
@@ -132,6 +132,16 @@ export function CloudBackupPanel({
     }
   }, [cloudBackupConfig])
 
+  const handleLoadFiles = useCallback(async () => {
+    if (!window.electronAPI) return
+    setLoadingFiles(true)
+    const result = await window.electronAPI.cloudBackupList(buildIpcConfig(cloudBackupConfig))
+    if (result.ok && result.files) {
+      setFiles(result.files)
+    }
+    setLoadingFiles(false)
+  }, [cloudBackupConfig])
+
   const handleUpload = useCallback(async () => {
     if (!window.electronAPI) return
     setUploadStatus('uploading')
@@ -152,17 +162,7 @@ export function CloudBackupPanel({
       setUploadStatus('error')
       setUploadError(err instanceof Error ? err.message : String(err))
     }
-  }, [cloudBackupConfig])
-
-  const handleLoadFiles = useCallback(async () => {
-    if (!window.electronAPI) return
-    setLoadingFiles(true)
-    const result = await window.electronAPI.cloudBackupList(buildIpcConfig(cloudBackupConfig))
-    if (result.ok && result.files) {
-      setFiles(result.files)
-    }
-    setLoadingFiles(false)
-  }, [cloudBackupConfig])
+  }, [cloudBackupConfig, handleLoadFiles])
 
   const handleRestore = useCallback(async (key: string) => {
     if (!window.electronAPI) return

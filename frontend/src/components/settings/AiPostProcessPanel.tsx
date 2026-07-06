@@ -6,15 +6,18 @@ import {
   EyeOff,
   Key,
   Loader2,
+  Plus,
   RefreshCw,
   Search,
   Sparkles,
   Star,
+  Trash2,
 } from 'lucide-react'
 import { Switch } from '../ui'
 import type { Translations } from '../../i18n'
-import type { AiFeatureKey, AiPostProcessConfig } from '../../types'
+import type { AiFeatureKey, AiGlossaryEntry, AiPostProcessConfig } from '../../types'
 import { fetchAvailableModels } from '../../services/aiPostProcess'
+import { generateId } from '../../utils/storage'
 
 interface AiPostProcessPanelProps {
   t: Translations
@@ -44,7 +47,8 @@ export function AiPostProcessPanel({
   const [modelSearch, setModelSearch] = useState('')
 
   const effectiveDefault = cfg.defaultModel?.trim() || cfg.model?.trim() || ''
-  const selected = cfg.selectedModels ?? []
+  const selected = useMemo(() => cfg.selectedModels ?? [], [cfg.selectedModels])
+  const glossary = useMemo(() => cfg.glossary ?? [], [cfg.glossary])
 
   const filteredModels = useMemo(() => {
     const all = cfg.availableModels ?? []
@@ -103,6 +107,52 @@ export function AiPostProcessPanel({
       })
     },
     [cfg.modelAssignment, updateAiPostProcessConfig],
+  )
+
+  const updateGlossary = useCallback(
+    (entries: AiGlossaryEntry[]) => {
+      const seen = new Set<string>()
+      const next = entries
+        .map((entry) => ({
+          ...entry,
+          source: entry.source,
+          target: entry.target,
+          note: entry.note,
+        }))
+        .filter((entry) => {
+          const source = entry.source.trim()
+          const target = entry.target.trim()
+          if (!source && !target) return true
+          if (!source || !target) return true
+          const key = `${source.toLowerCase()}\u0000${target.toLowerCase()}`
+          if (seen.has(key)) return false
+          seen.add(key)
+          return true
+        })
+      updateAiPostProcessConfig({ glossary: next })
+    },
+    [updateAiPostProcessConfig],
+  )
+
+  const addGlossaryEntry = useCallback(() => {
+    updateGlossary([
+      ...glossary,
+      { id: generateId(), source: '', target: '', note: '', enabled: true },
+    ])
+  }, [glossary, updateGlossary])
+
+  const patchGlossaryEntry = useCallback(
+    (id: string, patch: Partial<AiGlossaryEntry>) => {
+      updateGlossary(glossary.map((entry) => (entry.id === id ? { ...entry, ...patch } : entry)))
+    },
+    [glossary, updateGlossary],
+  )
+
+  const deleteGlossaryEntry = useCallback(
+    (id: string) => {
+      updateGlossary(glossary.filter((entry) => entry.id !== id))
+    },
+    [glossary, updateGlossary],
   )
 
   return (
@@ -438,6 +488,100 @@ export function AiPostProcessPanel({
             {isZh ? '先检测后纠错' : 'Review & Fix'}
           </button>
         </div>
+      </section>
+
+      {/* Correction automation */}
+      <section className="workspace-panel-muted p-4 space-y-3">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <label className="text-sm font-medium leading-none flex items-center gap-2">
+              <Sparkles className="w-3.5 h-3.5 text-muted-foreground" />
+              {isZh ? '自动检测 AI 纠错问题' : 'Auto Detect Correction Issues'}
+            </label>
+            <p className="text-xs text-muted-foreground mt-2">
+              {isZh
+                ? '转录完成后仅生成待确认的问题清单，不会自动应用修正。'
+                : 'After transcription completes, only prepare a review list; corrections are not applied automatically.'}
+            </p>
+          </div>
+          <Switch
+            checked={!!cfg.autoCorrectionDetection}
+            onChange={(val) => updateAiPostProcessConfig({ autoCorrectionDetection: val })}
+            aria-label={isZh ? '自动检测 AI 纠错问题' : 'Auto detect correction issues'}
+          />
+        </div>
+      </section>
+
+      {/* Correction glossary */}
+      <section className="workspace-panel-muted p-4 space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <label className="text-sm font-medium leading-none flex items-center gap-2">
+              <Sparkles className="w-3.5 h-3.5 text-muted-foreground" />
+              {isZh ? 'AI 纠错词汇表' : 'AI Correction Glossary'}
+            </label>
+            <p className="text-xs text-muted-foreground mt-2">
+              {isZh
+                ? '为高频误识别词提供提示，例如 difine -> dify。保存设置后生效。'
+                : 'Guide frequent ASR fixes, for example difine -> dify. Changes apply after saving settings.'}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={addGlossaryEntry}
+            className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-input bg-background px-3 text-xs font-medium transition-colors hover:bg-accent"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            {isZh ? '添加' : 'Add'}
+          </button>
+        </div>
+
+        {glossary.length === 0 ? (
+          <p className="rounded-lg border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground">
+            {isZh ? '暂无词汇表条目' : 'No glossary entries yet'}
+          </p>
+        ) : (
+          <div className="space-y-2">
+            {glossary.map((entry) => (
+              <div key={entry.id} className="grid grid-cols-[auto_1fr_1fr_auto] gap-2 rounded-lg bg-muted/50 p-2 sm:grid-cols-[auto_1fr_1fr_1fr_auto]">
+                <Switch
+                  checked={entry.enabled !== false}
+                  onChange={(val) => patchGlossaryEntry(entry.id, { enabled: val })}
+                  aria-label={isZh ? '启用词汇条目' : 'Enable glossary entry'}
+                />
+                <input
+                  type="text"
+                  value={entry.source}
+                  onChange={(e) => patchGlossaryEntry(entry.id, { source: e.target.value })}
+                  placeholder={isZh ? '误识别词' : 'Wrong term'}
+                  className="h-8 min-w-0 rounded-md border border-input bg-background px-2 text-xs"
+                />
+                <input
+                  type="text"
+                  value={entry.target}
+                  onChange={(e) => patchGlossaryEntry(entry.id, { target: e.target.value })}
+                  placeholder={isZh ? '正确词' : 'Correct term'}
+                  className="h-8 min-w-0 rounded-md border border-input bg-background px-2 text-xs"
+                />
+                <input
+                  type="text"
+                  value={entry.note || ''}
+                  onChange={(e) => patchGlossaryEntry(entry.id, { note: e.target.value })}
+                  placeholder={isZh ? '备注' : 'Note'}
+                  className="col-span-3 h-8 min-w-0 rounded-md border border-input bg-background px-2 text-xs sm:col-span-1"
+                />
+                <button
+                  type="button"
+                  onClick={() => deleteGlossaryEntry(entry.id)}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
+                  title={isZh ? '删除' : 'Delete'}
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
       </section>
     </div>
   )

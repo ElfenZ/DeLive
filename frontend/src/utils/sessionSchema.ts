@@ -127,6 +127,7 @@ function normalizeSourceMeta(value: unknown): TranscriptSourceMeta | undefined {
   }
 
   const captureMode = value.captureMode === 'system-audio'
+    || value.captureMode === 'microphone'
     || value.captureMode === 'file'
     || value.captureMode === 'mixed'
     || value.captureMode === 'unknown'
@@ -147,7 +148,35 @@ function normalizeSourceMeta(value: unknown): TranscriptSourceMeta | undefined {
     ? value.providerMode
     : undefined
 
-  if (!captureMode && !platform && !providerMode && !getString(value.sourceId) && !getString(value.sourceLabel)) {
+  const sourceKind = value.sourceKind === 'recording-audio'
+    || value.sourceKind === 'uploaded-audio'
+    ? value.sourceKind
+    : undefined
+
+  const captureAudioSource = value.captureAudioSource === 'system'
+    || value.captureAudioSource === 'microphone'
+    || value.captureAudioSource === 'mixed'
+    ? value.captureAudioSource
+    : undefined
+
+  const audioPath = getString(value.audioPath)?.trim()
+  const audioMimeType = getString(value.audioMimeType)?.trim()
+  const audioFileName = getString(value.audioFileName)?.trim()
+  const audioSize = getNumber(value.audioSize)
+
+  if (
+    !captureMode
+    && !platform
+    && !providerMode
+    && !getString(value.sourceId)
+    && !getString(value.sourceLabel)
+    && !sourceKind
+    && !audioPath
+    && !audioMimeType
+    && !audioFileName
+    && !audioSize
+    && !captureAudioSource
+  ) {
     return undefined
   }
 
@@ -157,6 +186,12 @@ function normalizeSourceMeta(value: unknown): TranscriptSourceMeta | undefined {
     sourceLabel: getString(value.sourceLabel),
     platform,
     providerMode,
+    sourceKind,
+    audioPath: audioPath || undefined,
+    audioMimeType: audioMimeType || undefined,
+    audioFileName: audioFileName || undefined,
+    audioSize,
+    captureAudioSource,
   }
 }
 

@@ -38,6 +38,8 @@ export {
 export {
   exportToTxt,
   exportToMarkdown,
+  exportAiAnalysisToTxt,
+  exportAiAnalysisToMarkdown,
   formatDate,
   formatTime,
   generateId,

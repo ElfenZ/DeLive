@@ -69,4 +69,52 @@ describe('sessionSchema', () => {
       updatedAt: 222,
     })
   })
+
+  it('preserves source audio metadata and supports old sessions without it', () => {
+    const normalized = normalizeTranscriptSession({
+      id: 'session-3',
+      title: 'Audio Session',
+      date: '2026-07-05',
+      time: '21:40',
+      createdAt: 1,
+      updatedAt: 2,
+      transcript: 'Hello world',
+      sourceMeta: {
+        captureMode: 'microphone',
+        platform: 'win32',
+        providerMode: 'realtime',
+        sourceKind: 'recording-audio',
+        audioPath: 'C:/Users/test/AppData/Roaming/DeLive/media/session/source-audio.wav',
+        audioMimeType: 'audio/wav',
+        audioFileName: 'source-audio.wav',
+        audioSize: 1234,
+        captureAudioSource: 'microphone',
+      },
+    })
+
+    expect(normalized.sourceMeta).toEqual({
+      captureMode: 'microphone',
+      platform: 'win32',
+      providerMode: 'realtime',
+      sourceId: undefined,
+      sourceLabel: undefined,
+      sourceKind: 'recording-audio',
+      audioPath: 'C:/Users/test/AppData/Roaming/DeLive/media/session/source-audio.wav',
+      audioMimeType: 'audio/wav',
+      audioFileName: 'source-audio.wav',
+      audioSize: 1234,
+      captureAudioSource: 'microphone',
+    })
+
+    const oldSession = normalizeTranscriptSession({
+      id: 'session-4',
+      title: 'Old Session',
+      date: '2026-07-05',
+      time: '21:41',
+      createdAt: 1,
+      updatedAt: 2,
+      transcript: 'Old transcript',
+    })
+    expect(oldSession.sourceMeta).toBeUndefined()
+  })
 })

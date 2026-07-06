@@ -156,6 +156,66 @@ describe('aiCorrection — detectCorrectionIssues with mock fetch', async () => 
     vi.unstubAllGlobals()
   })
 
+  it('sends speaker-labelled segments when speaker diarization exists', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: '[]' } }],
+      }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await detectCorrectionIssues(makeSession({
+      transcript: 'flat transcript without speaker labels',
+      speakers: [
+        { id: 'spk_0', label: 'Speaker 1' },
+        { id: 'spk_1', label: 'Speaker 2', displayName: 'Alice' },
+      ],
+      segments: [
+        { speakerId: 'spk_0', text: '大家好。' },
+        { speakerId: 'spk_1', text: '我们开始吧。' },
+      ],
+    }), makeSettings())
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
+    const userMessage = body.messages.find((message: { role: string }) => message.role === 'user')
+    expect(userMessage.content).toContain('Speaker 1: 大家好。')
+    expect(userMessage.content).toContain('Alice: 我们开始吧。')
+    expect(userMessage.content).not.toContain('flat transcript without speaker labels')
+
+    vi.unstubAllGlobals()
+  })
+
+  it('includes enabled non-empty glossary entries in detection prompts and omits invalid entries', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: '[]' } }],
+      }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await detectCorrectionIssues(makeSession({ transcript: 'difine is useful' }), makeSettings({
+      glossary: [
+        { id: '1', source: ' difine ', target: ' dify ', note: 'product', enabled: true },
+        { id: '2', source: 'disabled', target: 'enabled', enabled: false },
+        { id: '3', source: '', target: 'missing source', enabled: true },
+        { id: '4', source: 'difine', target: 'dify', enabled: true },
+      ],
+    }))
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
+    const systemMessage = body.messages.find((message: { role: string }) => message.role === 'system')
+    const userMessage = body.messages.find((message: { role: string }) => message.role === 'user')
+    expect(systemMessage.content).toContain('词汇表')
+    expect(userMessage.content).toContain('"difine" -> "dify"')
+    expect(userMessage.content).toContain('product')
+    expect(userMessage.content).not.toContain('disabled')
+    expect(userMessage.content.match(/"difine" -> "dify"/g)).toHaveLength(1)
+
+    vi.unstubAllGlobals()
+  })
+
   it('parses response wrapped in fenced code block', async () => {
     const fenced = '```json\n[{"id":"1","originalText":"A","suggestedText":"B","reason":"test","category":"grammar"}]\n```'
 
@@ -281,6 +341,42 @@ describe('aiCorrection — detectCorrectionIssues with mock fetch', async () => 
     const result = await detectCorrectionIssues(makeSession(), makeSettings())
     expect(result.issues[0].id).toBe('1')
     expect(result.issues[1].id).toBe('2')
+
+    vi.unstubAllGlobals()
+  })
+})
+
+describe('aiCorrection — quick correction with glossary', async () => {
+  const { correctTranscriptQuick } = await import('./aiCorrection')
+
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('includes glossary guidance in quick correction requests', async () => {
+    const reader = {
+      read: vi.fn()
+        .mockResolvedValueOnce({ done: false, value: new TextEncoder().encode('data: [DONE]\n\n') })
+        .mockResolvedValueOnce({ done: true, value: undefined }),
+      releaseLock: vi.fn(),
+    }
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      body: { getReader: () => reader },
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await correctTranscriptQuick(makeSession(), makeSettings({
+      glossary: [{ id: '1', source: 'define', target: 'dify', enabled: true }],
+    }), {
+      onChunk: vi.fn(),
+      onDone: vi.fn(),
+      onError: vi.fn(),
+    })
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
+    expect(body.messages[0].content).toContain('source/误识别原文')
+    expect(body.messages[1].content).toContain('"define" -> "dify"')
 
     vi.unstubAllGlobals()
   })

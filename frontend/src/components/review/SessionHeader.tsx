@@ -5,15 +5,23 @@ import {
   Calendar,
   Clock,
   FileText,
+  FolderOpen,
   SpellCheck,
+  Sparkles,
   Subtitles,
   ChevronDown,
   PanelLeftClose,
   PanelLeftOpen,
 } from 'lucide-react'
 import type { TranscriptSession } from '../../types'
-import { exportToTxt, exportToMarkdown } from '../../utils/storage'
+import {
+  exportAiAnalysisToMarkdown,
+  exportAiAnalysisToTxt,
+  exportToMarkdown,
+  exportToTxt,
+} from '../../utils/storage'
 import { downloadSubtitle } from '../../utils/subtitleExport'
+import { hasPostProcessContent } from '../../utils/transcriptState'
 import { useUIStore } from '../../stores/uiStore'
 import { useSessionStore } from '../../stores/sessionStore'
 
@@ -31,6 +39,7 @@ export function SessionHeader({
   onToggleSidebar,
 }: SessionHeaderProps) {
   const { t } = useUIStore()
+  const language = useUIStore((s) => s.language)
   const liveSession = useSessionStore(
     (s) => s.sessions.find((sess) => sess.id === session.id),
   ) ?? session
@@ -39,6 +48,8 @@ export function SessionHeader({
   const translatedText = liveSession.translatedTranscript?.text?.trim() || ''
   const hasContent = Boolean(liveSession.transcript || translatedText)
   const hasCorrectedText = liveSession.correction?.status === 'done' && !!liveSession.correction.correctedText
+  const hasAiAnalysis = liveSession.postProcess?.status === 'success' && hasPostProcessContent(liveSession.postProcess)
+  const sourceAudioPath = liveSession.sourceMeta?.audioPath?.trim()
 
   const handleExportTxt = () => {
     exportToTxt(liveSession)
@@ -97,6 +108,21 @@ export function SessionHeader({
     setShowExportMenu(false)
   }
 
+  const handleExportAiAnalysisTxt = () => {
+    exportAiAnalysisToTxt(liveSession)
+    setShowExportMenu(false)
+  }
+
+  const handleExportAiAnalysisMarkdown = () => {
+    exportAiAnalysisToMarkdown(liveSession)
+    setShowExportMenu(false)
+  }
+
+  const handleRevealSourceAudio = () => {
+    if (!sourceAudioPath) return
+    void window.electronAPI?.revealRecordingArchive?.(sourceAudioPath)
+  }
+
   return (
     <div className="flex items-center justify-between px-6 py-3.5 border-b border-border bg-muted/30">
       <div className="flex items-center gap-3 min-w-0">
@@ -137,6 +163,16 @@ export function SessionHeader({
       </div>
 
       <div className="flex items-center gap-2">
+        {sourceAudioPath && (
+          <button
+            type="button"
+            onClick={handleRevealSourceAudio}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
+          >
+            <FolderOpen className="w-4 h-4" />
+            {language === 'zh' ? '打开录音文件夹' : 'Open Recording Folder'}
+          </button>
+        )}
         {hasContent && (
           <div className="relative" ref={exportMenuRef}>
             <button
@@ -195,6 +231,25 @@ export function SessionHeader({
                       >
                         <SpellCheck className="w-4 h-4" />
                         Markdown ({t.preview.correctionCorrected})
+                      </button>
+                    </>
+                  )}
+                  {hasAiAnalysis && (
+                    <>
+                      <div className="mx-1 my-1 border-t border-border" />
+                      <button
+                        onClick={handleExportAiAnalysisTxt}
+                        className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-primary transition-colors hover:bg-accent"
+                      >
+                        <Sparkles className="w-4 h-4" />
+                        TXT (AI Analysis)
+                      </button>
+                      <button
+                        onClick={handleExportAiAnalysisMarkdown}
+                        className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-primary transition-colors hover:bg-accent"
+                      >
+                        <Sparkles className="w-4 h-4" />
+                        Markdown (AI Analysis)
                       </button>
                     </>
                   )}

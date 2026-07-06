@@ -11,6 +11,7 @@ import { getSessions, saveSessions } from './sessionStorage'
 import { getSettings, getTags, getTopics, saveSettings, saveTags, saveTopics } from './settingsStorage'
 import { normalizeTranscriptSessions } from './sessionSchema'
 import { getDefaultSettings } from './storageShared'
+import { generateId } from './storageUtils'
 
 export const CURRENT_BACKUP_VERSION = '3.0'
 export const CURRENT_BACKUP_SCHEMA_VERSION = 3
@@ -170,6 +171,26 @@ function normalizeAiPostProcessConfig(value: unknown): AiPostProcessConfig | und
   const promptLanguage = value.promptLanguage === 'en' || value.promptLanguage === 'zh'
     ? value.promptLanguage
     : undefined
+  const correctionMode = value.correctionMode === 'quick' || value.correctionMode === 'review'
+    ? value.correctionMode
+    : undefined
+  const preferCorrectedText = value.preferCorrectedText === 'auto'
+    || value.preferCorrectedText === 'original'
+    || value.preferCorrectedText === 'corrected'
+    ? value.preferCorrectedText
+    : undefined
+  const glossary = Array.isArray(value.glossary)
+    ? value.glossary
+      .filter(isRecord)
+      .map((entry) => ({
+        id: typeof entry.id === 'string' ? entry.id : generateId(),
+        source: typeof entry.source === 'string' ? entry.source : '',
+        target: typeof entry.target === 'string' ? entry.target : '',
+        note: typeof entry.note === 'string' ? entry.note : undefined,
+        enabled: typeof entry.enabled === 'boolean' ? entry.enabled : undefined,
+      }))
+      .filter((entry) => entry.source.trim() || entry.target.trim())
+    : undefined
 
   return {
     enabled: typeof value.enabled === 'boolean' ? value.enabled : undefined,
@@ -178,6 +199,15 @@ function normalizeAiPostProcessConfig(value: unknown): AiPostProcessConfig | und
     model: typeof value.model === 'string' ? value.model : undefined,
     apiKey: typeof value.apiKey === 'string' ? value.apiKey : undefined,
     promptLanguage,
+    availableModels: Array.isArray(value.availableModels) ? normalizeStringArray(value.availableModels) : undefined,
+    selectedModels: Array.isArray(value.selectedModels) ? normalizeStringArray(value.selectedModels) : undefined,
+    defaultModel: typeof value.defaultModel === 'string' ? value.defaultModel : undefined,
+    modelAssignment: isRecord(value.modelAssignment) ? value.modelAssignment as AiPostProcessConfig['modelAssignment'] : undefined,
+    correctionMode,
+    preferCorrectedText,
+    enableStreaming: typeof value.enableStreaming === 'boolean' ? value.enableStreaming : undefined,
+    glossary,
+    autoCorrectionDetection: typeof value.autoCorrectionDetection === 'boolean' ? value.autoCorrectionDetection : undefined,
   }
 }
 

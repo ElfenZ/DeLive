@@ -35,7 +35,7 @@ function App() {
   const [showSourcePicker, setShowSourcePicker] = useState(false)
   const [toasts, setToasts] = useState<ToastMessage[]>([])
   const [isInitialized, setIsInitialized] = useState(false)
-  const { initTheme, t, currentView, setView, backToLive } = useUIStore()
+  const { initTheme, t, language, currentView, setView, backToLive } = useUIStore()
   const { loadSettings, settings, availableProviders } = useSettingsStore()
   const { collapsed: sidebarCollapsed, toggle: toggleSidebar } = useSidebarState()
   const { enabled: captionEnabled, toggle: toggleCaption } = useCaptionToggle()
@@ -110,9 +110,25 @@ function App() {
       loadSettings()
       loadTags()
       loadTopics()
-      await loadSessions()
+      const recoverySummary = await loadSessions()
 
       if (!cancelled) {
+        if (recoverySummary?.linkedCount) {
+          addToast(
+            'success',
+            language === 'zh'
+              ? `已恢复 ${recoverySummary.linkedCount} 个录音音频文件`
+              : `Recovered ${recoverySummary.linkedCount} recording audio file${recoverySummary.linkedCount > 1 ? 's' : ''}`,
+          )
+        }
+        if (recoverySummary && (recoverySummary.unlinkedCount > 0 || recoverySummary.skippedCount > 0)) {
+          addToast(
+            'warning',
+            language === 'zh'
+              ? `有 ${recoverySummary.unlinkedCount + recoverySummary.skippedCount} 个录音音频恢复项未能自动关联，请检查本机媒体目录`
+              : `${recoverySummary.unlinkedCount + recoverySummary.skippedCount} recovered recording item${recoverySummary.unlinkedCount + recoverySummary.skippedCount > 1 ? 's' : ''} could not be linked automatically. Check the local media folder.`,
+          )
+        }
         setIsInitialized(true)
       }
     })()
@@ -120,7 +136,7 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [initTheme, loadSettings, loadSessions, loadTags])
+  }, [addToast, initTheme, language, loadSettings, loadSessions, loadTags, loadTopics])
 
   // 初始化完成后同步字幕样式到主进程，确保字幕窗口使用用户保存的样式
   useEffect(() => {

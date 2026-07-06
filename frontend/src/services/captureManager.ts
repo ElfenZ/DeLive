@@ -56,6 +56,7 @@ export class CaptureManager {
   private deviceChangeCleanup: (() => void) | null = null
   private callbacks: CaptureCallbacks | null = null
   private _isRestarting = false
+  private captureMode: 'system-audio' | 'microphone' | 'mixed' = 'system-audio'
 
   async start(
     capabilities: CapturePipelineCapabilities,
@@ -223,6 +224,10 @@ export class CaptureManager {
     return this.mediaStream
   }
 
+  get currentCaptureMode(): 'system-audio' | 'microphone' | 'mixed' {
+    return this.captureMode
+  }
+
   private async requestDisplayAudio(audioOptions: CaptureAudioOptions): Promise<MediaStream> {
     console.log('[CaptureManager] Requesting screen share...')
     const displayStream = await navigator.mediaDevices.getDisplayMedia({
@@ -239,7 +244,23 @@ export class CaptureManager {
 
     if (audioTracks.length === 0) {
       displayStream.getTracks().forEach((track) => track.stop())
-      throw new Error('未能获取系统音频。请确保在选择共享时勾选了"共享音频"选项。')
+      if (audioOptions.includeMicrophone) {
+        const microphoneStream = await this.requestMicrophoneStream(audioOptions)
+        if (microphoneStream) {
+          this.captureMode = 'microphone'
+          this.sourceStreams = [microphoneStream]
+          microphoneStream.getAudioTracks()[0].onended = () => {
+            if (this._isRestarting) {
+              console.log('[CaptureManager] Microphone track ended (ignored: restarting)')
+              return
+            }
+            console.log('[CaptureManager] Microphone track ended')
+            this.callbacks?.onTrackEnded()
+          }
+          return microphoneStream
+        }
+      }
+      throw new Error('未能获取系统音频，且麦克风不可用。请共享系统音频，或启用可用的麦克风。')
     }
 
     displayStream.getVideoTracks().forEach((track) => track.stop())
@@ -263,21 +284,14 @@ export class CaptureManager {
     audioOptions: CaptureAudioOptions,
   ): Promise<MediaStream> {
     this.sourceStreams = [systemAudioStream]
+    this.captureMode = 'system-audio'
 
     if (!audioOptions.includeMicrophone) {
       return systemAudioStream
     }
 
-    let microphoneStream: MediaStream | null = null
-
-    try {
-      microphoneStream = await navigator.mediaDevices.getUserMedia({
-        audio: this.buildMicrophoneConstraints(audioOptions.microphoneDeviceId),
-        video: false,
-      })
-    } catch (error) {
-      console.warn('[CaptureManager] Microphone capture unavailable, using system audio only:', error)
-      audioOptions.onMicrophoneUnavailable?.('microphone-unavailable')
+    const microphoneStream = await this.requestMicrophoneStream(audioOptions)
+    if (!microphoneStream) {
       return systemAudioStream
     }
 
@@ -312,6 +326,7 @@ export class CaptureManager {
 
     this.mixedAudioContext = audioContext
     this.sourceStreams = [systemAudioStream, microphoneStream]
+    this.captureMode = 'mixed'
     const mixedStream = destination.stream
 
     const stopMixedStream = () => {
@@ -324,6 +339,19 @@ export class CaptureManager {
     )
 
     return mixedStream
+  }
+
+  private async requestMicrophoneStream(audioOptions: CaptureAudioOptions): Promise<MediaStream | null> {
+    try {
+      return await navigator.mediaDevices.getUserMedia({
+        audio: this.buildMicrophoneConstraints(audioOptions.microphoneDeviceId),
+        video: false,
+      })
+    } catch (error) {
+      console.warn('[CaptureManager] Microphone capture unavailable:', error)
+      audioOptions.onMicrophoneUnavailable?.('microphone-unavailable')
+      return null
+    }
   }
 
   private buildMicrophoneConstraints(microphoneDeviceId?: string): MediaTrackConstraints {

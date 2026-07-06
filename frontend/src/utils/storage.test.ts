@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest'
+import type { TranscriptSession } from '../types'
 import { formatDate, formatTime, validateBackupData } from './storage'
+import { buildAiAnalysisMarkdown, buildAiAnalysisTxt } from './storageUtils'
 
 describe('formatDate', () => {
   it('formats timestamp as YYYY-MM-DD', () => {
@@ -94,5 +96,75 @@ describe('validateBackupData', () => {
       settings: { apiKey: 'key' },
       extraField: 'allowed',
     })).toBe(true)
+  })
+})
+
+describe('AI analysis export formatters', () => {
+  const baseSession: TranscriptSession = {
+    id: 'session-1',
+    title: 'Planning Call',
+    date: '2026-07-05',
+    time: '21:30',
+    createdAt: 1,
+    updatedAt: 2,
+    transcript: 'raw transcript',
+    segments: [],
+    speakers: [],
+    status: 'completed',
+  }
+
+  it('builds TXT with available post-process sections and omits empty sections', () => {
+    const output = buildAiAnalysisTxt({
+      ...baseSession,
+      postProcess: {
+        status: 'success',
+        summary: 'Ship the feature.',
+        actionItems: ['Add tests', ''],
+        keywords: ['AI', 'export'],
+        chapters: [{ title: 'Intro', summary: 'Scope' }, { title: '', summary: '' }],
+        titleSuggestion: 'Feature Plan',
+        tagSuggestions: ['release'],
+        model: 'qwen',
+        requestedAt: 1000,
+        generatedAt: 2000,
+      },
+      mindMap: { markdown: '# Mind map' },
+      askHistory: [{ id: 'q1', question: 'Q?', createdAt: 1, status: 'success', answer: 'A' }],
+    })
+
+    expect(output).toContain('标题: Planning Call')
+    expect(output).toContain('摘要')
+    expect(output).toContain('Ship the feature.')
+    expect(output).toContain('1. Add tests')
+    expect(output).toContain('关键词')
+    expect(output).toContain('AI, export')
+    expect(output).toContain('章节')
+    expect(output).toContain('1. Intro')
+    expect(output).toContain('标签建议')
+    expect(output).not.toContain('Mind map')
+    expect(output).not.toContain('Q?')
+  })
+
+  it('builds Markdown only for successful useful AI analysis', () => {
+    expect(buildAiAnalysisMarkdown({
+      ...baseSession,
+      postProcess: { status: 'pending', summary: 'Not ready' },
+    })).toBe('')
+
+    const output = buildAiAnalysisMarkdown({
+      ...baseSession,
+      postProcess: {
+        status: 'success',
+        summary: 'Ready',
+        actionItems: [],
+        keywords: ['planning'],
+      },
+    })
+
+    expect(output).toContain('# Planning Call AI Analysis')
+    expect(output).toContain('## Summary')
+    expect(output).toContain('Ready')
+    expect(output).toContain('## Keywords')
+    expect(output).not.toContain('## Action Items')
   })
 })

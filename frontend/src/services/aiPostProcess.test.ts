@@ -65,6 +65,32 @@ describe('aiPostProcess', () => {
     })).toBe(false)
   })
 
+  it('detects briefing model assigned through default or feature model settings', () => {
+    expect(isAiPostProcessConfigured({
+      apiKey: '',
+      languageHints: ['zh', 'en'],
+      aiPostProcess: {
+        enabled: true,
+        provider: 'openai-compatible',
+        baseUrl: 'http://127.0.0.1:11434/v1',
+        model: '',
+        defaultModel: 'qwen-default',
+      },
+    })).toBe(true)
+
+    expect(isAiPostProcessConfigured({
+      apiKey: '',
+      languageHints: ['zh', 'en'],
+      aiPostProcess: {
+        enabled: true,
+        provider: 'openai-compatible',
+        baseUrl: 'http://127.0.0.1:11434/v1',
+        model: '',
+        modelAssignment: { briefing: 'qwen-briefing' },
+      },
+    })).toBe(true)
+  })
+
   it('parses session qa responses with citations', () => {
     const result = parseSessionQaResponse(JSON.stringify({
       answer: 'Alice suggested shipping this week.',

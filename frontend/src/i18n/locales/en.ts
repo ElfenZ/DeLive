@@ -221,7 +221,7 @@ export const en: Translations = {
     cloudProviders: 'Cloud Services',
     localProviders: 'Local Models',
     // Provider names & descriptions
-    soniox: 'Soniox V4',
+    soniox: 'Soniox V5',
     sonioxDesc: 'High-precision real-time speech recognition, supports 60+ languages with optional live translation',
     volc: 'Volcengine',
     volcDesc: 'ByteDance speech recognition service, optimized for Chinese',

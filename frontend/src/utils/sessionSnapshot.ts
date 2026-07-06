@@ -26,6 +26,7 @@ export function hasPersistenceSnapshotContent(snapshot: TranscriptPersistenceSna
     snapshot.transcript
     || snapshot.tokens?.length
     || snapshot.translatedTranscript?.text
+    || snapshot.sourceMeta?.audioPath
     || hasPostProcessContent(snapshot.postProcess),
   )
 }
@@ -99,10 +100,20 @@ export function buildSourceMeta(options: {
     return undefined
   }
 
+  const captureAudioSource = options.captureMode === 'mixed'
+    ? 'mixed'
+    : options.captureMode === 'microphone'
+      ? 'microphone'
+      : options.captureMode === 'system-audio'
+        ? 'system'
+        : undefined
+
   return {
     captureMode: options.captureMode ?? 'system-audio',
     platform: options.platform ?? 'unknown',
     providerMode: options.providerMode ?? 'unknown',
+    sourceKind: options.captureMode === 'file' ? 'uploaded-audio' : 'recording-audio',
+    captureAudioSource,
   }
 }
 

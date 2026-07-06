@@ -56,6 +56,14 @@ import { generateId } from '../utils/storageUtils'
 
 const SESSION_AUTOSAVE_DELAY_MS = 1200
 let sessionAutosaveTimer: ReturnType<typeof setTimeout> | null = null
+const STALE_CORRECTION_ERROR = 'AI 纠错未完成，请重新启动纠错'
+
+export interface RecordingArchiveRecoverySummary {
+  recoveredCount: number
+  linkedCount: number
+  unlinkedCount: number
+  skippedCount: number
+}
 
 function clearSessionAutosaveTimer(): void {
   if (sessionAutosaveTimer) {
@@ -92,13 +100,14 @@ export interface SessionState {
 
   currentSessionId: string | null
   recoverySession: TranscriptSession | null
-  startNewSession: () => string
-  endCurrentSession: () => void
+  currentCaptureMode: NonNullable<TranscriptSession['sourceMeta']>['captureMode']
+  startNewSession: (options?: { captureMode?: NonNullable<TranscriptSession['sourceMeta']>['captureMode'] }) => string
+  endCurrentSession: (options?: { sourceMetaPatch?: Partial<NonNullable<TranscriptSession['sourceMeta']>> }) => void
   restoreRecoverySession: () => void
   dismissRecoverySession: () => void
 
   sessions: TranscriptSession[]
-  loadSessions: () => Promise<void>
+  loadSessions: () => Promise<RecordingArchiveRecoverySummary | undefined>
   updateSessionTitle: (id: string, title: string) => void
   updateSessionSpeakers: (sessionId: string, speakers: TranscriptSpeaker[]) => void
   updateSessionPostProcess: (sessionId: string, patch: Partial<TranscriptPostProcess>) => void
@@ -125,6 +134,8 @@ export interface SessionState {
   replaceAllSessions: (sessions: TranscriptSession[]) => TranscriptSession[]
 
   updateSessionCorrection: (sessionId: string, patch: Partial<TranscriptCorrection>) => void
+  recoverStaleSessionCorrection: (sessionId: string) => void
+  maybeAutoDetectSessionCorrection: (sessionId: string) => Promise<void>
   detectSessionCorrectionIssues: (sessionId: string) => Promise<CorrectionIssue[]>
   startSessionQuickCorrection: (
     sessionId: string,
@@ -137,6 +148,7 @@ export interface SessionState {
   ) => Promise<string>
 
   correctionStreamingText: Record<string, string>
+  correctionInFlight: Record<string, true>
   clearCorrectionStreamingText: (sessionId: string) => void
 
   finalTokens: TranscriptToken[]
@@ -152,6 +164,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
     nonFinalTranslatedTranscript?: string
     currentTranslatedTranscript?: string
     currentPostProcess?: TranscriptPostProcess
+    sourceMetaPatch?: Partial<NonNullable<TranscriptSession['sourceMeta']>>
   }) => {
     const state = resolveTranscriptRuntimeState(
       selectTranscriptRuntimeState(get()),
@@ -160,7 +173,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
     const providerId = useSettingsStore.getState().settings.currentVendor
     const captionDisplayMode = useSettingsStore.getState().settings.captionStyle?.displayMode ?? 'source'
 
-    return buildSessionSnapshot({
+    const snapshot = buildSessionSnapshot({
       runtimeState: {
         ...state,
         currentSegments: buildSegmentsFromTokens(state.finalTokens),
@@ -169,10 +182,20 @@ export const useSessionStore = create<SessionState>((set, get) => {
       providerId,
       providerMode: resolveProviderMode(providerId),
       platform: window.electronAPI?.platform ?? 'unknown',
-      captureMode: 'system-audio',
+      captureMode: get().currentCaptureMode || 'system-audio',
       translationTargetLanguage: getTranslationTargetLanguage(),
       captionDisplayMode,
     })
+
+    return overrides?.sourceMetaPatch
+      ? {
+        ...snapshot,
+        sourceMeta: {
+          ...(snapshot.sourceMeta || {}),
+          ...overrides.sourceMetaPatch,
+        },
+      }
+      : snapshot
   }
 
   const syncCurrentSessionInMemory = (overrides?: {
@@ -270,6 +293,16 @@ export const useSessionStore = create<SessionState>((set, get) => {
     })
   }
 
+  const markCorrectionInFlight = (sessionId: string) => {
+    set({ correctionInFlight: { ...get().correctionInFlight, [sessionId]: true } })
+  }
+
+  const clearCorrectionInFlight = (sessionId: string) => {
+    const next = { ...get().correctionInFlight }
+    delete next[sessionId]
+    set({ correctionInFlight: next })
+  }
+
   return {
     recordingState: 'idle',
     setRecordingState: (state) => set({ recordingState: state }),
@@ -310,7 +343,8 @@ export const useSessionStore = create<SessionState>((set, get) => {
 
     currentSessionId: null,
     recoverySession: null,
-    startNewSession: () => {
+    currentCaptureMode: 'system-audio',
+    startNewSession: (options) => {
       clearSessionAutosaveTimer()
       const now = Date.now()
       const { t } = useUIStore.getState()
@@ -325,27 +359,29 @@ export const useSessionStore = create<SessionState>((set, get) => {
           providerId,
           providerMode: resolveProviderMode(providerId),
           platform: window.electronAPI?.platform ?? 'unknown',
-          captureMode: 'system-audio',
+          captureMode: options?.captureMode || 'system-audio',
         }),
       })
 
       const sessions = sessionRepository.createDraft(session)
       set({
         currentSessionId: session.id,
+        currentCaptureMode: options?.captureMode || 'system-audio',
         sessions,
         ...createEmptyTranscriptRuntimeState(),
       })
       return session.id
     },
-    endCurrentSession: () => {
+    endCurrentSession: (options) => {
       clearSessionAutosaveTimer()
       const { currentSessionId } = get()
-      const snapshot = buildCurrentSessionSnapshot()
+      const snapshot = buildCurrentSessionSnapshot({ sourceMetaPatch: options?.sourceMetaPatch })
       const hasContent = hasPersistenceSnapshotContent(snapshot)
 
       if (currentSessionId && hasContent) {
         const sessions = sessionRepository.completeSession(currentSessionId, snapshot)
         set({ sessions })
+        void get().maybeAutoDetectSessionCorrection(currentSessionId)
         console.log('[SessionStore] 会话已保存, 文本长度:', snapshot.transcript.length)
       } else if (currentSessionId) {
         const sessions = sessionRepository.deleteSession(currentSessionId)
@@ -354,7 +390,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
       } else {
         console.log('[SessionStore] 会话未保存: currentSessionId=', currentSessionId)
       }
-      set({ currentSessionId: null })
+      set({ currentSessionId: null, currentCaptureMode: 'system-audio' })
     },
     restoreRecoverySession: () => {
       const { recoverySession } = get()
@@ -379,6 +415,69 @@ export const useSessionStore = create<SessionState>((set, get) => {
     loadSessions: async () => {
       const { sessions, recoverableSession } = await sessionRepository.loadForLaunch()
       set({ sessions, recoverySession: recoverableSession })
+
+      if (!window.electronAPI?.recoverRecordingArchives) return undefined
+
+      try {
+        const result = await window.electronAPI.recoverRecordingArchives()
+        if (!result.ok) {
+          console.warn('[SessionStore] 录音源音频恢复失败:', result.error)
+          return {
+            recoveredCount: 0,
+            linkedCount: 0,
+            unlinkedCount: 0,
+            skippedCount: result.skipped?.length || 0,
+          }
+        }
+
+        let linkedCount = 0
+        let unlinkedCount = 0
+        for (const archive of result.recovered) {
+          if (!archive.sessionId || !archive.path) {
+            unlinkedCount += 1
+            continue
+          }
+          const session = get().sessions.find((item) => item.id === archive.sessionId)
+          if (!session || session.sourceMeta?.audioPath) {
+            unlinkedCount += 1
+            continue
+          }
+
+          const sourceMeta = {
+            ...(session.sourceMeta || {}),
+            sourceKind: 'recording-audio' as const,
+            audioPath: archive.path,
+            audioMimeType: archive.mimeType || 'audio/wav',
+            audioFileName: archive.fileName || 'source-audio.wav',
+            audioSize: archive.size,
+          }
+          const nextSessions = sessionRepository.updateMetadata(session.id, { sourceMeta })
+          const currentRecoverySession = get().recoverySession
+          set({
+            sessions: nextSessions,
+            recoverySession: currentRecoverySession?.id === session.id
+              ? { ...currentRecoverySession, sourceMeta }
+              : currentRecoverySession,
+          })
+          linkedCount += 1
+        }
+
+        const summary = {
+          recoveredCount: result.recovered.length,
+          linkedCount,
+          unlinkedCount,
+          skippedCount: result.skipped?.length || 0,
+        }
+        return summary.recoveredCount > 0 || summary.skippedCount > 0 ? summary : undefined
+      } catch (error) {
+        console.warn('[SessionStore] 录音源音频恢复失败:', error)
+        return {
+          recoveredCount: 0,
+          linkedCount: 0,
+          unlinkedCount: 0,
+          skippedCount: 0,
+        }
+      }
     },
     updateSessionTitle: (id, title) => {
       const { sessions, recoverySession, currentSessionId, currentSpeakers, currentPostProcess } = get()
@@ -727,6 +826,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
     },
 
     correctionStreamingText: {},
+    correctionInFlight: {},
     clearCorrectionStreamingText: (sessionId) => {
       const { correctionStreamingText } = get()
       if (sessionId in correctionStreamingText) {
@@ -755,9 +855,45 @@ export const useSessionStore = create<SessionState>((set, get) => {
       })
     },
 
+    recoverStaleSessionCorrection: (sessionId) => {
+      const session = get().sessions.find((s) => s.id === sessionId)
+      const status = session?.correction?.status
+      if (status !== 'detecting' && status !== 'correcting') return
+      if (get().correctionInFlight[sessionId]) return
+      get().clearCorrectionStreamingText(sessionId)
+      get().updateSessionCorrection(sessionId, {
+        status: 'error',
+        error: STALE_CORRECTION_ERROR,
+      })
+    },
+
+    maybeAutoDetectSessionCorrection: async (sessionId) => {
+      const session = get().sessions.find((s) => s.id === sessionId)
+      if (!session?.transcript.trim()) return
+
+      const settings = useSettingsStore.getState().settings
+      const aiConfig = settings.aiPostProcess || {}
+      if (!aiConfig.enabled || !aiConfig.autoCorrectionDetection) return
+      if (!resolveModelForFeature(aiConfig, 'correction')) return
+      if (get().correctionInFlight[sessionId]) return
+
+      const status = session.correction?.status
+      if (status === 'detecting' || status === 'reviewing' || status === 'correcting' || status === 'done') {
+        return
+      }
+
+      try {
+        await get().detectSessionCorrectionIssues(sessionId)
+      } catch (error) {
+        console.warn('[SessionStore] 自动 AI 纠错检测失败:', error)
+      }
+    },
+
     detectSessionCorrectionIssues: async (sessionId) => {
       const session = get().sessions.find((s) => s.id === sessionId)
       if (!session) throw new Error('未找到要纠错的会话')
+
+      markCorrectionInFlight(sessionId)
 
       get().updateSessionCorrection(sessionId, {
         status: 'detecting',
@@ -784,6 +920,8 @@ export const useSessionStore = create<SessionState>((set, get) => {
           error: message,
         })
         throw error
+      } finally {
+        clearCorrectionInFlight(sessionId)
       }
     },
 
@@ -797,6 +935,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
       )
 
       set({ correctionStreamingText: { ...get().correctionStreamingText, [sessionId]: '' } })
+      markCorrectionInFlight(sessionId)
       get().updateSessionCorrection(sessionId, {
         status: 'correcting',
         error: undefined,
@@ -817,6 +956,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
             },
             onDone: (fullText) => {
               get().clearCorrectionStreamingText(sessionId)
+              clearCorrectionInFlight(sessionId)
               get().updateSessionCorrection(sessionId, {
                 status: 'done',
                 correctedText: fullText,
@@ -826,6 +966,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
             },
             onError: (err) => {
               get().clearCorrectionStreamingText(sessionId)
+              clearCorrectionInFlight(sessionId)
               get().updateSessionCorrection(sessionId, {
                 status: 'error',
                 error: err.message,
@@ -835,6 +976,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
           },
         ).catch((err) => {
           get().clearCorrectionStreamingText(sessionId)
+          clearCorrectionInFlight(sessionId)
           get().updateSessionCorrection(sessionId, {
             status: 'error',
             error: err instanceof Error ? err.message : '纠错失败',
@@ -854,16 +996,21 @@ export const useSessionStore = create<SessionState>((set, get) => {
       )
 
       set({ correctionStreamingText: { ...get().correctionStreamingText, [sessionId]: '' } })
+      markCorrectionInFlight(sessionId)
       get().updateSessionCorrection(sessionId, {
         status: 'correcting',
         error: undefined,
         requestedAt: Date.now(),
         mode: 'review',
         model,
-        issues: session.correction?.issues?.map((issue) => ({
-          ...issue,
-          accepted: acceptedIssues.some((a) => a.id === issue.id),
-        })),
+        issues: session.correction?.issues?.map((issue) => {
+          const acceptedIssue = acceptedIssues.find((accepted) => accepted.id === issue.id)
+          return {
+            ...issue,
+            ...(acceptedIssue ? { suggestedText: acceptedIssue.suggestedText } : {}),
+            accepted: Boolean(acceptedIssue),
+          }
+        }),
       })
 
       return new Promise<string>((resolve, reject) => {
@@ -879,6 +1026,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
             },
             onDone: (fullText) => {
               get().clearCorrectionStreamingText(sessionId)
+              clearCorrectionInFlight(sessionId)
               get().updateSessionCorrection(sessionId, {
                 status: 'done',
                 correctedText: fullText,
@@ -888,6 +1036,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
             },
             onError: (err) => {
               get().clearCorrectionStreamingText(sessionId)
+              clearCorrectionInFlight(sessionId)
               get().updateSessionCorrection(sessionId, {
                 status: 'error',
                 error: err.message,
@@ -897,6 +1046,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
           },
         ).catch((err) => {
           get().clearCorrectionStreamingText(sessionId)
+          clearCorrectionInFlight(sessionId)
           get().updateSessionCorrection(sessionId, {
             status: 'error',
             error: err instanceof Error ? err.message : '纠错失败',

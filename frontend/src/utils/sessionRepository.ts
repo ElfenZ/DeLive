@@ -13,6 +13,8 @@ import {
 import type { TranscriptPersistenceSnapshot } from './sessionSnapshot'
 import { hasPostProcessContent } from './transcriptState'
 
+const STALE_CORRECTION_ERROR = 'AI 纠错未完成，请重新启动纠错'
+
 export type SessionProgressSnapshot = TranscriptPersistenceSnapshot
 
 export interface SessionLaunchState {
@@ -108,6 +110,24 @@ function updateSessionCollection(
   })
 }
 
+function recoverStaleCorrection(session: TranscriptSession, now: number): TranscriptSession {
+  const status = session.correction?.status
+  if (status !== 'detecting' && status !== 'correcting') {
+    return session
+  }
+
+  return {
+    ...session,
+    correction: {
+      ...session.correction,
+      mode: session.correction?.mode ?? 'quick',
+      status: 'error',
+      error: STALE_CORRECTION_ERROR,
+    },
+    updatedAt: now,
+  }
+}
+
 export const sessionRepository = {
   async loadForLaunch(): Promise<SessionLaunchState> {
     const loadedSessions = await getSessions()
@@ -118,14 +138,25 @@ export const sessionRepository = {
     const interruptedSessionIds: string[] = []
     const now = Date.now()
 
+    const staleCorrectionSessionIds: string[] = []
+
     sessions = sessions.map((session) => {
+      const correctionStatus = session.correction?.status
+      const nextSession = correctionStatus === 'detecting' || correctionStatus === 'correcting'
+        ? recoverStaleCorrection(session, now)
+        : session
+
+      if (nextSession !== session) {
+        staleCorrectionSessionIds.push(session.id)
+      }
+
       if (session.status !== 'recording') {
-        return session
+        return nextSession
       }
 
       interruptedSessionIds.push(session.id)
       return {
-        ...session,
+        ...nextSession,
         status: 'interrupted',
         wasInterrupted: true,
         updatedAt: now,
@@ -137,8 +168,9 @@ export const sessionRepository = {
       ? Array.from(new Set([
         ...sessions.map((session) => session.id),
         ...interruptedSessionIds,
+        ...staleCorrectionSessionIds,
       ]))
-      : interruptedSessionIds
+      : Array.from(new Set([...interruptedSessionIds, ...staleCorrectionSessionIds]))
 
     if (sessionIdsToPersist.length > 0) {
       sessions = persistSessionBatch(sessionIdsToPersist, sessions)

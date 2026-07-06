@@ -21,6 +21,12 @@ const electronAPI: ElectronAPI = {
   setAutoLaunch: (enable: boolean) => ipcRenderer.invoke('set-auto-launch', enable) as Promise<boolean>,
   pickFilePath: (options) => ipcRenderer.invoke('pick-file-path', options) as Promise<string | null>,
   pathExists: (targetPath: string) => ipcRenderer.invoke('path-exists', targetPath) as Promise<boolean>,
+  saveRecordingArchive: (request) => ipcRenderer.invoke('save-recording-archive', request),
+  beginRecordingArchive: (request) => ipcRenderer.invoke('begin-recording-archive', request),
+  appendRecordingArchive: (request) => ipcRenderer.invoke('append-recording-archive', request),
+  finalizeRecordingArchive: (request) => ipcRenderer.invoke('finalize-recording-archive', request),
+  recoverRecordingArchives: () => ipcRenderer.invoke('recover-recording-archives'),
+  revealRecordingArchive: (targetPath: string) => ipcRenderer.invoke('reveal-recording-archive', targetPath),
 
   localRuntimeGetStatus: (runtimeId: string, options) =>
     ipcRenderer.invoke('local-runtime-get-status', runtimeId, options),
