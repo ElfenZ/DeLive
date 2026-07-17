@@ -13,8 +13,8 @@ import { normalizeTranscriptSessions } from './sessionSchema'
 import { getDefaultSettings } from './storageShared'
 import { generateId } from './storageUtils'
 
-export const CURRENT_BACKUP_VERSION = '3.0'
-export const CURRENT_BACKUP_SCHEMA_VERSION = 3
+export const CURRENT_BACKUP_VERSION = '4.0'
+export const CURRENT_BACKUP_SCHEMA_VERSION = 4
 
 function mergeProviderApiKeys(
   current?: Record<string, ProviderConfigData>,
@@ -191,6 +191,40 @@ function normalizeAiPostProcessConfig(value: unknown): AiPostProcessConfig | und
       }))
       .filter((entry) => entry.source.trim() || entry.target.trim())
     : undefined
+  const correctionStructuredOutput = value.correctionStructuredOutput === 'prompt-json'
+    || value.correctionStructuredOutput === 'json_object'
+    || value.correctionStructuredOutput === 'json_schema'
+    ? value.correctionStructuredOutput
+    : undefined
+  const advancedValue = isRecord(value.correctionAdvanced) ? value.correctionAdvanced : undefined
+  const safetyValue = advancedValue && isRecord(advancedValue.safetyLimits) ? advancedValue.safetyLimits : undefined
+  const positiveInteger = (candidate: unknown): number | undefined => (
+    typeof candidate === 'number' && Number.isInteger(candidate) && candidate > 0 ? candidate : undefined
+  )
+  const nonNegativeInteger = (candidate: unknown): number | undefined => (
+    typeof candidate === 'number' && Number.isInteger(candidate) && candidate >= 0 ? candidate : undefined
+  )
+  const nonNegativeNumber = (candidate: unknown): number | undefined => (
+    typeof candidate === 'number' && Number.isFinite(candidate) && candidate >= 0 ? candidate : undefined
+  )
+  const safetyLimits = safetyValue ? {
+    maxPatchTextLength: positiveInteger(safetyValue.maxPatchTextLength),
+    maxPatchesPerShard: positiveInteger(safetyValue.maxPatchesPerShard),
+    maxCumulativeEditRatio: nonNegativeNumber(safetyValue.maxCumulativeEditRatio),
+    maxNetLengthChangeRatio: nonNegativeNumber(safetyValue.maxNetLengthChangeRatio),
+  } : undefined
+  const normalizedSafetyLimits = safetyLimits && Object.values(safetyLimits).some((item) => item !== undefined)
+    ? safetyLimits
+    : undefined
+  const correctionAdvanced = advancedValue ? {
+    chunkSize: positiveInteger(advancedValue.chunkSize),
+    contextSize: nonNegativeInteger(advancedValue.contextSize),
+    concurrency: positiveInteger(advancedValue.concurrency),
+    safetyLimits: normalizedSafetyLimits,
+  } : undefined
+  const normalizedCorrectionAdvanced = correctionAdvanced && Object.values(correctionAdvanced).some((item) => item !== undefined)
+    ? correctionAdvanced
+    : undefined
 
   return {
     enabled: typeof value.enabled === 'boolean' ? value.enabled : undefined,
@@ -208,6 +242,8 @@ function normalizeAiPostProcessConfig(value: unknown): AiPostProcessConfig | und
     enableStreaming: typeof value.enableStreaming === 'boolean' ? value.enableStreaming : undefined,
     glossary,
     autoCorrectionDetection: typeof value.autoCorrectionDetection === 'boolean' ? value.autoCorrectionDetection : undefined,
+    correctionStructuredOutput,
+    correctionAdvanced: normalizedCorrectionAdvanced,
   }
 }
 

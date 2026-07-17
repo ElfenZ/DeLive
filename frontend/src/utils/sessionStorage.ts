@@ -33,17 +33,22 @@ function clearLegacySessionsFromLocalStorage(): void {
   )
 }
 
-function upsertLegacySessionInLocalStorage(session: TranscriptSession): void {
+function upsertLegacySessionInLocalStorageStrict(session: TranscriptSession): void {
   const sessions = getLegacySessionsFromLocalStorage()
   const index = sessions.findIndex((item) => item.id === session.id)
+  if (index === -1) sessions.unshift(session)
+  else sessions[index] = session
+  localStorage.setItem(STORAGE_KEYS.SESSIONS, JSON.stringify(sortSessions(sessions)))
+}
 
-  if (index === -1) {
-    sessions.unshift(session)
-  } else {
-    sessions[index] = session
+function upsertLegacySessionsInLocalStorageStrict(nextSessions: TranscriptSession[]): void {
+  const sessions = getLegacySessionsFromLocalStorage()
+  for (const session of nextSessions) {
+    const index = sessions.findIndex((item) => item.id === session.id)
+    if (index === -1) sessions.unshift(session)
+    else sessions[index] = session
   }
-
-  saveLegacySessionsToLocalStorage(sortSessions(sessions))
+  localStorage.setItem(STORAGE_KEYS.SESSIONS, JSON.stringify(sortSessions(sessions)))
 }
 
 function deleteLegacySessionFromLocalStorage(id: string): void {
@@ -106,10 +111,14 @@ async function replaceSessionsInIndexedDb(sessions: TranscriptSession[]): Promis
 
 async function upsertSessionInIndexedDb(session: TranscriptSession): Promise<void> {
   const db = await openAppDatabase()
-  await createTransaction<void>(db, SESSION_STORE, 'readwrite', (store, resolve, reject) => {
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(SESSION_STORE, 'readwrite')
+    const store = transaction.objectStore(SESSION_STORE)
     const request = store.put(session)
     request.onerror = () => reject(request.error ?? new Error('Failed to upsert session in IndexedDB'))
-    request.onsuccess = () => resolve()
+    transaction.onerror = () => reject(transaction.error ?? new Error('Failed to upsert session in IndexedDB'))
+    transaction.onabort = () => reject(transaction.error ?? new Error('IndexedDB session upsert was aborted'))
+    transaction.oncomplete = () => resolve()
   })
 }
 
@@ -195,7 +204,7 @@ export async function saveSessions(sessions: TranscriptSession[]): Promise<void>
 
 export async function upsertSession(session: TranscriptSession): Promise<void> {
   if (!supportsIndexedDb()) {
-    upsertLegacySessionInLocalStorage(session)
+    upsertLegacySessionInLocalStorageStrict(session)
     return
   }
 
@@ -204,7 +213,7 @@ export async function upsertSession(session: TranscriptSession): Promise<void> {
     await upsertSessionInIndexedDb(session)
   } catch (error) {
     console.error('Failed to upsert session in IndexedDB, falling back to localStorage:', error)
-    upsertLegacySessionInLocalStorage(session)
+    upsertLegacySessionInLocalStorageStrict(session)
   }
 }
 
@@ -212,9 +221,7 @@ export async function upsertSessions(sessions: TranscriptSession[]): Promise<voi
   const sortedSessions = sortSessions(sessions)
 
   if (!supportsIndexedDb()) {
-    for (const session of sortedSessions) {
-      upsertLegacySessionInLocalStorage(session)
-    }
+    upsertLegacySessionsInLocalStorageStrict(sortedSessions)
     return
   }
 
@@ -223,9 +230,7 @@ export async function upsertSessions(sessions: TranscriptSession[]): Promise<voi
     await upsertSessionsInIndexedDb(sortedSessions)
   } catch (error) {
     console.error('Failed to upsert sessions in IndexedDB, falling back to localStorage:', error)
-    for (const session of sortedSessions) {
-      upsertLegacySessionInLocalStorage(session)
-    }
+    upsertLegacySessionsInLocalStorageStrict(sortedSessions)
   }
 }
 

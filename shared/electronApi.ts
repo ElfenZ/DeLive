@@ -205,6 +205,16 @@ export interface SessionDetail {
     status: string
     mode: string
   }
+  correctionMeta?: {
+    sourceKind: 'published' | 'legacy' | 'none'
+    formatVersion?: number
+    sourceHash?: string
+    publishedStatus?: 'available' | 'none'
+    draftStatus?: string
+    appliedPatches?: number
+    rejectedPatches?: number
+    updatedAt?: number
+  }
 }
 
 export interface ApiRecordingStatus {

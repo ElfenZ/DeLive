@@ -162,4 +162,18 @@ describe('generateSubtitleFromSession', () => {
     expect(result).not.toContain('WEBVTT')
     expect(result).toContain('-->')
   })
+
+  it('ignores published correction text and always exports original ASR data', () => {
+    const session = makeSession({
+      tokens: [{ text: 'Original ASR.', startMs: 0, endMs: 1000 }],
+      correction: {
+        status: 'done',
+        mode: 'quick',
+        correctedText: 'Corrected output.',
+      },
+    })
+    const result = generateSubtitleFromSession(session, 'srt')
+    expect(result).toContain('Original ASR.')
+    expect(result).not.toContain('Corrected output.')
+  })
 })

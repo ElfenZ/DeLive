@@ -7,6 +7,22 @@ export interface WhatsNewEntry {
 
 const entries: WhatsNewEntry[] = [
   {
+    version: '2.5.3',
+    date: '2026-07-16',
+    features: [
+      {
+        zh: 'AI 严格纠错 Patch 引擎 — 分片检测、本地校验、Review 批量选择、暂停续跑与单条撤销',
+        en: 'Strict AI correction Patch engine — shard detection, local validation, Review bulk selection, resumable tasks, and per-patch revert',
+      },
+    ],
+    fixes: [
+      {
+        zh: '修复纠错降级时说话人和时间消失的问题；跨说话人修正会标为 S?，损坏分段会保留原分段并附完整修正稿',
+        en: 'Fixed speakers and timestamps disappearing during correction fallback; cross-speaker edits are marked S?, while damaged segmentation preserves original segments plus the complete correction',
+      },
+    ],
+  },
+  {
     version: '2.2.4',
     date: '2026-05-21',
     features: [

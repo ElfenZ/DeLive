@@ -7,6 +7,8 @@ import type {
   TranscriptPostProcess,
   TranscriptQaCitation,
   TranscriptSession,
+  TranscriptTextSourceKind,
+  TranscriptTextSourceMetadata,
 } from '../types'
 
 const DEFAULT_AI_BASE_URL = 'http://127.0.0.1:11434/v1'
@@ -82,16 +84,19 @@ interface SessionMindMapPayload {
 
 export interface SessionBriefingResult {
   postProcess: TranscriptPostProcess
+  source: ResolvedTranscriptText
 }
 
 export interface SessionQaResult {
   answer: string
   citations?: TranscriptQaCitation[]
   model: string
+  source?: ResolvedTranscriptText
 }
 
 export interface SessionMindMapResult {
   mindMap: TranscriptMindMap
+  source: ResolvedTranscriptText
 }
 
 function getAiConfig(settings: AppSettings): AiPostProcessConfig {
@@ -321,25 +326,61 @@ function buildUserPrompt(
   ].join('\n\n')
 }
 
+function fastTextHash(text: string): string {
+  let hash = 0x811c9dc5
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return `fnv1a-${(hash >>> 0).toString(16).padStart(8, '0')}-${text.length}`
+}
+
+export interface ResolvedTranscriptText {
+  text: string
+  sourceKind: TranscriptTextSourceKind
+  sourceTextHash: string
+  sourceResultId?: string
+}
+
+export type TranscriptArtifactSourceState = 'current' | 'stale' | 'unknown'
+
+export function resolveTranscriptArtifactSourceState(
+  artifact: TranscriptTextSourceMetadata,
+  current: ResolvedTranscriptText,
+): TranscriptArtifactSourceState {
+  if (!artifact.sourceKind || artifact.sourceKind === 'legacy-unknown' || !artifact.sourceTextHash) return 'unknown'
+  if (artifact.sourceKind !== current.sourceKind || artifact.sourceTextHash !== current.sourceTextHash) return 'stale'
+  if (artifact.sourceResultId && artifact.sourceResultId !== current.sourceResultId) return 'stale'
+  return 'current'
+}
+
+function sourceMetadata(source: ResolvedTranscriptText): TranscriptTextSourceMetadata {
+  return {
+    sourceKind: source.sourceKind,
+    sourceTextHash: source.sourceTextHash,
+    sourceResultId: source.sourceResultId,
+  }
+}
+
 export function resolveTranscriptText(
   session: TranscriptSession,
   preference: AiPostProcessConfig['preferCorrectedText'],
-): string {
+): ResolvedTranscriptText {
   const pref = preference || 'auto'
-  const hasCorrected = session.correction?.status === 'done'
-    && typeof session.correction.correctedText === 'string'
-    && session.correction.correctedText.trim().length > 0
-
-  if (pref === 'corrected' && hasCorrected) return session.correction!.correctedText!.trim()
-  if (pref === 'auto' && hasCorrected) return session.correction!.correctedText!.trim()
-  return session.transcript.trim()
+  const published = session.correction?.published
+  const legacy = session.correction?.legacy
+  if (pref !== 'original' && published?.correctedText) return { text: published.correctedText, sourceKind: 'published-correction', sourceTextHash: published.outputTextHash, sourceResultId: published.id }
+  if (pref !== 'original' && legacy?.correctedText) return { text: legacy.correctedText, sourceKind: 'legacy-correction', sourceTextHash: fastTextHash(legacy.correctedText) }
+  const compatibilityText = session.correction?.status === 'done' ? session.correction.correctedText : undefined
+  if (pref !== 'original' && compatibilityText?.trim()) return { text: compatibilityText, sourceKind: 'legacy-correction', sourceTextHash: fastTextHash(compatibilityText) }
+  return { text: session.transcript, sourceKind: 'original', sourceTextHash: fastTextHash(session.transcript) }
 }
 
 function buildSessionContextBlock(
   session: TranscriptSession,
   preference?: AiPostProcessConfig['preferCorrectedText'],
 ): string {
-  const transcript = resolveTranscriptText(session, preference)
+  const transcript = resolveTranscriptText(session, preference).text
   const clippedTranscript = transcript.length > MAX_TRANSCRIPT_CHARS
     ? `${transcript.slice(0, MAX_TRANSCRIPT_CHARS)}\n\n[truncated]`
     : transcript
@@ -561,8 +602,10 @@ export async function generateSessionBriefing(
   const payload = await response.json() as ChatCompletionResponse
   const content = extractTextContent(payload.choices)
   const postProcess = parseAiBriefingResponse(content, model)
+  const source = resolveTranscriptText(session, config.preferCorrectedText)
+  Object.assign(postProcess, sourceMetadata(source))
 
-  return { postProcess }
+  return { postProcess, source }
 }
 
 export async function askQuestionForSession(
@@ -629,7 +672,9 @@ export async function askQuestionForSession(
 
   const payload = await response.json() as ChatCompletionResponse
   const content = extractTextContent(payload.choices)
-  return parseSessionQaResponse(content, model)
+  const result = parseSessionQaResponse(content, model)
+  result.source = resolveTranscriptText(session, config.preferCorrectedText)
+  return result
 }
 
 export interface AskStreamCallbacks {
@@ -729,6 +774,7 @@ export async function askQuestionForSessionStreaming(
     }
 
     const result = parseSessionQaResponse(fullText, model)
+    result.source = resolveTranscriptText(session, config.preferCorrectedText)
     callbacks.onDone(fullText, result)
   } catch (err) {
     if (options?.signal?.aborted) return
@@ -784,6 +830,8 @@ export async function generateSessionMindMap(
   const payload = await response.json() as ChatCompletionResponse
   const content = extractTextContent(payload.choices)
   const mindMap = parseSessionMindMapResponse(content, model)
+  const source = resolveTranscriptText(session, config.preferCorrectedText)
+  Object.assign(mindMap, sourceMetadata(source))
 
-  return { mindMap }
+  return { mindMap, source }
 }

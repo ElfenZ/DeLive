@@ -369,6 +369,12 @@ export function ChatTab({ session }: ChatTabProps) {
                         </div>
                       )}
 
+                      {turn.status === 'success' && turn.answer && (
+                        <div className="mt-2">
+                          <TextSourceBanner session={session} artifact={turn} />
+                        </div>
+                      )}
+
                       {/* Citations */}
                       {turn.citations && turn.citations.length > 0 && (
                         <div className="mt-4 space-y-2">

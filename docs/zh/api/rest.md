@@ -80,7 +80,7 @@ curl "http://localhost:23456/api/v1/sessions?search=standup&limit=5"
 
 ### GET /sessions/:id
 
-完整会话详情，包含转录、AI 摘要、思维导图和问答历史。
+完整会话详情，包含转录、AI 摘要、思维导图和问答历史。存在纠错数据时，可选的 `correctionMeta` 仅返回兼容状态、来源哈希、数量和时间；不会暴露 Patch 明细或可续跑草稿。
 
 ```bash
 curl http://localhost:23456/api/v1/sessions/abc123

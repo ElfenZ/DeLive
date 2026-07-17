@@ -463,8 +463,8 @@ export function AiPostProcessPanel({
         </label>
         <p className="text-xs text-muted-foreground">
           {isZh
-            ? '选择 AI 纠错的工作方式。直接纠错会一次性输出修改后全文；先检测后纠错会先列出问题清单供你确认。'
-            : 'Choose how AI correction works. Quick mode outputs corrected text directly; Review mode lists issues for confirmation first.'}
+            ? '两种模式都使用分片 Patch。Quick 自动应用通过硬校验的 Patch；Review 默认全部选中，确认后仅在本地应用。'
+            : 'Both modes use shard-based patches. Quick applies patches that pass hard validation; Review selects all by default and applies locally.'}
         </p>
         <div className="flex gap-2">
           <button
@@ -487,6 +487,32 @@ export function AiPostProcessPanel({
           >
             {isZh ? '先检测后纠错' : 'Review & Fix'}
           </button>
+        </div>
+      </section>
+
+      <section className="workspace-panel-muted p-4 space-y-3">
+        <label className="text-sm font-medium leading-none flex items-center gap-2">
+          <Sparkles className="w-3.5 h-3.5 text-muted-foreground" />
+          {isZh ? '纠错结构化输出' : 'Correction structured output'}
+        </label>
+        <p className="text-xs text-muted-foreground">
+          {isZh ? '按服务端能力显式选择，不支持时会报错，不会自动降级重试。' : 'Choose explicitly for your endpoint. Unsupported modes fail without automatic downgrade.'}
+        </p>
+        <div className="grid grid-cols-3 gap-2">
+          {(['prompt-json', 'json_object', 'json_schema'] as const).map((option) => (
+            <button
+              key={option}
+              type="button"
+              onClick={() => updateAiPostProcessConfig({ correctionStructuredOutput: option })}
+              className={`h-9 rounded-md px-2 text-xs font-medium ${
+                (cfg.correctionStructuredOutput || 'prompt-json') === option
+                  ? 'border-2 border-primary bg-primary/10 text-primary'
+                  : 'border border-input bg-background hover:bg-accent'
+              }`}
+            >
+              {option}
+            </button>
+          ))}
         </div>
       </section>
 

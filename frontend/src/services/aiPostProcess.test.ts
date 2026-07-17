@@ -4,6 +4,7 @@ import {
   parseSessionMindMapResponse,
   parseSessionQaResponse,
   isAiPostProcessConfigured,
+  resolveTranscriptArtifactSourceState,
   resolveTranscriptText,
 } from './aiPostProcess'
 import type { TranscriptSession } from '../types'
@@ -173,56 +174,57 @@ describe('resolveTranscriptText', () => {
   } as unknown as TranscriptSession
 
   it('auto: uses corrected text when available and done', () => {
-    expect(resolveTranscriptText(sessionWithCorrection, 'auto'))
-      .toBe('corrected clean transcript')
+    expect(resolveTranscriptText(sessionWithCorrection, 'auto')).toMatchObject({ text: '  corrected clean transcript  ', sourceKind: 'legacy-correction' })
   })
 
   it('auto: falls back to original when no correction', () => {
-    expect(resolveTranscriptText(baseSession, 'auto'))
-      .toBe('original raw transcript')
+    expect(resolveTranscriptText(baseSession, 'auto')).toMatchObject({ text: '  original raw transcript  ', sourceKind: 'original' })
   })
 
   it('auto: falls back to original when correction is still in progress', () => {
-    expect(resolveTranscriptText(sessionCorrecting, 'auto'))
-      .toBe('original raw transcript')
+    expect(resolveTranscriptText(sessionCorrecting, 'auto').text).toBe('  original raw transcript  ')
   })
 
   it('auto: falls back to original after reset (status=idle, correctedText=undefined)', () => {
-    expect(resolveTranscriptText(sessionReset, 'auto'))
-      .toBe('original raw transcript')
+    expect(resolveTranscriptText(sessionReset, 'auto').text).toBe('  original raw transcript  ')
   })
 
   it('auto: falls back to original when correctedText is whitespace-only', () => {
-    expect(resolveTranscriptText(sessionEmptyCorrection, 'auto'))
-      .toBe('original raw transcript')
+    expect(resolveTranscriptText(sessionEmptyCorrection, 'auto').text).toBe('  original raw transcript  ')
   })
 
   it('original: always uses original transcript even when corrected exists', () => {
-    expect(resolveTranscriptText(sessionWithCorrection, 'original'))
-      .toBe('original raw transcript')
+    expect(resolveTranscriptText(sessionWithCorrection, 'original').text).toBe('  original raw transcript  ')
   })
 
   it('corrected: uses corrected text when available', () => {
-    expect(resolveTranscriptText(sessionWithCorrection, 'corrected'))
-      .toBe('corrected clean transcript')
+    expect(resolveTranscriptText(sessionWithCorrection, 'corrected').text).toBe('  corrected clean transcript  ')
   })
 
   it('corrected: falls back to original when no correction available', () => {
-    expect(resolveTranscriptText(baseSession, 'corrected'))
-      .toBe('original raw transcript')
+    expect(resolveTranscriptText(baseSession, 'corrected').text).toBe('  original raw transcript  ')
   })
 
   it('undefined preference defaults to auto behavior', () => {
-    expect(resolveTranscriptText(sessionWithCorrection, undefined))
-      .toBe('corrected clean transcript')
-    expect(resolveTranscriptText(baseSession, undefined))
-      .toBe('original raw transcript')
+    expect(resolveTranscriptText(sessionWithCorrection, undefined).text).toBe('  corrected clean transcript  ')
+    expect(resolveTranscriptText(baseSession, undefined).text).toBe('  original raw transcript  ')
   })
 
-  it('trims whitespace from both original and corrected text', () => {
-    expect(resolveTranscriptText(baseSession, 'original'))
-      .toBe('original raw transcript')
-    expect(resolveTranscriptText(sessionWithCorrection, 'corrected'))
-      .toBe('corrected clean transcript')
+  it('preserves exact source whitespace for hashing and provenance', () => {
+    expect(resolveTranscriptText(baseSession, 'original').text).toBe('  original raw transcript  ')
+    expect(resolveTranscriptText(sessionWithCorrection, 'corrected').text).toBe('  corrected clean transcript  ')
+  })
+
+  it('classifies persisted artifact provenance as current, stale, or unknown', () => {
+    const current = resolveTranscriptText(baseSession, 'original')
+    expect(resolveTranscriptArtifactSourceState({
+      sourceKind: current.sourceKind,
+      sourceTextHash: current.sourceTextHash,
+    }, current)).toBe('current')
+    expect(resolveTranscriptArtifactSourceState({
+      sourceKind: current.sourceKind,
+      sourceTextHash: 'different',
+    }, current)).toBe('stale')
+    expect(resolveTranscriptArtifactSourceState({ sourceKind: 'legacy-unknown' }, current)).toBe('unknown')
   })
 })

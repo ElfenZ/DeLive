@@ -46,6 +46,7 @@ yarn-error.log*
 
 # Testing
 coverage/
+correction-gold/
 
 # Misc
 *.tsbuildinfo

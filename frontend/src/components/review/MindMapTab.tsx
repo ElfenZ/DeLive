@@ -239,7 +239,7 @@ export function MindMapTab({ session }: MindMapTabProps) {
     <div className="flex h-full flex-col overflow-hidden">
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2 border-b border-border bg-muted/20 px-5 py-3">
-        <TextSourceBanner session={session} />
+        <TextSourceBanner session={session} artifact={hasMindMap ? session.mindMap : undefined} />
         <button
           onClick={() => void handleGenerate()}
           disabled={!aiConfigured || !hasTranscript || generating}

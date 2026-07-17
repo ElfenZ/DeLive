@@ -109,7 +109,7 @@ Search sessions by keyword in title or transcript content.
 
 ### get_session
 
-Get full session detail including transcript, corrected transcript (when available), AI summary, mind map, and Q&A history.
+Get full session detail including transcript, corrected transcript (when available), AI summary, mind map, and Q&A history. Correction metadata is summary-only; patch and draft payloads are not exposed.
 
 | Parameter | Type | Required |
 |-----------|------|----------|

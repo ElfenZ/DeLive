@@ -34,7 +34,9 @@ export function AiTab({ session }: AiTabProps) {
     postProcess?.summary?.trim()
     || postProcess?.actionItems?.length
     || postProcess?.keywords?.length
-    || postProcess?.chapters?.length,
+    || postProcess?.chapters?.length
+    || postProcess?.titleSuggestion?.trim()
+    || postProcess?.tagSuggestions?.length
   )
 
   const handleGenerateAiBriefing = async () => {
@@ -74,7 +76,7 @@ export function AiTab({ session }: AiTabProps) {
               <Sparkles className="w-3.5 h-3.5" />
               {t.preview.aiBriefing}
             </div>
-            <TextSourceBanner session={session} />
+            <TextSourceBanner session={session} artifact={hasAiContent ? postProcess : undefined} />
             {!aiConfigured && (
               <p className="text-xs text-muted-foreground">{t.preview.aiNotConfigured}</p>
             )}

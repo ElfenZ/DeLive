@@ -1,383 +1,215 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import type { TranscriptSession, AppSettings, CorrectionIssue } from '../types'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { AppSettings, TranscriptSession } from '../types'
+import { createCorrectionShards } from '../utils/correctionPatch'
+import {
+  CorrectionRequestError,
+  buildCorrectionRequestBody,
+  createCorrectionConfigSnapshot,
+  detectCorrectionIssues,
+  normalizeAiCorrectionGlossary,
+  requestCorrectionShard,
+} from './aiCorrection'
 
-function makeSession(overrides: Partial<TranscriptSession> = {}): TranscriptSession {
+function session(transcript = '需要侍应新的工作。'): TranscriptSession {
   return {
-    id: 'test-session',
-    title: 'Test Session',
-    transcript: '这是一段测试转录文本。',
-    startTime: Date.now(),
-    endTime: Date.now() + 60_000,
-    provider: 'soniox',
-    segments: [],
-    tags: [],
-    ...overrides,
-  } as TranscriptSession
+    id: 'session-1',
+    title: 'Session',
+    date: '2026-07-16',
+    time: '12:00',
+    createdAt: 1,
+    updatedAt: 1,
+    transcript,
+  }
 }
 
-function makeSettings(overrides: Partial<AppSettings['aiPostProcess']> = {}): AppSettings {
+function settings(overrides: Partial<NonNullable<AppSettings['aiPostProcess']>> = {}): AppSettings {
   return {
     apiKey: '',
-    languageHints: ['zh', 'en'],
+    languageHints: [],
     aiPostProcess: {
       enabled: true,
-      provider: 'openai-compatible',
-      baseUrl: 'http://127.0.0.1:11434/v1',
-      model: 'qwen2.5:7b',
+      baseUrl: 'http://127.0.0.1:11434/v1/',
+      defaultModel: 'qwen',
       promptLanguage: 'zh',
+      correctionStructuredOutput: 'prompt-json',
       ...overrides,
     },
-  } as AppSettings
+  }
 }
 
-const mockIssues: CorrectionIssue[] = [
-  {
-    id: '1',
-    originalText: '侍应',
-    suggestedText: '时应',
-    reason: '同音字替换',
-    category: 'homophone',
-    accepted: true,
-  },
-]
+function response(content: string, status = 200, headers: Record<string, string> = {}) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: (name: string) => headers[name] ?? null },
+    json: async () => ({
+      choices: [{ message: { content } }],
+      usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+    }),
+    text: async () => content,
+  }
+}
 
-describe('aiCorrection — extractTextContent', async () => {
-  // Import module to ensure it loads without errors
-  await import('./aiCorrection')
+const validPatch = {
+  op: 'replace',
+  oldText: '侍应',
+  replacement: '适应',
+  before: '需要',
+  after: '新的',
+  category: 'homophone',
+  reason: '同音误识别',
+}
 
-  it('extracts JSON array from plain text', () => {
-    // Internal helper: extractJsonArray
-    // Tested indirectly via the module's parsing contract
-    const raw = JSON.stringify([{ id: '1', originalText: 'foo', suggestedText: 'bar', reason: 'test', category: 'other' }])
-    const parsed = JSON.parse(raw)
-    expect(parsed).toBeInstanceOf(Array)
-    expect(parsed[0].originalText).toBe('foo')
+describe('aiCorrection config and body', () => {
+  it('validates configuration and snapshots without credentials', () => {
+    const snapshot = createCorrectionConfigSnapshot(settings({ apiKey: 'secret' }))
+    expect(snapshot.baseUrl).toBe('http://127.0.0.1:11434/v1')
+    expect(snapshot.concurrency).toBe(1)
+    expect(snapshot).not.toHaveProperty('apiKey')
+    expect(snapshot.credentialRef).toBe('ai-post-process')
   })
 
-  it('extracts JSON array from fenced code block', () => {
-    const raw = '```json\n[{"id":"1","originalText":"A","suggestedText":"B","reason":"R","category":"homophone"}]\n```'
-    const match = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/i)
-    expect(match?.[1]).toBeDefined()
-    const parsed = JSON.parse(match![1].trim())
-    expect(parsed[0].category).toBe('homophone')
-  })
-})
-
-describe('aiCorrection — prompt builders', async () => {
-  // We can't test private functions directly, but we can verify the
-  // public API validates inputs before calling the AI.
-
-  const { detectCorrectionIssues, correctTranscriptQuick, correctTranscriptWithReview } = await import('./aiCorrection')
-
-  describe('detectCorrectionIssues — input validation', () => {
-    it('throws when AI post-process is disabled', async () => {
-      const settings = makeSettings({ enabled: false })
-      await expect(detectCorrectionIssues(makeSession(), settings)).rejects.toThrow(/启用/)
-    })
-
-    it('throws when model is not configured', async () => {
-      const settings = makeSettings({ model: '', defaultModel: '' })
-      await expect(detectCorrectionIssues(makeSession(), settings)).rejects.toThrow(/模型/)
-    })
-
-    it('throws when transcript is empty', async () => {
-      const settings = makeSettings()
-      await expect(detectCorrectionIssues(makeSession({ transcript: '  ' }), settings)).rejects.toThrow(/转录/)
-    })
+  it('normalizes and deduplicates glossary entries', () => {
+    expect(normalizeAiCorrectionGlossary([
+      { id: '1', source: ' difine ', target: ' Dify ', enabled: true },
+      { id: '2', source: 'difine', target: 'dify', enabled: true },
+      { id: '3', source: 'disabled', target: 'x', enabled: false },
+    ])).toEqual([{ id: '1', source: 'difine', target: 'Dify', enabled: true, note: undefined }])
   })
 
-  describe('correctTranscriptQuick — input validation', () => {
-    const noopCallbacks = { onChunk: vi.fn(), onDone: vi.fn(), onError: vi.fn() }
-
-    it('throws when AI is disabled', async () => {
-      const settings = makeSettings({ enabled: false })
-      await expect(correctTranscriptQuick(makeSession(), settings, noopCallbacks)).rejects.toThrow(/启用/)
+  it.each([
+    ['prompt-json', undefined],
+    ['json_object', 'json_object'],
+    ['json_schema', 'json_schema'],
+  ] as const)('builds %s response format without streaming', (mode, expected) => {
+    const transcript = 'before CORE after'
+    const snapshot = createCorrectionConfigSnapshot(settings({ correctionStructuredOutput: mode }))
+    const body = buildCorrectionRequestBody({
+      transcript,
+      shard: { id: 's', index: 0, contextStart: 0, coreStart: 7, coreEnd: 11, contextEnd: transcript.length },
+      snapshot,
     })
-
-    it('throws when model is missing', async () => {
-      const settings = makeSettings({ model: '' })
-      await expect(correctTranscriptQuick(makeSession(), settings, noopCallbacks)).rejects.toThrow(/模型/)
-    })
-
-    it('throws when transcript is empty', async () => {
-      const settings = makeSettings()
-      await expect(
-        correctTranscriptQuick(makeSession({ transcript: '' }), settings, noopCallbacks),
-      ).rejects.toThrow(/转录/)
-    })
-  })
-
-  describe('correctTranscriptWithReview — input validation', () => {
-    const noopCallbacks = { onChunk: vi.fn(), onDone: vi.fn(), onError: vi.fn() }
-
-    it('throws when AI is disabled', async () => {
-      const settings = makeSettings({ enabled: false })
-      await expect(
-        correctTranscriptWithReview(makeSession(), mockIssues, settings, noopCallbacks),
-      ).rejects.toThrow(/启用/)
-    })
-
-    it('throws when no accepted issues', async () => {
-      const settings = makeSettings()
-      await expect(
-        correctTranscriptWithReview(makeSession(), [], settings, noopCallbacks),
-      ).rejects.toThrow(/修改项/)
-    })
+    expect(body.stream).toBe(false)
+    expect((body.response_format as { type?: string } | undefined)?.type).toBe(expected)
+    const user = (body.messages as Array<{ role: string; content: string }>)[1].content
+    expect(user).toContain('<EDITABLE_CORE>\nCORE\n</EDITABLE_CORE>')
+    expect(user).toContain('<READ_ONLY_BEFORE>\nbefore ')
   })
 })
 
-describe('aiCorrection — detectCorrectionIssues with mock fetch', async () => {
-  const { detectCorrectionIssues } = await import('./aiCorrection')
-
+describe('aiCorrection transport', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
+    vi.useRealTimers()
   })
 
-  it('parses a valid detection response', async () => {
-    const issues = [
-      { id: '1', originalText: '侍应', suggestedText: '时应', reason: '同音', category: 'homophone' },
-      { id: '2', originalText: '标点', suggestedText: '标点。', reason: '缺失句号', category: 'punctuation' },
-    ]
-
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        choices: [{ message: { content: JSON.stringify(issues) } }],
-      }),
-    }))
-
-    const result = await detectCorrectionIssues(makeSession(), makeSettings())
-    expect(result.issues).toHaveLength(2)
-    expect(result.issues[0].originalText).toBe('侍应')
-    expect(result.issues[0].category).toBe('homophone')
-    expect(result.issues[1].category).toBe('punctuation')
-    expect(result.model).toBe('qwen2.5:7b')
-
-    vi.unstubAllGlobals()
-  })
-
-  it('sends speaker-labelled segments when speaker diarization exists', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        choices: [{ message: { content: '[]' } }],
-      }),
+  it('parses strict patches and extracts usage', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(JSON.stringify({ patches: [validPatch] }))))
+    const transcript = session().transcript
+    const result = await requestCorrectionShard({
+      transcript,
+      shard: createCorrectionShards(transcript)[0],
+      snapshot: createCorrectionConfigSnapshot(settings()),
     })
+    expect(result.patches).toEqual([validPatch])
+    expect(result.usage?.totalTokens).toBe(30)
+    expect(result.attempt).toBe(1)
+  })
+
+  it('never sends the safe-storage placeholder as an authorization token', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response(JSON.stringify({ patches: [] })))
     vi.stubGlobal('fetch', fetchMock)
-
-    await detectCorrectionIssues(makeSession({
-      transcript: 'flat transcript without speaker labels',
-      speakers: [
-        { id: 'spk_0', label: 'Speaker 1' },
-        { id: 'spk_1', label: 'Speaker 2', displayName: 'Alice' },
-      ],
-      segments: [
-        { speakerId: 'spk_0', text: '大家好。' },
-        { speakerId: 'spk_1', text: '我们开始吧。' },
-      ],
-    }), makeSettings())
-
-    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
-    const userMessage = body.messages.find((message: { role: string }) => message.role === 'user')
-    expect(userMessage.content).toContain('Speaker 1: 大家好。')
-    expect(userMessage.content).toContain('Alice: 我们开始吧。')
-    expect(userMessage.content).not.toContain('flat transcript without speaker labels')
-
-    vi.unstubAllGlobals()
+    const transcript = session().transcript
+    await requestCorrectionShard({
+      transcript,
+      shard: createCorrectionShards(transcript)[0],
+      snapshot: createCorrectionConfigSnapshot(settings()),
+      apiKey: '{{SAFE_STORAGE}}',
+    })
+    expect(fetchMock.mock.calls[0][1].headers).not.toHaveProperty('Authorization')
   })
 
-  it('includes enabled non-empty glossary entries in detection prompts and omits invalid entries', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        choices: [{ message: { content: '[]' } }],
-      }),
-    })
+  it('retries 429 and respects Retry-After', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response('busy', 429, { 'Retry-After': '2' }))
+      .mockResolvedValueOnce(response(JSON.stringify({ patches: [] })))
     vi.stubGlobal('fetch', fetchMock)
-
-    await detectCorrectionIssues(makeSession({ transcript: 'difine is useful' }), makeSettings({
-      glossary: [
-        { id: '1', source: ' difine ', target: ' dify ', note: 'product', enabled: true },
-        { id: '2', source: 'disabled', target: 'enabled', enabled: false },
-        { id: '3', source: '', target: 'missing source', enabled: true },
-        { id: '4', source: 'difine', target: 'dify', enabled: true },
-      ],
-    }))
-
-    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
-    const systemMessage = body.messages.find((message: { role: string }) => message.role === 'system')
-    const userMessage = body.messages.find((message: { role: string }) => message.role === 'user')
-    expect(systemMessage.content).toContain('词汇表')
-    expect(userMessage.content).toContain('"difine" -> "dify"')
-    expect(userMessage.content).toContain('product')
-    expect(userMessage.content).not.toContain('disabled')
-    expect(userMessage.content.match(/"difine" -> "dify"/g)).toHaveLength(1)
-
-    vi.unstubAllGlobals()
-  })
-
-  it('parses response wrapped in fenced code block', async () => {
-    const fenced = '```json\n[{"id":"1","originalText":"A","suggestedText":"B","reason":"test","category":"grammar"}]\n```'
-
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        choices: [{ message: { content: fenced } }],
-      }),
-    }))
-
-    const result = await detectCorrectionIssues(makeSession(), makeSettings())
-    expect(result.issues).toHaveLength(1)
-    expect(result.issues[0].category).toBe('grammar')
-
-    vi.unstubAllGlobals()
-  })
-
-  it('maps unknown category to "other"', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        choices: [{ message: { content: JSON.stringify([
-          { id: '1', originalText: 'x', suggestedText: 'y', reason: 'r', category: 'unknown-category' },
-        ]) } }],
-      }),
-    }))
-
-    const result = await detectCorrectionIssues(makeSession(), makeSettings())
-    expect(result.issues[0].category).toBe('other')
-
-    vi.unstubAllGlobals()
-  })
-
-  it('filters out items with empty originalText or suggestedText', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        choices: [{ message: { content: JSON.stringify([
-          { id: '1', originalText: '', suggestedText: 'y', reason: 'r', category: 'other' },
-          { id: '2', originalText: 'x', suggestedText: '', reason: 'r', category: 'other' },
-          { id: '3', originalText: 'valid', suggestedText: 'also valid', reason: 'ok', category: 'homophone' },
-        ]) } }],
-      }),
-    }))
-
-    const result = await detectCorrectionIssues(makeSession(), makeSettings())
-    expect(result.issues).toHaveLength(1)
-    expect(result.issues[0].originalText).toBe('valid')
-
-    vi.unstubAllGlobals()
-  })
-
-  it('returns empty issues for an empty JSON array', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        choices: [{ message: { content: '[]' } }],
-      }),
-    }))
-
-    const result = await detectCorrectionIssues(makeSession(), makeSettings())
-    expect(result.issues).toHaveLength(0)
-
-    vi.unstubAllGlobals()
-  })
-
-  it('throws on HTTP error', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: false,
-      status: 500,
-      text: async () => 'Internal Server Error',
-    }))
-
-    await expect(detectCorrectionIssues(makeSession(), makeSettings())).rejects.toThrow(/Internal Server Error/)
-
-    vi.unstubAllGlobals()
-  })
-
-  it('throws on non-JSON AI response', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        choices: [{ message: { content: 'Sorry, I cannot help with that.' } }],
-      }),
-    }))
-
-    await expect(detectCorrectionIssues(makeSession(), makeSettings())).rejects.toThrow(/JSON/)
-
-    vi.unstubAllGlobals()
-  })
-
-  it('handles multipart content array', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        choices: [{
-          message: {
-            content: [
-              { type: 'text', text: '[{"id":"1","originalText":"a","suggestedText":"b","reason":"r","category":"other"}]' },
-            ],
-          },
-        }],
-      }),
-    }))
-
-    const result = await detectCorrectionIssues(makeSession(), makeSettings())
-    expect(result.issues).toHaveLength(1)
-
-    vi.unstubAllGlobals()
-  })
-
-  it('assigns sequential IDs when AI omits them', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        choices: [{ message: { content: JSON.stringify([
-          { originalText: 'a', suggestedText: 'b', reason: 'r', category: 'other' },
-          { originalText: 'c', suggestedText: 'd', reason: 'r', category: 'other' },
-        ]) } }],
-      }),
-    }))
-
-    const result = await detectCorrectionIssues(makeSession(), makeSettings())
-    expect(result.issues[0].id).toBe('1')
-    expect(result.issues[1].id).toBe('2')
-
-    vi.unstubAllGlobals()
-  })
-})
-
-describe('aiCorrection — quick correction with glossary', async () => {
-  const { correctTranscriptQuick } = await import('./aiCorrection')
-
-  beforeEach(() => {
-    vi.restoreAllMocks()
-  })
-
-  it('includes glossary guidance in quick correction requests', async () => {
-    const reader = {
-      read: vi.fn()
-        .mockResolvedValueOnce({ done: false, value: new TextEncoder().encode('data: [DONE]\n\n') })
-        .mockResolvedValueOnce({ done: true, value: undefined }),
-      releaseLock: vi.fn(),
-    }
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      body: { getReader: () => reader },
+    const transcript = session().transcript
+    const promise = requestCorrectionShard({
+      transcript,
+      shard: createCorrectionShards(transcript)[0],
+      snapshot: createCorrectionConfigSnapshot(settings()),
     })
+    await vi.advanceTimersByTimeAsync(2_000)
+    await expect(promise).resolves.toMatchObject({ attempt: 2 })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([400, 401, 403, 404])('does not retry HTTP %s', async (status) => {
+    const fetchMock = vi.fn().mockResolvedValue(response('bad request', status))
     vi.stubGlobal('fetch', fetchMock)
+    const transcript = session().transcript
+    await expect(requestCorrectionShard({
+      transcript,
+      shard: createCorrectionShards(transcript)[0],
+      snapshot: createCorrectionConfigSnapshot(settings()),
+    })).rejects.toBeInstanceOf(CorrectionRequestError)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
 
-    await correctTranscriptQuick(makeSession(), makeSettings({
-      glossary: [{ id: '1', source: 'define', target: 'dify', enabled: true }],
-    }), {
-      onChunk: vi.fn(),
-      onDone: vi.fn(),
-      onError: vi.fn(),
+  it('does not downgrade json_schema after a protocol error', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response('unsupported response_format', 400))
+    vi.stubGlobal('fetch', fetchMock)
+    const transcript = session().transcript
+    await expect(requestCorrectionShard({
+      transcript,
+      shard: createCorrectionShards(transcript)[0],
+      snapshot: createCorrectionConfigSnapshot(settings({ correctionStructuredOutput: 'json_schema' })),
+    })).rejects.toMatchObject({ code: 'protocol' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not retry invalid structured responses', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response('{"patches":[]} trailing'))
+    vi.stubGlobal('fetch', fetchMock)
+    const transcript = session().transcript
+    await expect(requestCorrectionShard({
+      transcript,
+      shard: createCorrectionShards(transcript)[0],
+      snapshot: createCorrectionConfigSnapshot(settings()),
+    })).rejects.toMatchObject({ code: 'parse' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('enforces the endpoint concurrency limit across queued shard requests', async () => {
+    let releaseFirst!: () => void
+    const firstResponse = new Promise<ReturnType<typeof response>>((resolve) => {
+      releaseFirst = () => resolve(response(JSON.stringify({ patches: [] })))
     })
+    const fetchMock = vi.fn()
+      .mockReturnValueOnce(firstResponse)
+      .mockResolvedValueOnce(response(JSON.stringify({ patches: [] })))
+    vi.stubGlobal('fetch', fetchMock)
+    const transcript = session().transcript
+    const snapshot = { ...createCorrectionConfigSnapshot(settings()), concurrency: 1 }
+    const shard = createCorrectionShards(transcript)[0]
+    const first = requestCorrectionShard({ transcript, shard, snapshot })
+    const second = requestCorrectionShard({ transcript, shard, snapshot })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    releaseFirst()
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
 
+  it('keeps the compatibility detector on canonical transcript text', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response(JSON.stringify({ patches: [] })))
+    vi.stubGlobal('fetch', fetchMock)
+    const source = session('raw\r\ntranscript')
+    source.segments = [{ text: 'different segment', speakerId: 'speaker-1' }]
+    await detectCorrectionIssues(source, settings())
     const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
-    expect(body.messages[0].content).toContain('source/误识别原文')
-    expect(body.messages[1].content).toContain('"define" -> "dify"')
-
-    vi.unstubAllGlobals()
+    expect(body.messages[1].content).toContain('raw\r\ntranscript')
+    expect(body.messages[1].content).not.toContain('different segment')
   })
 })

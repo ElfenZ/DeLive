@@ -107,7 +107,7 @@ function App() {
     void (async () => {
       await initStorage()
       initTheme()
-      loadSettings()
+      await loadSettings()
       loadTags()
       loadTopics()
       const recoverySummary = await loadSessions()

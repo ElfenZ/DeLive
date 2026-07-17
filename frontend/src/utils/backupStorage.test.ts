@@ -75,7 +75,7 @@ describe('backupStorage', () => {
     expect(upgraded.sessions).toHaveLength(1)
     expect(upgraded.sessions[0]).toEqual(expect.objectContaining({
       id: 'legacy-session',
-      schemaVersion: 3,
+      schemaVersion: 4,
       transcript: 'hello world',
       tagIds: [],
       speakers: [],
@@ -90,5 +90,46 @@ describe('backupStorage', () => {
       languageHints: ['zh', 'en'],
     }))
     expect(upgraded.settings.captionStyle).toBeDefined()
+  })
+
+  it('round-trips advanced correction overrides through backup normalization', () => {
+    const upgraded = upgradeBackupData({
+      version: '4.0',
+      schemaVersion: 4,
+      exportedAt: '2026-07-16T00:00:00Z',
+      sessions: [],
+      tags: [],
+      settings: {
+        apiKey: '',
+        languageHints: [],
+        aiPostProcess: {
+          enabled: true,
+          correctionStructuredOutput: 'json_schema',
+          correctionAdvanced: {
+            chunkSize: 5000,
+            contextSize: 600,
+            concurrency: 2,
+            safetyLimits: {
+              maxPatchTextLength: 800,
+              maxCumulativeEditRatio: 0.15,
+            },
+          },
+        },
+      },
+    })
+    expect(upgraded.settings.aiPostProcess).toEqual(expect.objectContaining({
+      correctionStructuredOutput: 'json_schema',
+      correctionAdvanced: {
+        chunkSize: 5000,
+        contextSize: 600,
+        concurrency: 2,
+        safetyLimits: {
+          maxPatchTextLength: 800,
+          maxPatchesPerShard: undefined,
+          maxCumulativeEditRatio: 0.15,
+          maxNetLengthChangeRatio: undefined,
+        },
+      },
+    }))
   })
 })

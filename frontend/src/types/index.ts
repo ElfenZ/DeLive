@@ -77,9 +77,155 @@ export interface TranscriptChapter {
 export type TranscriptPostProcessStatus = 'pending' | 'success' | 'error'
 export type TranscriptAskTurnStatus = 'pending' | 'success' | 'error'
 export type TranscriptMindMapStatus = 'pending' | 'success' | 'error'
+export type TranscriptTextSourceKind = 'original' | 'published-correction' | 'legacy-correction' | 'legacy-unknown'
+
+export interface TranscriptTextSourceMetadata {
+  sourceKind?: TranscriptTextSourceKind
+  sourceTextHash?: string
+  sourceResultId?: string
+}
 export type TranscriptCorrectionStatus = 'idle' | 'detecting' | 'reviewing' | 'correcting' | 'done' | 'error'
 
-export type CorrectionIssueCategory = 'homophone' | 'proper-noun' | 'grammar' | 'punctuation' | 'other'
+export type CorrectionIssueCategory =
+  | 'homophone'
+  | 'proper-noun'
+  | 'punctuation'
+  | 'asr-substitution'
+  | 'asr-omission'
+  | 'asr-duplication'
+
+export type LegacyCorrectionIssueCategory = CorrectionIssueCategory | 'grammar' | 'other'
+
+export type CorrectionPatchOperation = 'replace' | 'insert' | 'delete'
+
+export interface ModelCorrectionPatch {
+  op: CorrectionPatchOperation
+  oldText: string
+  replacement: string
+  before: string
+  after: string
+  category: CorrectionIssueCategory
+  reason: string
+}
+
+export type ResolvedCorrectionPatchState = 'proposed' | 'applied' | 'reverted' | 'rejected'
+
+export interface ResolvedCorrectionPatch {
+  id: string
+  shardId: string
+  op: CorrectionPatchOperation
+  sourceStart: number
+  sourceEnd: number
+  sourceText: string
+  replacement: string
+  sourceTextHash: string
+  category: CorrectionIssueCategory
+  reason: string
+  state: ResolvedCorrectionPatchState
+  rejectionReason?: string
+}
+
+export interface CorrectionPatchSafetyLimits {
+  maxPatchTextLength: number
+  maxPatchesPerShard: number
+  maxCumulativeEditRatio: number
+  maxNetLengthChangeRatio: number
+}
+
+export interface CorrectionShardPlan {
+  id: string
+  index: number
+  coreStart: number
+  coreEnd: number
+  contextStart: number
+  contextEnd: number
+}
+
+export type CorrectionShardStatus = 'pending' | 'running' | 'retrying' | 'completed' | 'failed'
+
+export interface CorrectionShardProgress extends CorrectionShardPlan {
+  status: CorrectionShardStatus
+  attempt: number
+  attemptId?: string
+  draftRevision: number
+  patches?: ResolvedCorrectionPatch[]
+  rejectedPatches?: ResolvedCorrectionPatch[]
+  nextRetryAt?: number
+  errorCode?: string
+  error?: string
+  completedAt?: number
+}
+
+export type CorrectionStructuredOutputMode = 'prompt-json' | 'json_object' | 'json_schema'
+
+export interface CorrectionConfigSnapshot {
+  model: string
+  baseUrl: string
+  promptLanguage: 'zh' | 'en'
+  promptVersion: string
+  schemaVersion: string
+  structuredOutput: CorrectionStructuredOutputMode
+  temperature: number
+  glossary: AiGlossaryEntry[]
+  chunkSize: number
+  contextSize: number
+  concurrency: number
+  safetyLimits: CorrectionPatchSafetyLimits
+  credentialRef: 'ai-post-process'
+}
+
+export type CorrectionDraftStatus =
+  | 'queued'
+  | 'running'
+  | 'paused'
+  | 'retrying'
+  | 'blocked-auth'
+  | 'failed'
+  | 'ready-for-review'
+
+export interface TranscriptCorrectionDraft {
+  runId: string
+  revision: number
+  trigger: 'manual-quick' | 'manual-review' | 'automatic'
+  mode: 'quick' | 'review'
+  status: CorrectionDraftStatus
+  baseTranscriptHash: string
+  pauseRequested?: boolean
+  config: CorrectionConfigSnapshot
+  shards: CorrectionShardProgress[]
+  proposedPatches: ResolvedCorrectionPatch[]
+  rejectedPatches: ResolvedCorrectionPatch[]
+  requestedAt: number
+  updatedAt: number
+  errorCode?: string
+  error?: string
+}
+
+export interface TranscriptCorrectionPublished {
+  id: string
+  formatVersion: 1
+  revision: number
+  baseTranscriptHash: string
+  outputTextHash: string
+  correctedText: string
+  patches: ResolvedCorrectionPatch[]
+  model: string
+  completedAt: number
+  stats: {
+    applied: number
+    reverted: number
+    rejected: number
+  }
+}
+
+export interface TranscriptCorrectionLegacy {
+  correctedText: string
+  source: 'v3-corrected-text'
+  model?: string
+  completedAt?: number
+  interrupted?: boolean
+  issues?: CorrectionIssue[]
+}
 
 export interface CorrectionIssue {
   id: string
@@ -88,7 +234,7 @@ export interface CorrectionIssue {
   suggestedText: string
   reason: string
   accepted?: boolean
-  category: CorrectionIssueCategory
+  category: LegacyCorrectionIssueCategory
 }
 
 export interface TranscriptCorrection {
@@ -100,6 +246,9 @@ export interface TranscriptCorrection {
   requestedAt?: number
   completedAt?: number
   error?: string
+  published?: TranscriptCorrectionPublished
+  legacy?: TranscriptCorrectionLegacy
+  draft?: TranscriptCorrectionDraft
 }
 
 export interface TranscriptQaCitation {
@@ -107,7 +256,7 @@ export interface TranscriptQaCitation {
   speakerLabel?: string
 }
 
-export interface TranscriptAskTurn {
+export interface TranscriptAskTurn extends TranscriptTextSourceMetadata {
   id: string
   conversationId?: string
   question: string
@@ -120,7 +269,7 @@ export interface TranscriptAskTurn {
   error?: string
 }
 
-export interface TranscriptMindMap {
+export interface TranscriptMindMap extends TranscriptTextSourceMetadata {
   markdown: string
   title?: string
   generatedAt?: number
@@ -131,7 +280,7 @@ export interface TranscriptMindMap {
   error?: string
 }
 
-export interface TranscriptPostProcess {
+export interface TranscriptPostProcess extends TranscriptTextSourceMetadata {
   summary?: string
   actionItems?: string[]
   keywords?: string[]
@@ -241,6 +390,13 @@ export interface AiPostProcessConfig {
   enableStreaming?: boolean
   glossary?: AiGlossaryEntry[]
   autoCorrectionDetection?: boolean
+  correctionStructuredOutput?: CorrectionStructuredOutputMode
+  correctionAdvanced?: Partial<{
+    chunkSize: number
+    contextSize: number
+    concurrency: number
+    safetyLimits: Partial<CorrectionPatchSafetyLimits>
+  }>
 }
 
 export interface OpenApiConfig {

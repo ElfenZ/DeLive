@@ -1,6 +1,8 @@
 import { create } from 'zustand'
 import type {
   CorrectionIssue,
+  CorrectionShardProgress,
+  ResolvedCorrectionPatch,
   RecordingState,
   TranscriptAskTurn,
   TranscriptCorrection,
@@ -19,10 +21,22 @@ import {
   resolveModelForFeature,
 } from '../services/aiPostProcess'
 import {
-  correctTranscriptQuick,
-  correctTranscriptWithReview,
-  detectCorrectionIssues,
+  CorrectionRequestError,
+  createCorrectionConfigSnapshot,
+  requestCorrectionShard,
 } from '../services/aiCorrection'
+import {
+  createCorrectionShards,
+  materializeCorrection,
+  partitionCorrectionPatchConflicts,
+  resolveCorrectionPatches,
+  sha256Utf8,
+  setCorrectionPatchState,
+  revertAllCorrectionPatches,
+  validateCorrectionPatchSet,
+  validateResolvedCorrectionPatch,
+  updateCorrectionPatchReplacement,
+} from '../utils/correctionPatch'
 import { sessionRepository } from '../utils/sessionRepository'
 import { formatTime } from '../utils/storage'
 import {
@@ -56,7 +70,24 @@ import { generateId } from '../utils/storageUtils'
 
 const SESSION_AUTOSAVE_DELAY_MS = 1200
 let sessionAutosaveTimer: ReturnType<typeof setTimeout> | null = null
-const STALE_CORRECTION_ERROR = 'AI 纠错未完成，请重新启动纠错'
+
+interface CorrectionExecutionLease {
+  runId: string
+  generation: number
+  controller: AbortController
+}
+
+let correctionExecutionGeneration = 0
+const correctionExecutionLeases = new Map<string, CorrectionExecutionLease>()
+const correctionMutationQueues = new Map<string, Promise<unknown>>()
+const correctionStartReservations = new Set<string>()
+
+class CorrectionRunError extends Error {
+  constructor(message: string, public readonly code: string) {
+    super(message)
+    this.name = 'CorrectionRunError'
+  }
+}
 
 export interface RecordingArchiveRecoverySummary {
   recoveredCount: number
@@ -150,6 +181,15 @@ export interface SessionState {
   correctionStreamingText: Record<string, string>
   correctionInFlight: Record<string, true>
   clearCorrectionStreamingText: (sessionId: string) => void
+  pauseSessionCorrection: (sessionId: string) => Promise<void>
+  resumeSessionCorrection: (sessionId: string) => Promise<void>
+  retrySessionCorrection: (sessionId: string) => Promise<void>
+  abandonSessionCorrection: (sessionId: string) => Promise<void>
+  applySessionCorrectionReview: (sessionId: string, patchIds: string[]) => Promise<string>
+  updateSessionCorrectionDraftPatch: (sessionId: string, patchId: string, replacement: string) => Promise<void>
+  restoreSessionLegacyCorrection: (sessionId: string) => Promise<void>
+  setSessionCorrectionPatchState: (sessionId: string, patchId: string, state: 'applied' | 'reverted') => Promise<void>
+  revertAllSessionCorrectionPatches: (sessionId: string) => Promise<void>
 
   finalTokens: TranscriptToken[]
 }
@@ -303,6 +343,374 @@ export const useSessionStore = create<SessionState>((set, get) => {
     set({ correctionInFlight: next })
   }
 
+  const checkpointCorrection = async (sessionId: string, correction: TranscriptCorrection) => {
+    const sessions = await sessionRepository.checkpointCorrection(sessionId, correction)
+    const recoverySession = get().recoverySession
+    set({
+      sessions,
+      recoverySession: recoverySession?.id === sessionId ? { ...recoverySession, correction } : recoverySession,
+    })
+  }
+
+  const enqueueCorrectionMutation = <T>(sessionId: string, operation: () => Promise<T>): Promise<T> => {
+    const previous = correctionMutationQueues.get(sessionId) || Promise.resolve()
+    const current = previous.then(operation)
+    correctionMutationQueues.set(sessionId, current)
+    void current.finally(() => {
+      if (correctionMutationQueues.get(sessionId) === current) correctionMutationQueues.delete(sessionId)
+    }).catch(() => undefined)
+    return current
+  }
+
+  const isCurrentCorrectionLease = (sessionId: string, lease: CorrectionExecutionLease): boolean => (
+    correctionExecutionLeases.get(sessionId) === lease && !lease.controller.signal.aborted
+  )
+
+  const revokeCorrectionLease = (sessionId: string): void => {
+    const lease = correctionExecutionLeases.get(sessionId)
+    if (!lease) return
+    correctionExecutionLeases.delete(sessionId)
+    lease.controller.abort()
+  }
+
+  const buildPublishedCorrection = async (
+    session: TranscriptSession,
+    correction: TranscriptCorrection,
+    patches: ResolvedCorrectionPatch[],
+    model: string,
+    baseTranscriptHash: string,
+  ) => {
+    const finalPatches = patches.map((patch) => patch.state === 'rejected' || patch.state === 'reverted' ? patch : { ...patch, state: 'applied' as const })
+    const correctedText = materializeCorrection(session.transcript, finalPatches)
+    const outputTextHash = await sha256Utf8(correctedText)
+    const completedAt = Date.now()
+    return {
+      correctedText,
+      correction: {
+        ...correction,
+        status: 'done' as const,
+        mode: correction.draft?.mode || correction.mode,
+        correctedText,
+        model,
+        completedAt,
+        error: undefined,
+        published: {
+          id: generateId(),
+          formatVersion: 1 as const,
+          revision: (correction.published?.revision || 0) + 1,
+          baseTranscriptHash,
+          outputTextHash,
+          correctedText,
+          patches: finalPatches,
+          model,
+          completedAt,
+          stats: {
+            applied: finalPatches.filter((patch) => patch.state === 'applied').length,
+            reverted: finalPatches.filter((patch) => patch.state === 'reverted').length,
+            rejected: finalPatches.filter((patch) => patch.state === 'rejected').length,
+          },
+        },
+        draft: undefined,
+      },
+    }
+  }
+
+  const publishCorrection = async (
+    session: TranscriptSession,
+    correction: TranscriptCorrection,
+    patches: ResolvedCorrectionPatch[],
+    model: string,
+    baseTranscriptHash: string,
+  ): Promise<string> => {
+    const result = await buildPublishedCorrection(session, correction, patches, model, baseTranscriptHash)
+    await checkpointCorrection(session.id, result.correction)
+    return result.correctedText
+  }
+
+  const runCorrectionDraft = async (sessionId: string): Promise<string | null> => {
+    const session = get().sessions.find((item) => item.id === sessionId)
+    const draft = session?.correction?.draft
+    if (!session || !draft) throw new Error('未找到可运行的纠错任务')
+    const runId = draft.runId
+    const existingLease = correctionExecutionLeases.get(sessionId)
+    if (existingLease) return null
+    const lease: CorrectionExecutionLease = {
+      runId,
+      generation: ++correctionExecutionGeneration,
+      controller: new AbortController(),
+    }
+    correctionExecutionLeases.set(sessionId, lease)
+    markCorrectionInFlight(sessionId)
+    try {
+      await enqueueCorrectionMutation(sessionId, async () => {
+        if (!isCurrentCorrectionLease(sessionId, lease)) return
+        const latestSession = get().sessions.find((item) => item.id === sessionId)
+        const latestDraft = latestSession?.correction?.draft
+        if (!latestSession || !latestDraft || latestDraft.runId !== runId) return
+        const runningDraft = {
+          ...latestDraft,
+          status: 'running' as const,
+          pauseRequested: false,
+          revision: latestDraft.revision + 1,
+          updatedAt: Date.now(),
+          shards: latestDraft.shards.map((shard) => shard.status === 'running' || shard.status === 'retrying'
+            ? { ...shard, status: 'pending' as const, attemptId: undefined, draftRevision: latestDraft.revision + 1 }
+            : shard),
+        }
+        await checkpointCorrection(sessionId, { ...latestSession.correction!, status: 'detecting', error: undefined, draft: runningDraft })
+      })
+
+      const claimNextShard = async (): Promise<{ session: TranscriptSession; shard: CorrectionShardProgress; config: typeof draft.config } | null> => {
+        let claimed: { session: TranscriptSession; shard: CorrectionShardProgress; config: typeof draft.config } | null = null
+        await enqueueCorrectionMutation(sessionId, async () => {
+          if (!isCurrentCorrectionLease(sessionId, lease)) return
+          const latestSession = get().sessions.find((item) => item.id === sessionId)
+          const latestDraft = latestSession?.correction?.draft
+          if (!latestSession || !latestDraft || latestDraft.runId !== runId || latestDraft.pauseRequested) return
+          const pendingShard = latestDraft.shards.find((shard) => shard.status === 'pending')
+          if (!pendingShard) return
+          const revision = latestDraft.revision + 1
+          const runningShard: CorrectionShardProgress = {
+            ...pendingShard,
+            status: 'running',
+            attempt: pendingShard.attempt + 1,
+            attemptId: generateId(),
+            draftRevision: revision,
+            error: undefined,
+            errorCode: undefined,
+          }
+          const nextDraft = {
+            ...latestDraft,
+            revision,
+            status: 'running' as const,
+            updatedAt: Date.now(),
+            shards: latestDraft.shards.map((shard) => shard.id === runningShard.id ? runningShard : shard),
+          }
+          await checkpointCorrection(sessionId, { ...latestSession.correction!, status: 'detecting', draft: nextDraft })
+          claimed = { session: latestSession, shard: runningShard, config: latestDraft.config }
+        })
+        return claimed
+      }
+
+      const worker = async (): Promise<void> => {
+        while (isCurrentCorrectionLease(sessionId, lease)) {
+          const claimed = await claimNextShard()
+          if (!claimed) return
+          const { session: claimedSession, shard, config } = claimed
+          let response
+          try {
+            response = await requestCorrectionShard({
+              transcript: claimedSession.transcript,
+              shard,
+              snapshot: config,
+              apiKey: useSettingsStore.getState().settings.aiPostProcess?.apiKey,
+              signal: lease.controller.signal,
+            })
+          } catch (error) {
+            if (!isCurrentCorrectionLease(sessionId, lease)) return
+            const code = error instanceof CorrectionRequestError ? error.code : 'protocol'
+            const message = error instanceof Error ? error.message : String(error)
+            await enqueueCorrectionMutation(sessionId, async () => {
+              if (!isCurrentCorrectionLease(sessionId, lease)) return
+              const latestSession = get().sessions.find((item) => item.id === sessionId)
+              const latestDraft = latestSession?.correction?.draft
+              const currentShard = latestDraft?.shards.find((item) => item.id === shard.id)
+              if (!latestSession || !latestDraft || latestDraft.runId !== runId || !currentShard
+                || currentShard.attemptId !== shard.attemptId || currentShard.draftRevision !== shard.draftRevision) return
+              const revision = latestDraft.revision + 1
+              const failedDraft = {
+                ...latestDraft,
+                revision,
+                status: code === 'auth' ? 'blocked-auth' as const : 'failed' as const,
+                errorCode: code,
+                error: message,
+                updatedAt: Date.now(),
+                shards: latestDraft.shards.map((item) => item.id === shard.id
+                  ? { ...item, status: 'failed' as const, errorCode: code, error: message, draftRevision: revision }
+                  : item.status === 'running' ? { ...item, status: 'pending' as const, attemptId: undefined, draftRevision: revision } : item),
+              }
+              await checkpointCorrection(sessionId, { ...latestSession.correction!, status: 'error', error: message, draft: failedDraft })
+            })
+            lease.controller.abort()
+            throw error
+          }
+
+          await enqueueCorrectionMutation(sessionId, async () => {
+            if (!isCurrentCorrectionLease(sessionId, lease)) return
+            const latestSession = get().sessions.find((item) => item.id === sessionId)
+            const latestDraft = latestSession?.correction?.draft
+            const currentShard = latestDraft?.shards.find((item) => item.id === shard.id)
+            if (!latestSession || !latestDraft || latestDraft.runId !== runId || !currentShard
+              || currentShard.attemptId !== shard.attemptId || currentShard.draftRevision !== shard.draftRevision) return
+            const resolved = resolveCorrectionPatches(latestSession.transcript, shard, response.patches, latestDraft.baseTranscriptHash, latestDraft.config.safetyLimits)
+            const accepted = resolved.filter((patch) => patch.state !== 'rejected')
+            const rejected = resolved.filter((patch) => patch.state === 'rejected')
+            const revision = latestDraft.revision + 1
+            const completedShard: CorrectionShardProgress = {
+              ...currentShard,
+              status: 'completed',
+              patches: accepted,
+              rejectedPatches: rejected,
+              completedAt: Date.now(),
+              draftRevision: revision,
+            }
+            const nextDraft = {
+              ...latestDraft,
+              revision,
+              updatedAt: Date.now(),
+              shards: latestDraft.shards.map((item) => item.id === completedShard.id ? completedShard : item),
+              proposedPatches: [...latestDraft.proposedPatches.filter((patch) => patch.shardId !== shard.id), ...accepted],
+              rejectedPatches: [...latestDraft.rejectedPatches.filter((patch) => patch.shardId !== shard.id), ...rejected],
+            }
+            await checkpointCorrection(sessionId, { ...latestSession.correction!, status: 'detecting', draft: nextDraft })
+          })
+        }
+      }
+
+      const workerCount = Math.max(1, Math.min(draft.config.concurrency, draft.shards.length))
+      await Promise.all(Array.from({ length: workerCount }, () => worker()))
+      if (!isCurrentCorrectionLease(sessionId, lease)) {
+        const failedDraft = get().sessions.find((item) => item.id === sessionId)?.correction?.draft
+        if (failedDraft?.status === 'failed' || failedDraft?.status === 'blocked-auth') {
+          throw new CorrectionRunError(failedDraft.error || '纠错任务失败', failedDraft.errorCode || 'failed')
+        }
+        return null
+      }
+
+      let output: string | null = null
+      await enqueueCorrectionMutation(sessionId, async () => {
+        if (!isCurrentCorrectionLease(sessionId, lease)) return
+        const latestSession = get().sessions.find((item) => item.id === sessionId)
+        const latestDraft = latestSession?.correction?.draft
+        if (!latestSession || !latestDraft || latestDraft.runId !== runId) return
+        if (await sha256Utf8(latestSession.transcript) !== latestDraft.baseTranscriptHash) {
+          throw new CorrectionRunError('原始转录已变化，无法发布纠错结果', 'source-changed')
+        }
+        for (const patch of latestDraft.proposedPatches) {
+          const validationError = validateResolvedCorrectionPatch(
+            latestSession.transcript,
+            patch,
+            latestDraft.baseTranscriptHash,
+            latestDraft.config.safetyLimits,
+          )
+          if (validationError) throw new CorrectionRunError(`Patch 校验失败: ${validationError}`, 'patch-validation')
+        }
+        const partition = partitionCorrectionPatchConflicts(latestDraft.proposedPatches)
+        const conflictIds = new Set(partition.rejected.map((patch) => patch.id))
+        const rejectedPatches = [...latestDraft.rejectedPatches, ...partition.rejected]
+        const normalizedDraft = {
+          ...latestDraft,
+          proposedPatches: partition.accepted,
+          rejectedPatches,
+          shards: latestDraft.shards.map((shard) => ({
+            ...shard,
+            patches: shard.patches?.filter((patch) => !conflictIds.has(patch.id)),
+            rejectedPatches: [
+              ...(shard.rejectedPatches || []),
+              ...partition.rejected.filter((patch) => patch.shardId === shard.id),
+            ],
+          })),
+        }
+        const safetyError = validateCorrectionPatchSet(latestSession.transcript, partition.accepted, latestDraft.config.safetyLimits)
+        if (safetyError) throw new CorrectionRunError(`纠错结果超过安全限制: ${safetyError}`, 'safety-limit')
+        if (normalizedDraft.mode === 'quick') {
+          const result = await buildPublishedCorrection(
+            latestSession,
+            { ...latestSession.correction!, draft: normalizedDraft },
+            [...partition.accepted, ...rejectedPatches],
+            normalizedDraft.config.model,
+            normalizedDraft.baseTranscriptHash,
+          )
+          if (!isCurrentCorrectionLease(sessionId, lease)) return
+          await checkpointCorrection(sessionId, result.correction)
+          output = result.correctedText
+          return
+        }
+        const ready = { ...normalizedDraft, revision: normalizedDraft.revision + 1, status: 'ready-for-review' as const, updatedAt: Date.now() }
+        if (!isCurrentCorrectionLease(sessionId, lease)) return
+        await checkpointCorrection(sessionId, { ...latestSession.correction!, status: 'reviewing', mode: 'review', error: undefined, draft: ready })
+      })
+      return output
+    } catch (error) {
+      if (correctionExecutionLeases.get(sessionId) !== lease) return null
+      lease.controller.abort()
+      const latestSession = get().sessions.find((item) => item.id === sessionId)
+      const latestDraft = latestSession?.correction?.draft
+      if (latestSession && latestDraft?.runId === runId && latestDraft.status !== 'failed' && latestDraft.status !== 'blocked-auth') {
+        const code = error instanceof CorrectionRunError
+          ? error.code
+          : error instanceof CorrectionRequestError ? error.code : 'finalization'
+        const message = error instanceof Error ? error.message : String(error)
+        try {
+          await enqueueCorrectionMutation(sessionId, async () => {
+            const currentSession = get().sessions.find((item) => item.id === sessionId)
+            const currentDraft = currentSession?.correction?.draft
+            if (!currentSession || !currentDraft || currentDraft.runId !== runId) return
+            const revision = currentDraft.revision + 1
+            const failed = { ...currentDraft, revision, status: code === 'auth' ? 'blocked-auth' as const : 'failed' as const, errorCode: code, error: message, updatedAt: Date.now(), shards: currentDraft.shards.map((shard) => shard.status === 'running' ? { ...shard, status: 'pending' as const, attemptId: undefined, draftRevision: revision } : shard) }
+            await checkpointCorrection(sessionId, { ...currentSession.correction!, status: 'error', error: message, draft: failed })
+          })
+        } catch {
+          // Preserve the last durable checkpoint when persisting the failure itself fails.
+        }
+      }
+      throw error
+    } finally {
+      if (correctionExecutionLeases.get(sessionId) === lease) {
+        correctionExecutionLeases.delete(sessionId)
+        clearCorrectionInFlight(sessionId)
+      }
+    }
+  }
+
+  const createAndRunCorrection = async (sessionId: string, mode: 'quick' | 'review', trigger: 'manual-quick' | 'manual-review' | 'automatic') => {
+    const session = get().sessions.find((item) => item.id === sessionId)
+    if (!session) throw new Error('未找到要纠错的会话')
+    if (!session.transcript) throw new Error('当前会话没有可用于纠错的转录内容')
+    if (session.correction?.draft) throw new Error('当前会话已有未完成的纠错任务')
+    if (correctionStartReservations.has(sessionId)) throw new Error('纠错任务正在启动')
+    correctionStartReservations.add(sessionId)
+    try {
+      const settings = useSettingsStore.getState().settings
+      const config = createCorrectionConfigSnapshot(settings)
+      const baseTranscriptHash = await sha256Utf8(session.transcript)
+      const now = Date.now()
+      const draft = {
+        runId: generateId(),
+        revision: 1,
+        trigger,
+        mode,
+        status: 'queued' as const,
+        baseTranscriptHash,
+        config,
+        shards: createCorrectionShards(session.transcript, config.chunkSize, config.contextSize).map((shard) => ({
+          ...shard,
+          status: 'pending' as const,
+          attempt: 0,
+          draftRevision: 1,
+        })),
+        proposedPatches: [],
+        rejectedPatches: [],
+        requestedAt: now,
+        updatedAt: now,
+      }
+      const correction: TranscriptCorrection = {
+        status: 'detecting',
+        mode,
+        correctedText: session.correction?.correctedText,
+        published: session.correction?.published,
+        legacy: session.correction?.legacy,
+        model: config.model,
+        requestedAt: now,
+        draft,
+      }
+      await checkpointCorrection(sessionId, correction)
+      return await runCorrectionDraft(sessionId)
+    } finally {
+      correctionStartReservations.delete(sessionId)
+    }
+  }
+
   return {
     recordingState: 'idle',
     setRecordingState: (state) => set({ recordingState: state }),
@@ -415,6 +823,13 @@ export const useSessionStore = create<SessionState>((set, get) => {
     loadSessions: async () => {
       const { sessions, recoverableSession } = await sessionRepository.loadForLaunch()
       set({ sessions, recoverySession: recoverableSession })
+
+      for (const session of sessions) {
+        if (session.correction?.draft?.status !== 'queued') continue
+        void runCorrectionDraft(session.id).catch((error) => {
+          console.warn('[SessionStore] 恢复 AI 纠错任务失败:', error)
+        })
+      }
 
       if (!window.electronAPI?.recoverRecordingArchives) return undefined
 
@@ -632,6 +1047,9 @@ export const useSessionStore = create<SessionState>((set, get) => {
           citations: result.citations,
           answeredAt: Date.now(),
           model: result.model,
+          sourceKind: result.source?.sourceKind,
+          sourceTextHash: result.source?.sourceTextHash,
+          sourceResultId: result.source?.sourceResultId,
           status: 'success',
           error: undefined,
         }
@@ -696,6 +1114,9 @@ export const useSessionStore = create<SessionState>((set, get) => {
               citations: result.citations,
               answeredAt: Date.now(),
               model: result.model,
+              sourceKind: result.source?.sourceKind,
+              sourceTextHash: result.source?.sourceTextHash,
+              sourceResultId: result.source?.sourceResultId,
               status: 'success',
             }
             const nextHistory = (latestSession?.askHistory || [pendingTurn]).map((turn) =>
@@ -855,17 +1276,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
       })
     },
 
-    recoverStaleSessionCorrection: (sessionId) => {
-      const session = get().sessions.find((s) => s.id === sessionId)
-      const status = session?.correction?.status
-      if (status !== 'detecting' && status !== 'correcting') return
-      if (get().correctionInFlight[sessionId]) return
-      get().clearCorrectionStreamingText(sessionId)
-      get().updateSessionCorrection(sessionId, {
-        status: 'error',
-        error: STALE_CORRECTION_ERROR,
-      })
-    },
+    recoverStaleSessionCorrection: () => undefined,
 
     maybeAutoDetectSessionCorrection: async (sessionId) => {
       const session = get().sessions.find((s) => s.id === sessionId)
@@ -877,182 +1288,177 @@ export const useSessionStore = create<SessionState>((set, get) => {
       if (!resolveModelForFeature(aiConfig, 'correction')) return
       if (get().correctionInFlight[sessionId]) return
 
-      const status = session.correction?.status
-      if (status === 'detecting' || status === 'reviewing' || status === 'correcting' || status === 'done') {
-        return
-      }
+      if (session.correction?.draft) return
 
       try {
-        await get().detectSessionCorrectionIssues(sessionId)
+        await createAndRunCorrection(sessionId, 'review', 'automatic')
       } catch (error) {
         console.warn('[SessionStore] 自动 AI 纠错检测失败:', error)
       }
     },
 
     detectSessionCorrectionIssues: async (sessionId) => {
-      const session = get().sessions.find((s) => s.id === sessionId)
-      if (!session) throw new Error('未找到要纠错的会话')
-
-      markCorrectionInFlight(sessionId)
-
-      get().updateSessionCorrection(sessionId, {
-        status: 'detecting',
-        error: undefined,
-        requestedAt: Date.now(),
-        mode: 'review',
-      })
-
-      try {
-        const { issues, model } = await detectCorrectionIssues(
-          session,
-          useSettingsStore.getState().settings,
-        )
-        get().updateSessionCorrection(sessionId, {
-          status: 'reviewing',
-          issues,
-          model,
-        })
-        return issues
-      } catch (error) {
-        const message = error instanceof Error ? error.message : '检测失败'
-        get().updateSessionCorrection(sessionId, {
-          status: 'error',
-          error: message,
-        })
-        throw error
-      } finally {
-        clearCorrectionInFlight(sessionId)
-      }
+      await createAndRunCorrection(sessionId, 'review', 'manual-review')
+      return []
     },
 
     startSessionQuickCorrection: async (sessionId, onChunk) => {
-      const session = get().sessions.find((s) => s.id === sessionId)
-      if (!session) throw new Error('未找到要纠错的会话')
-
-      const model = resolveModelForFeature(
-        { ...useSettingsStore.getState().settings.aiPostProcess } as import('../types').AiPostProcessConfig,
-        'correction',
-      )
-
-      set({ correctionStreamingText: { ...get().correctionStreamingText, [sessionId]: '' } })
-      markCorrectionInFlight(sessionId)
-      get().updateSessionCorrection(sessionId, {
-        status: 'correcting',
-        error: undefined,
-        requestedAt: Date.now(),
-        mode: 'quick',
-        model,
-      })
-
-      return new Promise<string>((resolve, reject) => {
-        correctTranscriptQuick(
-          session,
-          useSettingsStore.getState().settings,
-          {
-            onChunk: (chunk) => {
-              const prev = get().correctionStreamingText[sessionId] || ''
-              set({ correctionStreamingText: { ...get().correctionStreamingText, [sessionId]: prev + chunk } })
-              onChunk?.(chunk)
-            },
-            onDone: (fullText) => {
-              get().clearCorrectionStreamingText(sessionId)
-              clearCorrectionInFlight(sessionId)
-              get().updateSessionCorrection(sessionId, {
-                status: 'done',
-                correctedText: fullText,
-                completedAt: Date.now(),
-              })
-              resolve(fullText)
-            },
-            onError: (err) => {
-              get().clearCorrectionStreamingText(sessionId)
-              clearCorrectionInFlight(sessionId)
-              get().updateSessionCorrection(sessionId, {
-                status: 'error',
-                error: err.message,
-              })
-              reject(err)
-            },
-          },
-        ).catch((err) => {
-          get().clearCorrectionStreamingText(sessionId)
-          clearCorrectionInFlight(sessionId)
-          get().updateSessionCorrection(sessionId, {
-            status: 'error',
-            error: err instanceof Error ? err.message : '纠错失败',
-          })
-          reject(err)
-        })
-      })
+      const text = await createAndRunCorrection(sessionId, 'quick', 'manual-quick') || ''
+      onChunk?.(text)
+      return text
     },
 
     startSessionReviewCorrection: async (sessionId, acceptedIssues, onChunk) => {
-      const session = get().sessions.find((s) => s.id === sessionId)
-      if (!session) throw new Error('未找到要纠错的会话')
-
-      const model = resolveModelForFeature(
-        { ...useSettingsStore.getState().settings.aiPostProcess } as import('../types').AiPostProcessConfig,
-        'correction',
-      )
-
-      set({ correctionStreamingText: { ...get().correctionStreamingText, [sessionId]: '' } })
-      markCorrectionInFlight(sessionId)
-      get().updateSessionCorrection(sessionId, {
-        status: 'correcting',
-        error: undefined,
-        requestedAt: Date.now(),
-        mode: 'review',
-        model,
-        issues: session.correction?.issues?.map((issue) => {
-          const acceptedIssue = acceptedIssues.find((accepted) => accepted.id === issue.id)
-          return {
-            ...issue,
-            ...(acceptedIssue ? { suggestedText: acceptedIssue.suggestedText } : {}),
-            accepted: Boolean(acceptedIssue),
-          }
-        }),
+      const text = await get().applySessionCorrectionReview(sessionId, acceptedIssues.filter((issue) => issue.accepted !== false).map((issue) => issue.id))
+      onChunk?.(text)
+      return text
+    },
+    pauseSessionCorrection: async (sessionId) => {
+      revokeCorrectionLease(sessionId)
+      clearCorrectionInFlight(sessionId)
+      await enqueueCorrectionMutation(sessionId, async () => {
+        const session = get().sessions.find((item) => item.id === sessionId)
+        const draft = session?.correction?.draft
+        if (!session || !draft) return
+        const revision = draft.revision + 1
+        const paused = {
+          ...draft,
+          status: 'paused' as const,
+          pauseRequested: true,
+          revision,
+          updatedAt: Date.now(),
+          shards: draft.shards.map((shard) => shard.status === 'running' || shard.status === 'retrying'
+            ? { ...shard, status: 'pending' as const, attemptId: undefined, draftRevision: revision }
+            : shard),
+        }
+        await checkpointCorrection(sessionId, { ...session.correction!, status: 'detecting', draft: paused })
       })
-
-      return new Promise<string>((resolve, reject) => {
-        correctTranscriptWithReview(
-          session,
-          acceptedIssues,
-          useSettingsStore.getState().settings,
-          {
-            onChunk: (chunk) => {
-              const prev = get().correctionStreamingText[sessionId] || ''
-              set({ correctionStreamingText: { ...get().correctionStreamingText, [sessionId]: prev + chunk } })
-              onChunk?.(chunk)
-            },
-            onDone: (fullText) => {
-              get().clearCorrectionStreamingText(sessionId)
-              clearCorrectionInFlight(sessionId)
-              get().updateSessionCorrection(sessionId, {
-                status: 'done',
-                correctedText: fullText,
-                completedAt: Date.now(),
-              })
-              resolve(fullText)
-            },
-            onError: (err) => {
-              get().clearCorrectionStreamingText(sessionId)
-              clearCorrectionInFlight(sessionId)
-              get().updateSessionCorrection(sessionId, {
-                status: 'error',
-                error: err.message,
-              })
-              reject(err)
-            },
-          },
-        ).catch((err) => {
-          get().clearCorrectionStreamingText(sessionId)
-          clearCorrectionInFlight(sessionId)
-          get().updateSessionCorrection(sessionId, {
-            status: 'error',
-            error: err instanceof Error ? err.message : '纠错失败',
-          })
-          reject(err)
+    },
+    resumeSessionCorrection: async (sessionId) => {
+      await enqueueCorrectionMutation(sessionId, async () => {
+        const session = get().sessions.find((item) => item.id === sessionId)
+        const draft = session?.correction?.draft
+        if (!session || !draft) return
+        const revision = draft.revision + 1
+        const queued = { ...draft, status: 'queued' as const, pauseRequested: false, revision, updatedAt: Date.now(), shards: draft.shards.map((shard) => shard.status === 'running' || shard.status === 'retrying' ? { ...shard, status: 'pending' as const, attemptId: undefined, draftRevision: revision } : shard) }
+        await checkpointCorrection(sessionId, { ...session.correction!, status: 'detecting', error: undefined, draft: queued })
+      })
+      await runCorrectionDraft(sessionId)
+    },
+    retrySessionCorrection: async (sessionId) => {
+      await enqueueCorrectionMutation(sessionId, async () => {
+        const session = get().sessions.find((item) => item.id === sessionId)
+        const draft = session?.correction?.draft
+        if (!session || !draft) return
+        const revision = draft.revision + 1
+        const queued = { ...draft, status: 'queued' as const, error: undefined, errorCode: undefined, pauseRequested: false, revision, updatedAt: Date.now(), shards: draft.shards.map((shard) => shard.status === 'failed' || shard.status === 'running' || shard.status === 'retrying' ? { ...shard, status: 'pending' as const, attemptId: undefined, error: undefined, errorCode: undefined, draftRevision: revision } : shard) }
+        await checkpointCorrection(sessionId, { ...session.correction!, status: 'detecting', error: undefined, draft: queued })
+      })
+      await runCorrectionDraft(sessionId)
+    },
+    abandonSessionCorrection: async (sessionId) => {
+      revokeCorrectionLease(sessionId)
+      clearCorrectionInFlight(sessionId)
+      await enqueueCorrectionMutation(sessionId, async () => {
+        const session = get().sessions.find((item) => item.id === sessionId)
+        if (!session?.correction) return
+        const next = { ...session.correction, draft: undefined, status: session.correction.published || session.correction.legacy ? 'done' as const : 'idle' as const, error: undefined }
+        await checkpointCorrection(sessionId, next)
+      })
+    },
+    applySessionCorrectionReview: async (sessionId, patchIds) => {
+      let output = ''
+      await enqueueCorrectionMutation(sessionId, async () => {
+        const session = get().sessions.find((item) => item.id === sessionId)
+        const draft = session?.correction?.draft
+        if (!session || !draft || draft.status !== 'ready-for-review') throw new Error('没有可应用的 Review 候选')
+        if (await sha256Utf8(session.transcript) !== draft.baseTranscriptHash) throw new Error('原始转录已变化，无法应用 Review')
+        const selected = new Set(patchIds)
+        const patches = draft.proposedPatches.map((patch) => ({ ...patch, state: selected.has(patch.id) ? 'applied' as const : 'reverted' as const }))
+        const active = patches.filter((patch) => patch.state === 'applied')
+        for (const patch of active) {
+          const validationError = validateResolvedCorrectionPatch(session.transcript, patch, draft.baseTranscriptHash, draft.config.safetyLimits)
+          if (validationError) throw new Error(`Patch 校验失败: ${validationError}`)
+        }
+        if (partitionCorrectionPatchConflicts(active).rejected.length > 0) throw new Error('所选 Patch 存在冲突')
+        const safetyError = validateCorrectionPatchSet(session.transcript, active, draft.config.safetyLimits)
+        if (safetyError) throw new Error(`所选 Patch 超过安全限制: ${safetyError}`)
+        output = await publishCorrection(session, session.correction!, [...patches, ...draft.rejectedPatches], draft.config.model, draft.baseTranscriptHash)
+      })
+      return output
+    },
+    updateSessionCorrectionDraftPatch: async (sessionId, patchId, replacement) => {
+      await enqueueCorrectionMutation(sessionId, async () => {
+        const session = get().sessions.find((item) => item.id === sessionId)
+        const draft = session?.correction?.draft
+        if (!session || !draft || draft.status !== 'ready-for-review') throw new Error('没有可编辑的 Review 候选')
+        const current = draft.proposedPatches.find((patch) => patch.id === patchId)
+        if (!current) throw new Error('未找到要编辑的 Patch')
+        const edited = updateCorrectionPatchReplacement(session.transcript, current, replacement, draft.baseTranscriptHash, draft.config.safetyLimits)
+        if (!edited.patch) throw new Error(`建议文本不合法: ${edited.error}`)
+        const proposedPatches = draft.proposedPatches.map((patch) => patch.id === patchId ? edited.patch! : patch)
+        if (partitionCorrectionPatchConflicts(proposedPatches).rejected.length > 0) throw new Error('编辑后的 Patch 与其他候选冲突')
+        const safetyError = validateCorrectionPatchSet(session.transcript, proposedPatches, draft.config.safetyLimits)
+        if (safetyError) throw new Error(`编辑后的 Patch 超过安全限制: ${safetyError}`)
+        const revision = draft.revision + 1
+        const nextDraft = {
+          ...draft,
+          revision,
+          updatedAt: Date.now(),
+          proposedPatches,
+          shards: draft.shards.map((shard) => ({
+            ...shard,
+            patches: shard.patches?.map((patch) => patch.id === patchId ? edited.patch! : patch),
+          })),
+        }
+        await checkpointCorrection(sessionId, { ...session.correction!, draft: nextDraft })
+      })
+    },
+    restoreSessionLegacyCorrection: async (sessionId) => {
+      await enqueueCorrectionMutation(sessionId, async () => {
+        const session = get().sessions.find((item) => item.id === sessionId)
+        if (!session?.correction?.legacy || session.correction.draft || session.correction.published) return
+        await checkpointCorrection(sessionId, {
+          ...session.correction,
+          status: 'idle',
+          correctedText: undefined,
+          legacy: undefined,
+          error: undefined,
         })
+      })
+    },
+    setSessionCorrectionPatchState: async (sessionId, patchId, state) => {
+      await enqueueCorrectionMutation(sessionId, async () => {
+        const session = get().sessions.find((item) => item.id === sessionId)
+        const published = session?.correction?.published
+        if (!session || !published) return
+        if (await sha256Utf8(session.transcript) !== published.baseTranscriptHash) throw new Error('原始转录已变化，无法修改已发布 Patch')
+        const patches = setCorrectionPatchState(published.patches, patchId, state)
+        const active = patches.filter((patch) => patch.state === 'applied')
+        for (const patch of active) {
+          const maxPatchTextLength = Math.max(1_000, patch.sourceText.length, patch.replacement.length)
+          const validationError = validateResolvedCorrectionPatch(session.transcript, patch, published.baseTranscriptHash, {
+            maxPatchTextLength,
+            maxPatchesPerShard: Number.MAX_SAFE_INTEGER,
+            maxCumulativeEditRatio: Number.MAX_SAFE_INTEGER,
+            maxNetLengthChangeRatio: Number.MAX_SAFE_INTEGER,
+          })
+          if (validationError) throw new Error(`已发布 Patch 校验失败: ${validationError}`)
+        }
+        if (partitionCorrectionPatchConflicts(active).rejected.length > 0) throw new Error('已发布 Patch 状态产生冲突')
+        const correctedText = materializeCorrection(session.transcript, patches)
+        const nextPublished = { ...published, revision: published.revision + 1, patches, correctedText, outputTextHash: await sha256Utf8(correctedText), stats: { ...published.stats, applied: patches.filter((patch) => patch.state === 'applied').length, reverted: patches.filter((patch) => patch.state === 'reverted').length } }
+        await checkpointCorrection(sessionId, { ...session.correction!, correctedText, published: nextPublished })
+      })
+    },
+    revertAllSessionCorrectionPatches: async (sessionId) => {
+      await enqueueCorrectionMutation(sessionId, async () => {
+        const session = get().sessions.find((item) => item.id === sessionId)
+        const published = session?.correction?.published
+        if (!session || !published) return
+        const patches = revertAllCorrectionPatches(published.patches)
+        const outputTextHash = await sha256Utf8(session.transcript)
+        await checkpointCorrection(sessionId, { ...session.correction!, correctedText: session.transcript, published: { ...published, revision: published.revision + 1, patches, correctedText: session.transcript, outputTextHash, stats: { ...published.stats, applied: 0, reverted: patches.filter((patch) => patch.state === 'reverted').length } } })
       })
     },
   }

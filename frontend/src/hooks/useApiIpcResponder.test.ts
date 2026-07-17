@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { TranscriptSession } from '../types'
 import type { SessionSummary, SessionDetail } from '../../../shared/electronApi'
+import { toSessionDetail as projectSessionDetail } from './useApiIpcResponder'
 
 function toSessionSummary(session: TranscriptSession): SessionSummary {
   return {
@@ -273,6 +274,25 @@ describe('toSessionDetail', () => {
     expect(detail.postProcess).toBeUndefined()
     expect(detail.mindMap).toBeUndefined()
     expect(detail.askHistory).toBeUndefined()
+  })
+
+  it('projects correction metadata without exposing patches or draft payloads', () => {
+    const detail = projectSessionDetail(makeSession({
+      correction: {
+        status: 'done', mode: 'quick', correctedText: 'corrected',
+        published: {
+          id: 'result-1', formatVersion: 1, revision: 1, baseTranscriptHash: 'base', outputTextHash: 'output',
+          correctedText: 'corrected', patches: [], model: 'model', completedAt: 123,
+          stats: { applied: 2, reverted: 0, rejected: 1 },
+        },
+      },
+    }))
+    expect(detail.correctionMeta).toEqual({
+      sourceKind: 'published', formatVersion: 1, sourceHash: 'output', publishedStatus: 'available',
+      draftStatus: undefined, appliedPatches: 2, rejectedPatches: 1, updatedAt: 123,
+    })
+    expect(detail).not.toHaveProperty('patches')
+    expect(JSON.stringify(detail)).not.toContain('baseTranscriptHash')
   })
 })
 

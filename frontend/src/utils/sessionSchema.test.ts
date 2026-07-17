@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { normalizeTranscriptSession } from './sessionSchema'
+import { CURRENT_SESSION_SCHEMA_VERSION, normalizeTranscriptSession } from './sessionSchema'
 
 describe('sessionSchema', () => {
   it('normalizes ask history entries and citations', () => {
@@ -39,6 +39,7 @@ describe('sessionSchema', () => {
         citations: [
           { quote: 'We should ship it this week.', speakerLabel: 'Alice' },
         ],
+        sourceKind: 'legacy-unknown',
       },
     ])
   })
@@ -67,6 +68,7 @@ describe('sessionSchema', () => {
       status: 'success',
       generatedAt: 111,
       updatedAt: 222,
+      sourceKind: 'legacy-unknown',
     })
   })
 
@@ -116,5 +118,103 @@ describe('sessionSchema', () => {
       transcript: 'Old transcript',
     })
     expect(oldSession.sourceMeta).toBeUndefined()
+  })
+
+  it('migrates v3 corrected text to an immutable legacy result idempotently', () => {
+    const normalized = normalizeTranscriptSession({
+      id: 'legacy-correction',
+      schemaVersion: 3,
+      title: 'Legacy',
+      date: '2026-07-16',
+      time: '12:00',
+      createdAt: 1,
+      updatedAt: 2,
+      transcript: 'original',
+      correction: {
+        status: 'done',
+        mode: 'quick',
+        correctedText: 'corrected',
+        model: 'legacy-model',
+      },
+    })
+    expect(normalized.schemaVersion).toBe(CURRENT_SESSION_SCHEMA_VERSION)
+    expect(normalized.correction?.legacy).toEqual(expect.objectContaining({ correctedText: 'corrected', source: 'v3-corrected-text' }))
+    expect(normalized.correction?.published).toBeUndefined()
+    expect(normalizeTranscriptSession(normalized)).toEqual(normalized)
+  })
+
+  it('drops corrupted drafts without activating partial progress', () => {
+    const normalized = normalizeTranscriptSession({
+      id: 'broken-draft',
+      title: 'Broken',
+      date: '2026-07-16',
+      time: '12:00',
+      createdAt: 1,
+      updatedAt: 2,
+      transcript: 'original',
+      correction: {
+        status: 'detecting',
+        mode: 'review',
+        draft: { runId: 'x', status: 'running' },
+      } as never,
+    })
+    expect(normalized.correction?.draft).toBeUndefined()
+    expect(normalized.correction?.status).toBe('error')
+  })
+
+  it('drops an otherwise valid draft when any persisted patch is corrupted', () => {
+    const normalized = normalizeTranscriptSession({
+      id: 'partially-corrupted-draft', title: 'Broken patch', date: '2026-07-16', time: '12:00',
+      createdAt: 1, updatedAt: 2, transcript: 'original',
+      correction: {
+        status: 'detecting', mode: 'review',
+        draft: {
+          runId: 'run', revision: 1, trigger: 'manual-review', mode: 'review', status: 'running',
+          baseTranscriptHash: 'hash', requestedAt: 1, updatedAt: 2,
+          config: {
+            model: 'm', baseUrl: 'http://localhost/v1', promptLanguage: 'zh', promptVersion: 'patch-v1', schemaVersion: '1',
+            structuredOutput: 'prompt-json', temperature: 0.1, glossary: [], chunkSize: 4000, contextSize: 500,
+            concurrency: 1, safetyLimits: { maxPatchTextLength: 1000, maxPatchesPerShard: 100, maxCumulativeEditRatio: 0.2, maxNetLengthChangeRatio: 0.1 },
+            credentialRef: 'ai-post-process',
+          },
+          shards: [],
+          proposedPatches: [
+            { id: 'invalid-patch', op: 'replace' } as never,
+          ],
+          rejectedPatches: [],
+        },
+      },
+    })
+    expect(normalized.correction?.draft).toBeUndefined()
+    expect(normalized.correction?.status).toBe('error')
+  })
+
+  it('drops semantically invalid active patches even when their shape is complete', () => {
+    const invalidPatch = {
+      id: 'semantic-invalid', shardId: 'shard-1', op: 'insert', sourceStart: 0, sourceEnd: 3,
+      sourceText: 'bad', replacement: 'new', sourceTextHash: 'hash', category: 'asr-omission',
+      reason: 'invalid insert', state: 'proposed',
+    }
+    const normalized = normalizeTranscriptSession({
+      id: 'semantic-invalid-draft', title: 'Broken semantic patch', date: '2026-07-16', time: '12:00',
+      createdAt: 1, updatedAt: 2, transcript: 'bad source',
+      correction: {
+        status: 'detecting', mode: 'review',
+        draft: {
+          runId: 'run', revision: 1, trigger: 'manual-review', mode: 'review', status: 'ready-for-review',
+          baseTranscriptHash: 'hash', requestedAt: 1, updatedAt: 2,
+          config: {
+            model: 'm', baseUrl: 'http://localhost/v1', promptLanguage: 'zh', promptVersion: 'patch-v1', schemaVersion: '1',
+            structuredOutput: 'prompt-json', temperature: 0.1, glossary: [], chunkSize: 4000, contextSize: 500,
+            concurrency: 1, safetyLimits: { maxPatchTextLength: 1000, maxPatchesPerShard: 100, maxCumulativeEditRatio: 0.2, maxNetLengthChangeRatio: 0.1 },
+            credentialRef: 'ai-post-process',
+          },
+          shards: [{ id: 'shard-1', index: 0, coreStart: 0, coreEnd: 10, contextStart: 0, contextEnd: 10, status: 'completed', attempt: 1, draftRevision: 1, patches: [invalidPatch] }],
+          proposedPatches: [invalidPatch], rejectedPatches: [],
+        },
+      },
+    } as never)
+    expect(normalized.correction?.draft).toBeUndefined()
+    expect(normalized.correction?.status).toBe('error')
   })
 })

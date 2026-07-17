@@ -8,7 +8,7 @@ import type {
 } from '../../../shared/electronApi'
 import type { TranscriptSession } from '../types'
 
-function toSessionSummary(session: TranscriptSession): SessionSummary {
+export function toSessionSummary(session: TranscriptSession): SessionSummary {
   return {
     id: session.id,
     title: session.title,
@@ -27,7 +27,7 @@ function toSessionSummary(session: TranscriptSession): SessionSummary {
   }
 }
 
-function toSessionDetail(session: TranscriptSession): SessionDetail {
+export function toSessionDetail(session: TranscriptSession): SessionDetail {
   return {
     id: session.id,
     title: session.title,
@@ -96,6 +96,16 @@ function toSessionDetail(session: TranscriptSession): SessionDetail {
           mode: session.correction.mode,
         }
       : undefined,
+    correctionMeta: session.correction ? {
+      sourceKind: session.correction.published ? 'published' : session.correction.legacy ? 'legacy' : 'none',
+      formatVersion: session.correction.published?.formatVersion,
+      sourceHash: session.correction.published?.outputTextHash,
+      publishedStatus: session.correction.published || session.correction.legacy ? 'available' : 'none',
+      draftStatus: session.correction.draft?.status,
+      appliedPatches: session.correction.published?.stats.applied,
+      rejectedPatches: session.correction.published?.stats.rejected ?? session.correction.draft?.rejectedPatches.length,
+      updatedAt: session.correction.draft?.updatedAt ?? session.correction.published?.completedAt,
+    } : undefined,
   }
 }
 

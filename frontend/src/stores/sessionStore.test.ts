@@ -1,299 +1,186 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { TranscriptSession } from '../types'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { CorrectionConfigSnapshot, TranscriptCorrection, TranscriptSession } from '../types'
 
-const sessionRepositoryMock = vi.hoisted(() => ({
+const repository = vi.hoisted(() => ({
   loadForLaunch: vi.fn(),
   updateMetadata: vi.fn(),
+  checkpointCorrection: vi.fn(),
+}))
+const correction = vi.hoisted(() => ({
+  createCorrectionConfigSnapshot: vi.fn(),
+  requestCorrectionShard: vi.fn(),
+  CorrectionRequestError: class extends Error {},
 }))
 
-const aiCorrectionMock = vi.hoisted(() => ({
-  detectCorrectionIssues: vi.fn(),
-  correctTranscriptQuick: vi.fn(),
-  correctTranscriptWithReview: vi.fn(),
-}))
+vi.mock('../utils/sessionRepository', () => ({ sessionRepository: repository }))
+vi.mock('../services/aiCorrection', () => correction)
 
-vi.mock('../utils/sessionRepository', () => ({
-  sessionRepository: sessionRepositoryMock,
-}))
+function session(overrides: Partial<TranscriptSession> = {}): TranscriptSession {
+  return { id: 's1', title: 'Session', date: '2026-07-16', time: '12:00', createdAt: 1, updatedAt: 1, transcript: '需要侍应新的工作。', status: 'completed', ...overrides }
+}
 
-vi.mock('../services/aiCorrection', () => aiCorrectionMock)
-
-function makeSession(overrides: Partial<TranscriptSession> = {}): TranscriptSession {
+function configSnapshot(overrides: Partial<CorrectionConfigSnapshot> = {}): CorrectionConfigSnapshot {
+  const safetyLimits = { maxPatchTextLength: 1000, maxPatchesPerShard: 100, maxCumulativeEditRatio: 1, maxNetLengthChangeRatio: 1 }
   return {
-    id: 'session-1',
-    title: 'Test Session',
-    date: '2026-07-05',
-    time: '19:30',
-    createdAt: 1,
-    updatedAt: 1,
-    transcript: 'hello world',
-    segments: [],
-    speakers: [],
-    status: 'completed',
-    ...overrides,
+    model: 'model', baseUrl: 'http://localhost/v1', promptLanguage: 'zh', promptVersion: 'patch-v1', schemaVersion: '1',
+    structuredOutput: 'prompt-json', temperature: 0.1, glossary: [], chunkSize: 4000, contextSize: 500, concurrency: 1,
+    safetyLimits: { ...safetyLimits, ...overrides.safetyLimits }, credentialRef: 'ai-post-process', ...overrides,
   }
 }
 
-describe('sessionStore correction recovery', () => {
+describe('sessionStore patch correction runner', () => {
   beforeEach(async () => {
+    vi.unstubAllGlobals()
     vi.resetModules()
     vi.clearAllMocks()
+    correction.createCorrectionConfigSnapshot.mockReturnValue(configSnapshot())
+    correction.requestCorrectionShard.mockResolvedValue({ patches: [{ op: 'replace', oldText: '侍应', replacement: '适应', before: '需要', after: '新的', category: 'homophone', reason: '同音' }] })
+    repository.checkpointCorrection.mockImplementation(async (_id: string, next: TranscriptCorrection) => {
+      const { useSessionStore } = await import('./sessionStore')
+      const current = useSessionStore.getState().sessions[0]
+      const sessions = [{ ...current, correction: next }]
+      useSessionStore.setState({ sessions })
+      return sessions
+    })
   })
 
-  afterEach(() => {
-    vi.unstubAllGlobals()
-  })
-
-  it('recovers stale correcting state when no correction request is in flight', async () => {
+  it('quick mode checkpoints shards then atomically publishes deterministic text', async () => {
     const { useSessionStore } = await import('./sessionStore')
-    const staleSession = makeSession({
-      correction: {
-        status: 'correcting',
-        mode: 'quick',
-        requestedAt: 100,
-      },
-    })
-    sessionRepositoryMock.updateMetadata.mockImplementation((_sessionId: string, updates: Partial<TranscriptSession>) => [
-      { ...staleSession, ...updates },
-    ])
+    const source = session()
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+    const result = await useSessionStore.getState().startSessionQuickCorrection(source.id)
+    expect(result).toBe('需要适应新的工作。')
+    expect(repository.checkpointCorrection).toHaveBeenCalled()
+    expect(useSessionStore.getState().sessions[0].transcript).toBe(source.transcript)
+    expect(useSessionStore.getState().sessions[0].correction?.published?.correctedText).toBe(result)
+  })
 
-    useSessionStore.setState({
-      sessions: [staleSession],
-      recoverySession: null,
-      correctionStreamingText: { 'session-1': 'partial text' },
-      correctionInFlight: {},
-    })
+  it('rejects a concurrent double-start before a second draft can overwrite the first', async () => {
+    const { useSessionStore } = await import('./sessionStore')
+    const source = session()
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+    const first = useSessionStore.getState().startSessionQuickCorrection(source.id)
+    const second = useSessionStore.getState().startSessionQuickCorrection(source.id)
+    await expect(second).rejects.toThrow(/正在启动|未完成/)
+    await expect(first).resolves.toBe('需要适应新的工作。')
+    expect(useSessionStore.getState().sessions[0].correction?.draft).toBeUndefined()
+  })
 
-    useSessionStore.getState().recoverStaleSessionCorrection('session-1')
+  it('review mode can apply zero selected patches locally without a second request', async () => {
+    const { useSessionStore } = await import('./sessionStore')
+    const source = session()
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+    await useSessionStore.getState().detectSessionCorrectionIssues(source.id)
+    expect(useSessionStore.getState().sessions[0].correction?.draft?.status).toBe('ready-for-review')
+    expect(correction.requestCorrectionShard).toHaveBeenCalledTimes(1)
+    const result = await useSessionStore.getState().applySessionCorrectionReview(source.id, [])
+    expect(result).toBe(source.transcript)
+    expect(correction.requestCorrectionShard).toHaveBeenCalledTimes(1)
+  })
 
-    expect(sessionRepositoryMock.updateMetadata).toHaveBeenCalledWith('session-1', {
-      correction: expect.objectContaining({
-        status: 'error',
-        mode: 'quick',
-        error: expect.stringContaining('AI 纠错未完成'),
-      }),
-    })
-    expect(useSessionStore.getState().sessions[0].correction).toEqual(expect.objectContaining({
-      status: 'error',
-      mode: 'quick',
+  it('keeps a previous published result while a rerun draft is active', async () => {
+    const { useSessionStore } = await import('./sessionStore')
+    const source = session({ correction: { status: 'done', mode: 'quick', correctedText: 'old result', legacy: { correctedText: 'old result', source: 'v3-corrected-text' } } })
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+    await useSessionStore.getState().detectSessionCorrectionIssues(source.id)
+    const current = useSessionStore.getState().sessions[0].correction
+    expect(current?.correctedText).toBe('old result')
+    expect(current?.draft?.status).toBe('ready-for-review')
+  })
+
+  it('persists a valid Review replacement edit and applies it without another request', async () => {
+    const { useSessionStore } = await import('./sessionStore')
+    const source = session()
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+    await useSessionStore.getState().detectSessionCorrectionIssues(source.id)
+    const patchId = useSessionStore.getState().sessions[0].correction!.draft!.proposedPatches[0].id
+    await useSessionStore.getState().updateSessionCorrectionDraftPatch(source.id, patchId, '适配')
+    const result = await useSessionStore.getState().applySessionCorrectionReview(source.id, [patchId])
+    expect(result).toBe('需要适配新的工作。')
+    expect(correction.requestCorrectionShard).toHaveBeenCalledTimes(1)
+  })
+
+  it('persists finalization safety failures instead of leaving the draft running', async () => {
+    correction.createCorrectionConfigSnapshot.mockReturnValue(configSnapshot({
+      safetyLimits: { maxPatchTextLength: 1000, maxPatchesPerShard: 100, maxCumulativeEditRatio: 0.01, maxNetLengthChangeRatio: 1 },
     }))
-    expect(useSessionStore.getState().correctionStreamingText['session-1']).toBeUndefined()
+    const { useSessionStore } = await import('./sessionStore')
+    const source = session()
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+    await expect(useSessionStore.getState().startSessionQuickCorrection(source.id)).rejects.toThrow(/安全限制/)
+    expect(useSessionStore.getState().sessions[0].correction?.draft).toMatchObject({ status: 'failed', errorCode: 'safety-limit' })
   })
 
-  it('keeps correcting state when a correction request is still in flight', async () => {
+  it('runs remote shards with the configured bounded worker concurrency', async () => {
+    correction.createCorrectionConfigSnapshot.mockReturnValue(configSnapshot({ chunkSize: 4, contextSize: 0, concurrency: 2 }))
+    const releases: Array<() => void> = []
+    correction.requestCorrectionShard.mockImplementation(() => new Promise((resolve) => {
+      releases.push(() => resolve({ patches: [] }))
+    }))
     const { useSessionStore } = await import('./sessionStore')
-    const activeSession = makeSession({
+    const source = session({ transcript: 'abcdefgh' })
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+    const running = useSessionStore.getState().startSessionQuickCorrection(source.id)
+    await vi.waitFor(() => expect(correction.requestCorrectionShard).toHaveBeenCalledTimes(2))
+    releases.splice(0).forEach((release) => release())
+    await expect(running).resolves.toBe(source.transcript)
+  })
+
+  it('auto-resumes only queued drafts loaded at launch', async () => {
+    vi.stubGlobal('window', { electronAPI: undefined })
+    vi.stubGlobal('localStorage', { getItem: () => null, setItem: () => undefined, removeItem: () => undefined })
+    correction.requestCorrectionShard.mockResolvedValue({ patches: [] })
+    const source = session({ transcript: 'resume' })
+    const { sha256Utf8 } = await import('../utils/correctionPatch')
+    const queued = session({
+      transcript: source.transcript,
       correction: {
-        status: 'correcting',
-        mode: 'quick',
-        requestedAt: 100,
+        status: 'detecting', mode: 'review',
+        draft: {
+          runId: 'resume-run', revision: 1, trigger: 'manual-review', mode: 'review', status: 'queued',
+          baseTranscriptHash: await sha256Utf8(source.transcript), config: configSnapshot(),
+          shards: [{ id: 'shard-1', index: 0, coreStart: 0, coreEnd: source.transcript.length, contextStart: 0, contextEnd: source.transcript.length, status: 'pending', attempt: 0, draftRevision: 1 }],
+          proposedPatches: [], rejectedPatches: [], requestedAt: 1, updatedAt: 1,
+        },
       },
     })
-
-    useSessionStore.setState({
-      sessions: [activeSession],
-      recoverySession: null,
-      correctionStreamingText: { 'session-1': 'partial text' },
-      correctionInFlight: { 'session-1': true },
-    })
-
-    useSessionStore.getState().recoverStaleSessionCorrection('session-1')
-
-    expect(sessionRepositoryMock.updateMetadata).not.toHaveBeenCalled()
-    expect(useSessionStore.getState().sessions[0].correction?.status).toBe('correcting')
-    expect(useSessionStore.getState().correctionStreamingText['session-1']).toBe('partial text')
+    repository.loadForLaunch.mockResolvedValue({ sessions: [queued], recoverableSession: null })
+    const { useSessionStore } = await import('./sessionStore')
+    await useSessionStore.getState().loadSessions()
+    await vi.waitFor(() => expect(useSessionStore.getState().sessions[0].correction?.draft?.status).toBe('ready-for-review'))
+    expect(correction.requestCorrectionShard).toHaveBeenCalledTimes(1)
   })
 
-  it('auto-detects correction issues only when enabled and eligible', async () => {
+  it('fences a late response after pause before it can checkpoint patches', async () => {
+    let release!: () => void
+    correction.requestCorrectionShard.mockImplementation(() => new Promise((resolve) => {
+      release = () => resolve({ patches: [{ op: 'replace', oldText: '侍应', replacement: '适应', before: '需要', after: '新的', category: 'homophone', reason: '同音' }] })
+    }))
     const { useSessionStore } = await import('./sessionStore')
-    const { useSettingsStore } = await import('./settingsStore')
-    const session = makeSession()
-    aiCorrectionMock.detectCorrectionIssues.mockResolvedValue({
-      model: 'qwen2.5',
-      issues: [{
-        id: '1',
-        originalText: 'difine',
-        suggestedText: 'dify',
-        reason: 'glossary',
-        category: 'proper-noun',
-      }],
-    })
-    sessionRepositoryMock.updateMetadata.mockImplementation((_sessionId: string, updates: Partial<TranscriptSession>) => [
-      { ...session, ...updates },
-    ])
-
-    useSettingsStore.setState({
-      settings: {
-        apiKey: '',
-        languageHints: [],
-        aiPostProcess: {
-          enabled: true,
-          autoCorrectionDetection: true,
-          model: 'qwen2.5',
-        },
-      } as never,
-    })
-    useSessionStore.setState({
-      sessions: [session],
-      correctionInFlight: {},
-    })
-
-    await useSessionStore.getState().maybeAutoDetectSessionCorrection('session-1')
-
-    expect(aiCorrectionMock.detectCorrectionIssues).toHaveBeenCalledWith(
-      session,
-      expect.objectContaining({
-        aiPostProcess: expect.objectContaining({ autoCorrectionDetection: true }),
-      }),
-    )
-    expect(sessionRepositoryMock.updateMetadata).toHaveBeenLastCalledWith('session-1', {
-      correction: expect.objectContaining({
-        status: 'reviewing',
-        mode: 'review',
-        model: 'qwen2.5',
-      }),
-    })
-
-    aiCorrectionMock.detectCorrectionIssues.mockClear()
-    useSettingsStore.setState({
-      settings: {
-        apiKey: '',
-        languageHints: [],
-        aiPostProcess: {
-          enabled: true,
-          autoCorrectionDetection: false,
-          model: 'qwen2.5',
-        },
-      } as never,
-    })
-    await useSessionStore.getState().maybeAutoDetectSessionCorrection('session-1')
-    expect(aiCorrectionMock.detectCorrectionIssues).not.toHaveBeenCalled()
+    const source = session()
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+    const running = useSessionStore.getState().detectSessionCorrectionIssues(source.id)
+    await vi.waitFor(() => expect(correction.requestCorrectionShard).toHaveBeenCalledTimes(1))
+    await useSessionStore.getState().pauseSessionCorrection(source.id)
+    release()
+    await running
+    expect(useSessionStore.getState().sessions[0].correction?.draft).toMatchObject({ status: 'paused', proposedPatches: [] })
   })
 
-  it('persists edited review suggestions before applying accepted issues', async () => {
+  it('serializes concurrent published patch toggles against the latest revision', async () => {
+    correction.requestCorrectionShard.mockResolvedValue({ patches: [
+      { op: 'replace', oldText: '侍应', replacement: '适应', before: '甲需要', after: '新的', category: 'homophone', reason: '同音' },
+      { op: 'replace', oldText: '侍应', replacement: '适应', before: '乙需要', after: '其他', category: 'homophone', reason: '同音' },
+    ] })
     const { useSessionStore } = await import('./sessionStore')
-    const { useSettingsStore } = await import('./settingsStore')
-    const session = makeSession({
-      correction: {
-        status: 'reviewing',
-        mode: 'review',
-        issues: [
-          {
-            id: '1',
-            originalText: 'difine',
-            suggestedText: 'define',
-            reason: 'AI guess',
-            category: 'proper-noun',
-          },
-          {
-            id: '2',
-            originalText: 'keep',
-            suggestedText: 'skip',
-            reason: 'Rejected',
-            category: 'other',
-          },
-        ],
-      },
-    })
-    aiCorrectionMock.correctTranscriptWithReview.mockImplementation((_session, issues, _settings, callbacks) => {
-      callbacks.onDone(`corrected with ${issues[0].suggestedText}`)
-      return Promise.resolve()
-    })
-    sessionRepositoryMock.updateMetadata.mockImplementation((_sessionId: string, updates: Partial<TranscriptSession>) => [
-      { ...session, ...updates },
-    ])
-    useSettingsStore.setState({
-      settings: {
-        apiKey: '',
-        languageHints: [],
-        aiPostProcess: { enabled: true, model: 'qwen2.5' },
-      } as never,
-    })
-    useSessionStore.setState({
-      sessions: [session],
-      correctionInFlight: {},
-      correctionStreamingText: {},
-    })
-
-    await useSessionStore.getState().startSessionReviewCorrection('session-1', [
-      {
-        id: '1',
-        originalText: 'difine',
-        suggestedText: 'dify',
-        reason: 'edited',
-        category: 'proper-noun',
-        accepted: true,
-      },
-    ])
-
-    expect(aiCorrectionMock.correctTranscriptWithReview).toHaveBeenCalledWith(
-      session,
-      [expect.objectContaining({ id: '1', suggestedText: 'dify' })],
-      expect.anything(),
-      expect.anything(),
-    )
-    expect(sessionRepositoryMock.updateMetadata).toHaveBeenCalledWith('session-1', {
-      correction: expect.objectContaining({
-        status: 'correcting',
-        issues: [
-          expect.objectContaining({ id: '1', suggestedText: 'dify', accepted: true }),
-          expect.objectContaining({ id: '2', suggestedText: 'skip', accepted: false }),
-        ],
-      }),
-    })
-  })
-
-  it('returns recording archive recovery summary and links recovered audio to matching sessions', async () => {
-    const { useSessionStore } = await import('./sessionStore')
-    const session = makeSession({
-      sourceMeta: {
-        captureMode: 'system-audio',
-        sourceKind: 'recording-audio',
-      },
-    })
-    const recoverRecordingArchives = vi.fn().mockResolvedValue({
-      ok: true,
-      recovered: [
-        {
-          ok: true,
-          sessionId: 'session-1',
-          path: 'C:/Users/test/AppData/Roaming/DeLive/media/session-1/source-audio.wav',
-          mimeType: 'audio/wav',
-          fileName: 'source-audio.wav',
-          size: 46,
-        },
-        {
-          ok: true,
-          sessionId: 'missing-session',
-          path: 'C:/Users/test/AppData/Roaming/DeLive/media/missing-session/source-audio.wav',
-          mimeType: 'audio/wav',
-          fileName: 'source-audio.wav',
-          size: 46,
-        },
-      ],
-      skipped: [{ sessionId: 'empty-session', reason: 'empty-audio' }],
-    })
-    vi.stubGlobal('window', { electronAPI: { recoverRecordingArchives } })
-    sessionRepositoryMock.loadForLaunch.mockResolvedValue({ sessions: [session], recoverableSession: null })
-    sessionRepositoryMock.updateMetadata.mockImplementation((_sessionId: string, updates: Partial<TranscriptSession>) => [
-      { ...session, ...updates },
-    ])
-
-    const summary = await useSessionStore.getState().loadSessions()
-
-    expect(summary).toEqual({
-      recoveredCount: 2,
-      linkedCount: 1,
-      unlinkedCount: 1,
-      skippedCount: 1,
-    })
-    expect(sessionRepositoryMock.updateMetadata).toHaveBeenCalledWith('session-1', {
-      sourceMeta: expect.objectContaining({
-        audioPath: 'C:/Users/test/AppData/Roaming/DeLive/media/session-1/source-audio.wav',
-        audioMimeType: 'audio/wav',
-        audioFileName: 'source-audio.wav',
-        audioSize: 46,
-      }),
-    })
+    const source = session({ transcript: '甲需要侍应新的工作。乙需要侍应其他工作。' })
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+    await useSessionStore.getState().detectSessionCorrectionIssues(source.id)
+    const ids = useSessionStore.getState().sessions[0].correction!.draft!.proposedPatches.map((patch) => patch.id)
+    await useSessionStore.getState().applySessionCorrectionReview(source.id, ids)
+    await Promise.all(ids.map((id) => useSessionStore.getState().setSessionCorrectionPatchState(source.id, id, 'reverted')))
+    const published = useSessionStore.getState().sessions[0].correction!.published!
+    expect(published.patches.filter((patch) => patch.state === 'reverted')).toHaveLength(2)
+    expect(published.correctedText).toBe(source.transcript)
   })
 })

@@ -45,10 +45,10 @@ Displays the full transcript with:
 
 Provides two modes for correcting transcription errors:
 
-- **Quick Fix** — rewrites the full transcript in one pass via streaming; corrected text replaces the original immediately
-- **Review & Fix** — AI detects issues one by one (grammar, punctuation, wording); each issue shows original vs. suggested text and can be accepted or ignored individually
+- **Quick Fix** — detects local ASR edit intents in shards and automatically applies patches that pass local hard validation
+- **Review & Fix** — detects validated patch candidates with all selected by default; use Select all / Select none to adjust the set, then confirm to apply locally without another model call
 
-After correction completes, a **side-by-side diff view** highlights every change. Corrected transcripts can be exported as TXT or Markdown.
+The original transcript never changes. Corrected output is deterministically materialized from the original and active patches, with a real diff, per-patch revert/restore, and restore-all. Corrected results and corrected TXT/Markdown exports preserve original speaker labels and timestamps. Added text whose ownership cannot be determined safely, such as cross-speaker replacements or boundary insertions, appears in a separate `S? / Speaker uncertain` block instead of being assigned to a speaker. If stored speaker segments no longer match the full transcript, the page and exports preserve those original segments first, then append the complete correction under a clear “could not be safely segmented” warning. Long transcripts use non-overlapping editable shards and publish only after every shard succeeds. Failure or pause preserves the previous published result. SRT/VTT continue to use original ASR data.
 
 ### Smart Text-Source Selection
 
@@ -58,7 +58,7 @@ Once a correction is available, downstream AI features (Overview, Chat, Mind Map
 |--------|----------|
 | **Auto** *(default)* | Use corrected text when available, fall back to original |
 | **Always Original** | Always use the original transcript |
-| **Always Corrected** | Always use corrected text (error if none exists) |
+| **Always Corrected** | Use a published correction when available, otherwise fall back to original |
 
 A real-time banner on each tab indicates which text source is currently in use.
 

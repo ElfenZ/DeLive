@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import type { TranscriptSession } from '../types'
 import { formatDate, formatTime, validateBackupData } from './storage'
-import { buildAiAnalysisMarkdown, buildAiAnalysisTxt } from './storageUtils'
+import { buildAiAnalysisMarkdown, buildAiAnalysisTxt, buildTranscriptExportBody } from './storageUtils'
 
 describe('formatDate', () => {
   it('formats timestamp as YYYY-MM-DD', () => {
@@ -166,5 +166,38 @@ describe('AI analysis export formatters', () => {
     expect(output).toContain('Ready')
     expect(output).toContain('## Keywords')
     expect(output).not.toContain('## Action Items')
+  })
+})
+
+describe('transcript export body', () => {
+  const baseSession: TranscriptSession = {
+    id: 'speaker-export',
+    title: 'Speaker export',
+    date: '2026-07-16',
+    time: '20:00',
+    createdAt: 1,
+    updatedAt: 2,
+    transcript: '第一段。 第二段。',
+    segments: [
+      { text: '第一段。', speakerId: '1', startMs: 0 },
+      { text: '第二段。', speakerId: '2', startMs: 5_000 },
+    ],
+    speakers: [
+      { id: '1', label: '主持人' },
+      { id: '2', label: '参会者' },
+    ],
+  }
+
+  it('preserves safely aligned speaker labels and timestamps', () => {
+    expect(buildTranscriptExportBody(baseSession, 'txt')).toContain('S1\n主持人\n0:00\n第一段。')
+    expect(buildTranscriptExportBody(baseSession, 'markdown')).toContain('### S2 · 参会者 · 0:05')
+  })
+
+  it('falls back to the complete canonical transcript when segments cannot align', () => {
+    expect(buildTranscriptExportBody({
+      ...baseSession,
+      transcript: '完整原文',
+      segments: [{ text: '不匹配', speakerId: '1' }],
+    }, 'txt')).toBe('完整原文')
   })
 })

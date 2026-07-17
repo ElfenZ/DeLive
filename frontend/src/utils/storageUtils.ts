@@ -1,5 +1,6 @@
 import type { Tag, TranscriptSession } from '../types'
 import { hasPostProcessContent } from './transcriptState'
+import { formatCorrectionProjection, projectCorrectionOntoSegments } from './correctedSegmentProjection'
 
 export function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
@@ -13,30 +14,6 @@ export function formatDate(timestamp: number): string {
 export function formatTime(timestamp: number): string {
   const date = new Date(timestamp)
   return date.toTimeString().slice(0, 5)
-}
-
-function buildSpeakerAwareTranscript(session: TranscriptSession): string {
-  const speakerNameMap = Object.fromEntries(
-    (session.speakers || []).map((speaker) => [
-      speaker.id,
-      speaker.displayName?.trim() || speaker.label?.trim() || speaker.id,
-    ]),
-  )
-
-  if ((session.segments || []).length > 0) {
-    return (session.segments || [])
-      .filter((segment) => segment.text.trim())
-      .map((segment) => {
-        const speakerLabel = segment.speakerId
-          ? speakerNameMap[segment.speakerId] || segment.speakerId
-          : ''
-        return speakerLabel
-          ? `[${speakerLabel}]\n${segment.text}`
-          : segment.text
-      })
-      .join('\n\n')
-  }
-  return session.transcript
 }
 
 function triggerDownload(blob: Blob, filename: string): void {
@@ -54,14 +31,14 @@ export function exportToTxt(session: TranscriptSession, tags?: Tag[]): void {
   const sessionTags = tags?.filter((tag) => session.tagIds?.includes(tag.id)) || []
   const tagNames = sessionTags.map((tag) => tag.name).join(', ')
   const translatedText = session.translatedTranscript?.text?.trim()
-  const speakerAwareTranscript = buildSpeakerAwareTranscript(session)
+  const transcriptBody = buildTranscriptExportBody(session, 'txt')
 
   const content = `标题: ${session.title}
 日期: ${session.date}
 时间: ${session.time}${tagNames ? `\n标签: ${tagNames}` : ''}
 ${'='.repeat(50)}
 
-${speakerAwareTranscript}
+${transcriptBody}
 ${translatedText ? `\n\n${'-'.repeat(20)}\n翻译\n${'-'.repeat(20)}\n\n${translatedText}\n` : ''}
 `
 
@@ -75,26 +52,7 @@ export function exportToMarkdown(session: TranscriptSession, tags?: Tag[]): void
   const sessionTags = tags?.filter((tag) => session.tagIds?.includes(tag.id)) || []
   const tagNames = sessionTags.map((tag) => `\`${tag.name}\``).join(' ')
   const translatedText = session.translatedTranscript?.text?.trim()
-
-  const speakerNameMap = Object.fromEntries(
-    (session.speakers || []).map((speaker) => [
-      speaker.id,
-      speaker.displayName?.trim() || speaker.label?.trim() || speaker.id,
-    ]),
-  )
-
-  const hasSegments = (session.segments || []).length > 0
-  const transcriptMd = hasSegments
-    ? (session.segments || [])
-        .filter((seg) => seg.text.trim())
-        .map((seg) => {
-          const speaker = seg.speakerId
-            ? speakerNameMap[seg.speakerId] || seg.speakerId
-            : ''
-          return speaker ? `**${speaker}**: ${seg.text}` : seg.text
-        })
-        .join('\n\n')
-    : session.transcript
+  const transcriptBody = buildTranscriptExportBody(session, 'markdown')
 
   const lines: string[] = []
   lines.push(`# ${session.title}`)
@@ -103,7 +61,7 @@ export function exportToMarkdown(session: TranscriptSession, tags?: Tag[]): void
   lines.push('')
   lines.push('---')
   lines.push('')
-  lines.push(transcriptMd)
+  lines.push(transcriptBody)
 
   if (translatedText) {
     lines.push('')
@@ -120,6 +78,16 @@ export function exportToMarkdown(session: TranscriptSession, tags?: Tag[]): void
     new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' }),
     `${session.title}_${session.date}_${session.time.replace(':', '-')}.md`,
   )
+}
+
+export function buildTranscriptExportBody(
+  session: TranscriptSession,
+  format: 'txt' | 'markdown',
+): string {
+  const projection = projectCorrectionOntoSegments(session.transcript, session.segments, [])
+  return projection.status === 'projected'
+    ? formatCorrectionProjection(projection, session.speakers, format)
+    : session.transcript
 }
 
 function formatTimestamp(timestamp: number | undefined): string {

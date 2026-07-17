@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import {
   X,
   Download,
@@ -24,6 +24,7 @@ import { downloadSubtitle } from '../../utils/subtitleExport'
 import { hasPostProcessContent } from '../../utils/transcriptState'
 import { useUIStore } from '../../stores/uiStore'
 import { useSessionStore } from '../../stores/sessionStore'
+import { formatCorrectionProjection, projectSessionCorrection } from '../../utils/correctedSegmentProjection'
 
 interface SessionHeaderProps {
   session: TranscriptSession
@@ -47,9 +48,24 @@ export function SessionHeader({
   const exportMenuRef = useRef<HTMLDivElement>(null)
   const translatedText = liveSession.translatedTranscript?.text?.trim() || ''
   const hasContent = Boolean(liveSession.transcript || translatedText)
-  const hasCorrectedText = liveSession.correction?.status === 'done' && !!liveSession.correction.correctedText
+  const correctedText = liveSession.correction?.published?.correctedText
+    || liveSession.correction?.legacy?.correctedText
+    || (liveSession.correction?.status === 'done' ? liveSession.correction.correctedText : undefined)
+  const hasCorrectedText = Boolean(correctedText)
   const hasAiAnalysis = liveSession.postProcess?.status === 'success' && hasPostProcessContent(liveSession.postProcess)
   const sourceAudioPath = liveSession.sourceMeta?.audioPath?.trim()
+  const correctedSegmentProjection = useMemo(
+    () => projectSessionCorrection(liveSession.transcript, liveSession.segments, liveSession.correction),
+    [liveSession.correction, liveSession.segments, liveSession.transcript],
+  )
+
+  const correctedExportBody = (format: 'txt' | 'markdown'): string => {
+    if (!correctedText) return ''
+    if (correctedSegmentProjection) {
+      return formatCorrectionProjection(correctedSegmentProjection, liveSession.speakers, format, language)
+    }
+    return correctedText
+  }
 
   const handleExportTxt = () => {
     exportToTxt(liveSession)
@@ -72,8 +88,8 @@ export function SessionHeader({
   }
 
   const handleExportCorrectedTxt = () => {
-    if (!liveSession.correction?.correctedText) return
-    const blob = new Blob([liveSession.correction.correctedText], { type: 'text/plain;charset=utf-8' })
+    if (!correctedText) return
+    const blob = new Blob([correctedExportBody('txt')], { type: 'text/plain;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
@@ -86,7 +102,7 @@ export function SessionHeader({
   }
 
   const handleExportCorrectedMarkdown = () => {
-    if (!liveSession.correction?.correctedText) return
+    if (!correctedText) return
     const lines: string[] = []
     lines.push(`# ${liveSession.title} (${t.preview.correctionCorrected})`)
     lines.push('')
@@ -94,7 +110,7 @@ export function SessionHeader({
     lines.push('')
     lines.push('---')
     lines.push('')
-    lines.push(liveSession.correction.correctedText)
+    lines.push(correctedExportBody('markdown'))
     lines.push('')
     const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' })
     const url = URL.createObjectURL(blob)

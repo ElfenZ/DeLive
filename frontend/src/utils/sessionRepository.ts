@@ -1,4 +1,4 @@
-import type { TranscriptSession } from '../types'
+import type { TranscriptCorrection, TranscriptSession } from '../types'
 import {
   deleteSessionById,
   getSessions,
@@ -13,8 +13,6 @@ import {
 import type { TranscriptPersistenceSnapshot } from './sessionSnapshot'
 import { hasPostProcessContent } from './transcriptState'
 
-const STALE_CORRECTION_ERROR = 'AI 纠错未完成，请重新启动纠错'
-
 export type SessionProgressSnapshot = TranscriptPersistenceSnapshot
 
 export interface SessionLaunchState {
@@ -24,6 +22,18 @@ export interface SessionLaunchState {
 
 let cachedSessions: TranscriptSession[] = []
 let cacheReady = false
+const sessionWriteQueues = new Map<string, Promise<void>>()
+const pendingCorrections = new Map<string, TranscriptCorrection>()
+
+function enqueueSessionWrite(sessionId: string, operation: () => Promise<void>): Promise<void> {
+  const previous = sessionWriteQueues.get(sessionId) || Promise.resolve()
+  const write = previous.then(operation)
+  sessionWriteQueues.set(sessionId, write)
+  void write.finally(() => {
+    if (sessionWriteQueues.get(sessionId) === write) sessionWriteQueues.delete(sessionId)
+  }).catch(() => undefined)
+  return write
+}
 
 function normalizeSession(session: TranscriptSession): TranscriptSession {
   return normalizeTranscriptSession(session)
@@ -57,14 +67,18 @@ function persistSingleSession(sessionId: string, sessions: TranscriptSession[]):
     return nextSessions
   }
 
-  void upsertSession(targetSession).catch((error) => {
+  const pendingCorrection = pendingCorrections.get(sessionId)
+  const durableTarget = pendingCorrection
+    ? normalizeSession({ ...targetSession, correction: pendingCorrection })
+    : targetSession
+  void enqueueSessionWrite(sessionId, () => upsertSession(durableTarget)).catch((error) => {
     console.error('[sessionRepository] Failed to persist session:', error)
   })
 
   return nextSessions
 }
 
-function persistSessionBatch(sessionIds: string[], sessions: TranscriptSession[]): TranscriptSession[] {
+async function persistSessionBatch(sessionIds: string[], sessions: TranscriptSession[]): Promise<TranscriptSession[]> {
   const nextSessions = updateCachedSessions(sessions)
   const targets = nextSessions.filter((session) => sessionIds.includes(session.id))
 
@@ -72,9 +86,7 @@ function persistSessionBatch(sessionIds: string[], sessions: TranscriptSession[]
     return nextSessions
   }
 
-  void upsertSessions(targets).catch((error) => {
-    console.error('[sessionRepository] Failed to persist session batch:', error)
-  })
+  await upsertSessions(targets)
 
   return nextSessions
 }
@@ -110,19 +122,25 @@ function updateSessionCollection(
   })
 }
 
-function recoverStaleCorrection(session: TranscriptSession, now: number): TranscriptSession {
-  const status = session.correction?.status
-  if (status !== 'detecting' && status !== 'correcting') {
-    return session
-  }
-
+function recoverInterruptedDraft(session: TranscriptSession, now: number): TranscriptSession {
+  const draft = session.correction?.draft
+  if (!draft || draft.status === 'paused' || draft.pauseRequested) return session
+  if (draft.status !== 'running' && draft.status !== 'retrying') return session
   return {
     ...session,
     correction: {
+      status: session.correction?.status || 'detecting',
+      mode: session.correction?.mode || draft.mode,
       ...session.correction,
-      mode: session.correction?.mode ?? 'quick',
-      status: 'error',
-      error: STALE_CORRECTION_ERROR,
+      draft: {
+        ...draft,
+        status: 'queued',
+        revision: draft.revision + 1,
+        updatedAt: now,
+        shards: draft.shards.map((shard) => shard.status === 'running' || shard.status === 'retrying'
+          ? { ...shard, status: 'pending', attemptId: undefined, nextRetryAt: undefined, draftRevision: draft.revision + 1 }
+          : shard),
+      },
     },
     updatedAt: now,
   }
@@ -141,10 +159,7 @@ export const sessionRepository = {
     const staleCorrectionSessionIds: string[] = []
 
     sessions = sessions.map((session) => {
-      const correctionStatus = session.correction?.status
-      const nextSession = correctionStatus === 'detecting' || correctionStatus === 'correcting'
-        ? recoverStaleCorrection(session, now)
-        : session
+      const nextSession = recoverInterruptedDraft(session, now)
 
       if (nextSession !== session) {
         staleCorrectionSessionIds.push(session.id)
@@ -173,7 +188,7 @@ export const sessionRepository = {
       : Array.from(new Set([...interruptedSessionIds, ...staleCorrectionSessionIds]))
 
     if (sessionIdsToPersist.length > 0) {
-      sessions = persistSessionBatch(sessionIdsToPersist, sessions)
+      sessions = await persistSessionBatch(sessionIdsToPersist, sessions)
     }
 
     const recoverableSession = sessions.find((session) => {
@@ -209,6 +224,20 @@ export const sessionRepository = {
   updateMetadata(sessionId: string, updates: Partial<TranscriptSession>): TranscriptSession[] {
     const sessions = updateSessionCollection(getCachedSessions(), sessionId, updates)
     return persistSingleSession(sessionId, sessions)
+  },
+
+  async checkpointCorrection(sessionId: string, correction: NonNullable<TranscriptSession['correction']>): Promise<TranscriptSession[]> {
+    const sessions = updateSessionCollection(getCachedSessions(), sessionId, { correction })
+    const target = sessions.find((session) => session.id === sessionId)
+    if (!target) throw new Error(`Session ${sessionId} was not found for correction checkpoint`)
+    pendingCorrections.set(sessionId, correction)
+    try {
+      await enqueueSessionWrite(sessionId, () => upsertSession(target))
+      const committed = updateSessionCollection(getCachedSessions(), sessionId, { correction })
+      return updateCachedSessions(committed)
+    } finally {
+      if (pendingCorrections.get(sessionId) === correction) pendingCorrections.delete(sessionId)
+    }
   },
 
   saveProgress(sessionId: string, snapshot: SessionProgressSnapshot): TranscriptSession[] {

@@ -80,7 +80,7 @@ curl "http://localhost:23456/api/v1/sessions?search=standup&limit=5"
 
 ### GET /sessions/:id
 
-Full session detail including transcript, AI summary, mind map, and Q&A history.
+Full session detail including transcript, AI summary, mind map, and Q&A history. When correction data exists, the optional `correctionMeta` object exposes only compatibility-safe status, source hash, counts, and timestamps; patch payloads and resumable drafts are never returned.
 
 ```bash
 curl http://localhost:23456/api/v1/sessions/abc123

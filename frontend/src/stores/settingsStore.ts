@@ -31,7 +31,7 @@ const defaultCaptionStyle: CaptionStyle = {
 
 export interface SettingsState {
   settings: AppSettings
-  loadSettings: () => void
+  loadSettings: () => Promise<void>
   updateSettings: (settings: Partial<AppSettings>) => void
   updateAiPostProcessConfig: (config: Partial<AiPostProcessConfig>) => Promise<void>
   updateOpenApiConfig: (config: Partial<OpenApiConfig>) => void
@@ -53,7 +53,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     captionStyle: defaultCaptionStyle,
     aiPostProcess: getDefaultSettings().aiPostProcess,
   },
-  loadSettings: () => {
+  loadSettings: async () => {
     const settings = getSettings()
     const defaultSettings = getDefaultSettings()
     const registeredVendors = providerRegistry.getAllProviders().map(p => p.id)
@@ -103,18 +103,16 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
 
     set({ settings: merged })
 
+    await migrateApiKeysToSafeStorage()
+    const resolved = await resolveApiKeysFromSafeStorage(get().settings)
+    set({ settings: resolved })
+
     if (window.electronAPI) {
       window.electronAPI.apiUpdateOpenApiConfig({
-        enabled: !!merged.openApi?.enabled,
-        token: merged.openApi?.token || '',
+        enabled: !!resolved.openApi?.enabled,
+        token: resolved.openApi?.token || '',
       })
     }
-
-    void (async () => {
-      await migrateApiKeysToSafeStorage()
-      const resolved = await resolveApiKeysFromSafeStorage(get().settings)
-      set({ settings: resolved })
-    })()
   },
   updateSettings: (newSettings) => {
     const settings = { ...get().settings, ...newSettings }
