@@ -7,6 +7,21 @@ export interface WhatsNewEntry {
 
 const entries: WhatsNewEntry[] = [
   {
+    version: '2.5.4',
+    date: '2026-07-18',
+    features: [
+      {
+        zh: '自动 AI 后处理：转录完成后按 Quick 或 Review 模式衔接纠错、摘要和安全标题更新',
+        en: 'Automatic AI post-processing: chain correction, briefing, and safe title updates after transcription in Quick or Review mode',
+      },
+      {
+        zh: '会话导出文件名统一使用本地创建时间和清理后的标题，覆盖 TXT、Markdown、SRT 与 VTT',
+        en: 'Session exports now use local creation time and sanitized titles consistently across TXT, Markdown, SRT, and VTT',
+      },
+    ],
+    fixes: [],
+  },
+  {
     version: '2.5.3',
     date: '2026-07-16',
     features: [

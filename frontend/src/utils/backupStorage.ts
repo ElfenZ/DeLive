@@ -242,6 +242,7 @@ function normalizeAiPostProcessConfig(value: unknown): AiPostProcessConfig | und
     enableStreaming: typeof value.enableStreaming === 'boolean' ? value.enableStreaming : undefined,
     glossary,
     autoCorrectionDetection: typeof value.autoCorrectionDetection === 'boolean' ? value.autoCorrectionDetection : undefined,
+    autoAiPostProcess: typeof value.autoAiPostProcess === 'boolean' ? value.autoAiPostProcess : undefined,
     correctionStructuredOutput,
     correctionAdvanced: normalizedCorrectionAdvanced,
   }

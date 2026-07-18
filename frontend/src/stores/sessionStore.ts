@@ -5,6 +5,7 @@ import type {
   ResolvedCorrectionPatch,
   RecordingState,
   TranscriptAskTurn,
+  TranscriptAutoPostProcessWorkflow,
   TranscriptCorrection,
   TranscriptMindMap,
   TranscriptPostProcess,
@@ -19,6 +20,8 @@ import {
   generateSessionBriefing,
   generateSessionMindMap as generateMindMapForSession,
   resolveModelForFeature,
+  resolveTranscriptArtifactSourceState,
+  resolveTranscriptText,
 } from '../services/aiPostProcess'
 import {
   CorrectionRequestError,
@@ -81,6 +84,7 @@ let correctionExecutionGeneration = 0
 const correctionExecutionLeases = new Map<string, CorrectionExecutionLease>()
 const correctionMutationQueues = new Map<string, Promise<unknown>>()
 const correctionStartReservations = new Set<string>()
+const autoPostProcessWorkflowInFlight = new Set<string>()
 
 class CorrectionRunError extends Error {
   constructor(message: string, public readonly code: string) {
@@ -166,6 +170,7 @@ export interface SessionState {
 
   updateSessionCorrection: (sessionId: string, patch: Partial<TranscriptCorrection>) => void
   recoverStaleSessionCorrection: (sessionId: string) => void
+  maybeStartAutoAiPostProcess: (sessionId: string) => Promise<void>
   maybeAutoDetectSessionCorrection: (sessionId: string) => Promise<void>
   detectSessionCorrectionIssues: (sessionId: string) => Promise<CorrectionIssue[]>
   startSessionQuickCorrection: (
@@ -711,6 +716,171 @@ export const useSessionStore = create<SessionState>((set, get) => {
     }
   }
 
+  const replaceAutoPostProcessWorkflow = (
+    sessionId: string,
+    workflow: TranscriptAutoPostProcessWorkflow,
+  ): void => {
+    const sessions = sessionRepository.updateMetadata(sessionId, { autoPostProcessWorkflow: workflow })
+    const persistedWorkflow = sessions.find((session) => session.id === sessionId)?.autoPostProcessWorkflow || workflow
+    const recoverySession = get().recoverySession
+    set({
+      sessions,
+      recoverySession: recoverySession?.id === sessionId
+        ? { ...recoverySession, autoPostProcessWorkflow: persistedWorkflow }
+        : recoverySession,
+    })
+  }
+
+  const updateAutoPostProcessWorkflow = (
+    sessionId: string,
+    patch: Partial<TranscriptAutoPostProcessWorkflow>,
+  ): TranscriptAutoPostProcessWorkflow | undefined => {
+    const workflow = get().sessions.find((session) => session.id === sessionId)?.autoPostProcessWorkflow
+    if (!workflow) return undefined
+    const nextWorkflow: TranscriptAutoPostProcessWorkflow = {
+      ...workflow,
+      ...patch,
+      version: 1,
+      updatedAt: Date.now(),
+    }
+    replaceAutoPostProcessWorkflow(sessionId, nextWorkflow)
+    return nextWorkflow
+  }
+
+  const failAutoPostProcessWorkflow = (
+    sessionId: string,
+    error: unknown,
+    step?: TranscriptAutoPostProcessWorkflow['step'],
+  ): void => {
+    const message = error instanceof Error ? error.message : String(error)
+    updateAutoPostProcessWorkflow(sessionId, {
+      status: 'error',
+      ...(step ? { step } : {}),
+      error: message || '自动 AI 后处理失败',
+    })
+  }
+
+  const finishAutoPostProcessTitle = async (sessionId: string): Promise<void> => {
+    const session = get().sessions.find((item) => item.id === sessionId)
+    const workflow = session?.autoPostProcessWorkflow
+    if (!session || !workflow) return
+    const titleSuggestion = session.postProcess?.titleSuggestion?.trim()
+    if (!titleSuggestion) {
+      failAutoPostProcessWorkflow(sessionId, 'AI 摘要未返回有效标题建议', 'title')
+      return
+    }
+
+    if (session.title === workflow.titleAtStart) {
+      get().updateSessionTitle(sessionId, titleSuggestion)
+    }
+    updateAutoPostProcessWorkflow(sessionId, {
+      status: 'completed',
+      step: 'title',
+      completedAt: Date.now(),
+      error: undefined,
+    })
+  }
+
+  const continueAutoPostProcessAfterCorrection = async (sessionId: string): Promise<void> => {
+    const session = get().sessions.find((item) => item.id === sessionId)
+    const workflow = session?.autoPostProcessWorkflow
+    if (!session || !workflow || workflow.step !== 'correction'
+      || workflow.status === 'error' || workflow.status === 'completed'
+      || session.correction?.draft || !session.correction?.published) return
+    updateAutoPostProcessWorkflow(sessionId, {
+      status: 'queued',
+      step: 'briefing',
+      error: undefined,
+    })
+    await runAutoAiPostProcessWorkflow(sessionId)
+  }
+
+  async function runAutoAiPostProcessWorkflow(sessionId: string): Promise<void> {
+    if (autoPostProcessWorkflowInFlight.has(sessionId)) return
+    autoPostProcessWorkflowInFlight.add(sessionId)
+    try {
+      while (true) {
+        const session = get().sessions.find((item) => item.id === sessionId)
+        const workflow = session?.autoPostProcessWorkflow
+        if (!session || !workflow || (workflow.status !== 'queued' && workflow.status !== 'running')) return
+
+        if (workflow.step === 'correction') {
+          if (session.correction?.draft?.status === 'paused') return
+          updateAutoPostProcessWorkflow(sessionId, { status: 'running', error: undefined })
+
+          let latestSession = get().sessions.find((item) => item.id === sessionId)
+          let draft = latestSession?.correction?.draft
+          if (draft?.status === 'failed' || draft?.status === 'blocked-auth') {
+            throw new Error(draft.error || 'AI 纠错失败')
+          }
+          if (draft?.status === 'queued' || draft?.status === 'running' || draft?.status === 'retrying') {
+            await runCorrectionDraft(sessionId)
+          } else if (!draft) {
+            const published = latestSession?.correction?.published
+            const publishedByWorkflow = published && published.completedAt >= workflow.startedAt
+            if (!publishedByWorkflow) {
+              await createAndRunCorrection(sessionId, workflow.correctionMode, 'automatic')
+            }
+          }
+
+          latestSession = get().sessions.find((item) => item.id === sessionId)
+          draft = latestSession?.correction?.draft
+          if (draft?.status === 'ready-for-review') {
+            if (draft.proposedPatches.length === 0) {
+              await get().applySessionCorrectionReview(sessionId, [])
+              continue
+            }
+            updateAutoPostProcessWorkflow(sessionId, { status: 'waiting-review', error: undefined })
+            return
+          }
+          if (draft?.status === 'failed' || draft?.status === 'blocked-auth') {
+            throw new Error(draft.error || 'AI 纠错失败')
+          }
+          if (draft?.status === 'paused') return
+
+          const published = latestSession?.correction?.published
+          if (!draft && published && published.completedAt >= workflow.startedAt) {
+            updateAutoPostProcessWorkflow(sessionId, {
+              status: 'queued',
+              step: 'briefing',
+              error: undefined,
+            })
+            continue
+          }
+          return
+        }
+
+        if (workflow.step === 'briefing') {
+          updateAutoPostProcessWorkflow(sessionId, { status: 'running', error: undefined })
+          const latestSession = get().sessions.find((item) => item.id === sessionId)
+          if (!latestSession) return
+          const settings = useSettingsStore.getState().settings
+          const currentSource = resolveTranscriptText(
+            latestSession,
+            settings.aiPostProcess?.preferCorrectedText,
+          )
+          const reusableBriefing = latestSession.postProcess?.status === 'success'
+            && Boolean(latestSession.postProcess.generatedAt && latestSession.postProcess.generatedAt >= workflow.startedAt)
+            && resolveTranscriptArtifactSourceState(latestSession.postProcess, currentSource) === 'current'
+          if (!reusableBriefing) {
+            await get().generateSessionPostProcess(sessionId)
+          }
+          updateAutoPostProcessWorkflow(sessionId, { status: 'running', step: 'title', error: undefined })
+          await finishAutoPostProcessTitle(sessionId)
+          return
+        }
+
+        updateAutoPostProcessWorkflow(sessionId, { status: 'running', error: undefined })
+        await finishAutoPostProcessTitle(sessionId)
+        return
+      }
+    } catch (error) {
+      failAutoPostProcessWorkflow(sessionId, error)
+    } finally {
+      autoPostProcessWorkflowInFlight.delete(sessionId)
+    }
+  }
+
   return {
     recordingState: 'idle',
     setRecordingState: (state) => set({ recordingState: state }),
@@ -789,7 +959,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
       if (currentSessionId && hasContent) {
         const sessions = sessionRepository.completeSession(currentSessionId, snapshot)
         set({ sessions })
-        void get().maybeAutoDetectSessionCorrection(currentSessionId)
+        void get().maybeStartAutoAiPostProcess(currentSessionId)
         console.log('[SessionStore] 会话已保存, 文本长度:', snapshot.transcript.length)
       } else if (currentSessionId) {
         const sessions = sessionRepository.deleteSession(currentSessionId)
@@ -825,6 +995,16 @@ export const useSessionStore = create<SessionState>((set, get) => {
       set({ sessions, recoverySession: recoverableSession })
 
       for (const session of sessions) {
+        const workflow = session.autoPostProcessWorkflow
+        if (workflow) {
+          if ((workflow.status === 'queued' || workflow.status === 'running')
+            && session.correction?.draft?.status !== 'paused') {
+            void runAutoAiPostProcessWorkflow(session.id).catch((error) => {
+              console.warn('[SessionStore] 恢复自动 AI 后处理失败:', error)
+            })
+          }
+          continue
+        }
         if (session.correction?.draft?.status !== 'queued') continue
         void runCorrectionDraft(session.id).catch((error) => {
           console.warn('[SessionStore] 恢复 AI 纠错任务失败:', error)
@@ -1155,12 +1335,13 @@ export const useSessionStore = create<SessionState>((set, get) => {
       })
 
       try {
+        const latestSession = get().sessions.find((item) => item.id === sessionId) || session
         const { postProcess } = await generateSessionBriefing(
-          session,
+          latestSession,
           useSettingsStore.getState().settings,
         )
         const nextPostProcess = options?.overwrite === false
-          ? mergeSessionPostProcess(session.postProcess, {
+          ? mergeSessionPostProcess(latestSession.postProcess, {
             ...postProcess,
             status: 'success',
             error: undefined,
@@ -1278,12 +1459,51 @@ export const useSessionStore = create<SessionState>((set, get) => {
 
     recoverStaleSessionCorrection: () => undefined,
 
+    maybeStartAutoAiPostProcess: async (sessionId) => {
+      const session = get().sessions.find((item) => item.id === sessionId)
+      if (!session?.transcript.trim() || session.autoPostProcessWorkflow) return
+
+      const settings = useSettingsStore.getState().settings
+      const aiConfig = settings.aiPostProcess || {}
+      if (!aiConfig.autoAiPostProcess) {
+        await get().maybeAutoDetectSessionCorrection(sessionId)
+        return
+      }
+
+      const now = Date.now()
+      const workflow: TranscriptAutoPostProcessWorkflow = {
+        version: 1,
+        status: 'queued',
+        step: 'correction',
+        correctionMode: aiConfig.correctionMode || 'quick',
+        titleAtStart: session.title,
+        startedAt: now,
+        updatedAt: now,
+      }
+      replaceAutoPostProcessWorkflow(sessionId, workflow)
+
+      const configurationError = !aiConfig.enabled
+        ? '请先在设置中启用 AI 后处理'
+        : !resolveModelForFeature(aiConfig, 'correction')
+          ? '请先配置 AI 纠错模型'
+          : !resolveModelForFeature(aiConfig, 'briefing')
+            ? '请先配置 AI 摘要模型'
+            : ''
+      if (configurationError) {
+        failAutoPostProcessWorkflow(sessionId, configurationError)
+        return
+      }
+
+      await runAutoAiPostProcessWorkflow(sessionId)
+    },
+
     maybeAutoDetectSessionCorrection: async (sessionId) => {
       const session = get().sessions.find((s) => s.id === sessionId)
       if (!session?.transcript.trim()) return
 
       const settings = useSettingsStore.getState().settings
       const aiConfig = settings.aiPostProcess || {}
+      if (aiConfig.autoAiPostProcess) return
       if (!aiConfig.enabled || !aiConfig.autoCorrectionDetection) return
       if (!resolveModelForFeature(aiConfig, 'correction')) return
       if (get().correctionInFlight[sessionId]) return
@@ -1335,6 +1555,10 @@ export const useSessionStore = create<SessionState>((set, get) => {
       })
     },
     resumeSessionCorrection: async (sessionId) => {
+      const workflow = get().sessions.find((item) => item.id === sessionId)?.autoPostProcessWorkflow
+      if (workflow?.step === 'correction' && workflow.status !== 'completed') {
+        updateAutoPostProcessWorkflow(sessionId, { status: 'queued', error: undefined })
+      }
       await enqueueCorrectionMutation(sessionId, async () => {
         const session = get().sessions.find((item) => item.id === sessionId)
         const draft = session?.correction?.draft
@@ -1343,9 +1567,19 @@ export const useSessionStore = create<SessionState>((set, get) => {
         const queued = { ...draft, status: 'queued' as const, pauseRequested: false, revision, updatedAt: Date.now(), shards: draft.shards.map((shard) => shard.status === 'running' || shard.status === 'retrying' ? { ...shard, status: 'pending' as const, attemptId: undefined, draftRevision: revision } : shard) }
         await checkpointCorrection(sessionId, { ...session.correction!, status: 'detecting', error: undefined, draft: queued })
       })
-      await runCorrectionDraft(sessionId)
+      try {
+        await runCorrectionDraft(sessionId)
+      } catch (error) {
+        if (workflow?.step === 'correction') failAutoPostProcessWorkflow(sessionId, error, 'correction')
+        throw error
+      }
+      if (workflow?.step === 'correction') await runAutoAiPostProcessWorkflow(sessionId)
     },
     retrySessionCorrection: async (sessionId) => {
+      const workflow = get().sessions.find((item) => item.id === sessionId)?.autoPostProcessWorkflow
+      if (workflow?.step === 'correction' && workflow.status !== 'completed') {
+        updateAutoPostProcessWorkflow(sessionId, { status: 'queued', error: undefined })
+      }
       await enqueueCorrectionMutation(sessionId, async () => {
         const session = get().sessions.find((item) => item.id === sessionId)
         const draft = session?.correction?.draft
@@ -1354,7 +1588,13 @@ export const useSessionStore = create<SessionState>((set, get) => {
         const queued = { ...draft, status: 'queued' as const, error: undefined, errorCode: undefined, pauseRequested: false, revision, updatedAt: Date.now(), shards: draft.shards.map((shard) => shard.status === 'failed' || shard.status === 'running' || shard.status === 'retrying' ? { ...shard, status: 'pending' as const, attemptId: undefined, error: undefined, errorCode: undefined, draftRevision: revision } : shard) }
         await checkpointCorrection(sessionId, { ...session.correction!, status: 'detecting', error: undefined, draft: queued })
       })
-      await runCorrectionDraft(sessionId)
+      try {
+        await runCorrectionDraft(sessionId)
+      } catch (error) {
+        if (workflow?.step === 'correction') failAutoPostProcessWorkflow(sessionId, error, 'correction')
+        throw error
+      }
+      if (workflow?.step === 'correction') await runAutoAiPostProcessWorkflow(sessionId)
     },
     abandonSessionCorrection: async (sessionId) => {
       revokeCorrectionLease(sessionId)
@@ -1365,6 +1605,10 @@ export const useSessionStore = create<SessionState>((set, get) => {
         const next = { ...session.correction, draft: undefined, status: session.correction.published || session.correction.legacy ? 'done' as const : 'idle' as const, error: undefined }
         await checkpointCorrection(sessionId, next)
       })
+      const workflow = get().sessions.find((item) => item.id === sessionId)?.autoPostProcessWorkflow
+      if (workflow?.step === 'correction' && workflow.status !== 'completed') {
+        failAutoPostProcessWorkflow(sessionId, 'AI 纠错任务已放弃', 'correction')
+      }
     },
     applySessionCorrectionReview: async (sessionId, patchIds) => {
       let output = ''
@@ -1385,6 +1629,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
         if (safetyError) throw new Error(`所选 Patch 超过安全限制: ${safetyError}`)
         output = await publishCorrection(session, session.correction!, [...patches, ...draft.rejectedPatches], draft.config.model, draft.baseTranscriptHash)
       })
+      void continueAutoPostProcessAfterCorrection(sessionId)
       return output
     },
     updateSessionCorrectionDraftPatch: async (sessionId, patchId, replacement) => {

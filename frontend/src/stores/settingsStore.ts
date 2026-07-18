@@ -29,6 +29,12 @@ const defaultCaptionStyle: CaptionStyle = {
   displayMode: 'source',
 }
 
+function enforceAiAutomationExclusivity(config: AiPostProcessConfig): AiPostProcessConfig {
+  if (config.autoAiPostProcess) return { ...config, autoCorrectionDetection: false }
+  if (config.autoCorrectionDetection) return { ...config, autoAiPostProcess: false }
+  return config
+}
+
 export interface SettingsState {
   settings: AppSettings
   loadSettings: () => Promise<void>
@@ -100,6 +106,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     if (merged.aiPostProcess.model && !merged.aiPostProcess.defaultModel) {
       merged.aiPostProcess.defaultModel = merged.aiPostProcess.model
     }
+    merged.aiPostProcess = enforceAiAutomationExclusivity(merged.aiPostProcess)
 
     set({ settings: merged })
 
@@ -122,7 +129,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   updateAiPostProcessConfig: async (config) => {
     const { settings } = get()
     const currentConfig = settings.aiPostProcess || {}
-    const nextConfig = { ...currentConfig, ...config }
+    const nextConfig = enforceAiAutomationExclusivity({ ...currentConfig, ...config })
     const inMemorySettings = {
       ...settings,
       aiPostProcess: nextConfig,

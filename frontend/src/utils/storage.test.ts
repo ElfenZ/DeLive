@@ -1,7 +1,12 @@
 import { describe, it, expect } from 'vitest'
 import type { TranscriptSession } from '../types'
 import { formatDate, formatTime, validateBackupData } from './storage'
-import { buildAiAnalysisMarkdown, buildAiAnalysisTxt, buildTranscriptExportBody } from './storageUtils'
+import {
+  buildAiAnalysisMarkdown,
+  buildAiAnalysisTxt,
+  buildSessionExportFilename,
+  buildTranscriptExportBody,
+} from './storageUtils'
 
 describe('formatDate', () => {
   it('formats timestamp as YYYY-MM-DD', () => {
@@ -96,6 +101,36 @@ describe('validateBackupData', () => {
       settings: { apiKey: 'key' },
       extraField: 'allowed',
     })).toBe(true)
+  })
+})
+
+describe('buildSessionExportFilename', () => {
+  const createdAt = new Date(2026, 6, 17, 16, 10, 15).getTime()
+  const source = { createdAt, title: '客户需求沟通' }
+
+  it('uses local session creation time for every supported export variant', () => {
+    expect(buildSessionExportFilename(source, 'txt')).toBe('2026-07-17_16-10-15_客户需求沟通.txt')
+    expect(buildSessionExportFilename(source, 'md')).toBe('2026-07-17_16-10-15_客户需求沟通.md')
+    expect(buildSessionExportFilename(source, 'txt', 'corrected')).toBe('2026-07-17_16-10-15_客户需求沟通_corrected.txt')
+    expect(buildSessionExportFilename(source, 'md', 'corrected')).toBe('2026-07-17_16-10-15_客户需求沟通_corrected.md')
+    expect(buildSessionExportFilename(source, 'txt', 'ai-analysis')).toBe('2026-07-17_16-10-15_客户需求沟通_ai-analysis.txt')
+    expect(buildSessionExportFilename(source, 'md', 'ai-analysis')).toBe('2026-07-17_16-10-15_客户需求沟通_ai-analysis.md')
+    expect(buildSessionExportFilename(source, 'srt')).toBe('2026-07-17_16-10-15_客户需求沟通.srt')
+    expect(buildSessionExportFilename(source, 'vtt')).toBe('2026-07-17_16-10-15_客户需求沟通.vtt')
+  })
+
+  it('sanitizes Windows-invalid titles and falls back for empty titles', () => {
+    expect(buildSessionExportFilename({ createdAt, title: '  客户\n需<求>:沟通..  ' }, 'md'))
+      .toBe('2026-07-17_16-10-15_客户 需求沟通.md')
+    expect(buildSessionExportFilename({ createdAt, title: ' <>:"/\\|?*\u0000. ' }, 'vtt'))
+      .toBe('2026-07-17_16-10-15_transcript.vtt')
+  })
+
+  it('preserves variant and extension when truncating long titles', () => {
+    const filename = buildSessionExportFilename({ createdAt, title: `${'超长标题'.repeat(100)}😀` }, 'md', 'ai-analysis')
+    expect(filename.length).toBeLessThanOrEqual(240)
+    expect(filename.endsWith('_ai-analysis.md')).toBe(true)
+    expect(filename).not.toContain('\uFFFD')
   })
 })
 

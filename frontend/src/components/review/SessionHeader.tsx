@@ -15,6 +15,7 @@ import {
 } from 'lucide-react'
 import type { TranscriptSession } from '../../types'
 import {
+  buildSessionExportFilename,
   exportAiAnalysisToMarkdown,
   exportAiAnalysisToTxt,
   exportToMarkdown,
@@ -93,7 +94,7 @@ export function SessionHeader({
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `${liveSession.title || 'transcript'}_corrected.txt`
+    a.download = buildSessionExportFilename(liveSession, 'txt', 'corrected')
     document.body.appendChild(a)
     a.click()
     document.body.removeChild(a)
@@ -116,7 +117,7 @@ export function SessionHeader({
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `${liveSession.title || 'transcript'}_corrected.md`
+    a.download = buildSessionExportFilename(liveSession, 'md', 'corrected')
     document.body.appendChild(a)
     a.click()
     document.body.removeChild(a)

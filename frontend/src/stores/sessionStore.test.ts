@@ -11,9 +11,16 @@ const correction = vi.hoisted(() => ({
   requestCorrectionShard: vi.fn(),
   CorrectionRequestError: class extends Error {},
 }))
+const postProcess = vi.hoisted(() => ({
+  generateSessionBriefing: vi.fn(),
+}))
 
 vi.mock('../utils/sessionRepository', () => ({ sessionRepository: repository }))
 vi.mock('../services/aiCorrection', () => correction)
+vi.mock('../services/aiPostProcess', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/aiPostProcess')>()),
+  generateSessionBriefing: postProcess.generateSessionBriefing,
+}))
 
 function session(overrides: Partial<TranscriptSession> = {}): TranscriptSession {
   return { id: 's1', title: 'Session', date: '2026-07-16', time: '12:00', createdAt: 1, updatedAt: 1, transcript: '需要侍应新的工作。', status: 'completed', ...overrides }
@@ -28,6 +35,33 @@ function configSnapshot(overrides: Partial<CorrectionConfigSnapshot> = {}): Corr
   }
 }
 
+function mockMetadataPersistence(useSessionStore: typeof import('./sessionStore').useSessionStore): void {
+  repository.updateMetadata.mockImplementation((id: string, updates: Partial<TranscriptSession>) => {
+    const sessions = useSessionStore.getState().sessions.map((item) => item.id === id
+      ? { ...item, ...updates, updatedAt: Date.now() }
+      : item)
+    useSessionStore.setState({ sessions })
+    return sessions
+  })
+}
+
+async function configureAutomaticWorkflow(mode: 'quick' | 'review' = 'quick'): Promise<void> {
+  const { useSettingsStore } = await import('./settingsStore')
+  const current = useSettingsStore.getState().settings
+  useSettingsStore.setState({
+    settings: {
+      ...current,
+      aiPostProcess: {
+        enabled: true,
+        autoAiPostProcess: true,
+        autoCorrectionDetection: true,
+        correctionMode: mode,
+        modelAssignment: { correction: 'model', briefing: 'model' },
+      },
+    },
+  })
+}
+
 describe('sessionStore patch correction runner', () => {
   beforeEach(async () => {
     vi.unstubAllGlobals()
@@ -35,6 +69,10 @@ describe('sessionStore patch correction runner', () => {
     vi.clearAllMocks()
     correction.createCorrectionConfigSnapshot.mockReturnValue(configSnapshot())
     correction.requestCorrectionShard.mockResolvedValue({ patches: [{ op: 'replace', oldText: '侍应', replacement: '适应', before: '需要', after: '新的', category: 'homophone', reason: '同音' }] })
+    postProcess.generateSessionBriefing.mockResolvedValue({
+      postProcess: { status: 'success', summary: '摘要', titleSuggestion: 'AI 标题', model: 'model' },
+      source: { text: '需要适应新的工作。', sourceKind: 'published-correction', sourceTextHash: 'hash' },
+    })
     repository.checkpointCorrection.mockImplementation(async (_id: string, next: TranscriptCorrection) => {
       const { useSessionStore } = await import('./sessionStore')
       const current = useSessionStore.getState().sessions[0]
@@ -182,5 +220,232 @@ describe('sessionStore patch correction runner', () => {
     const published = useSessionStore.getState().sessions[0].correction!.published!
     expect(published.patches.filter((patch) => patch.state === 'reverted')).toHaveLength(2)
     expect(published.correctedText).toBe(source.transcript)
+  })
+
+  it('runs the complete Quick workflow once and briefs the published correction', async () => {
+    const { useSessionStore } = await import('./sessionStore')
+    mockMetadataPersistence(useSessionStore)
+    await configureAutomaticWorkflow('quick')
+    const source = session()
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+
+    await Promise.all([
+      useSessionStore.getState().maybeStartAutoAiPostProcess(source.id),
+      useSessionStore.getState().maybeStartAutoAiPostProcess(source.id),
+    ])
+
+    const completed = useSessionStore.getState().sessions[0]
+    expect(correction.requestCorrectionShard).toHaveBeenCalledTimes(1)
+    expect(postProcess.generateSessionBriefing).toHaveBeenCalledTimes(1)
+    expect(postProcess.generateSessionBriefing.mock.calls[0][0].correction?.published?.correctedText)
+      .toBe('需要适应新的工作。')
+    expect(completed.title).toBe('AI 标题')
+    expect(completed.autoPostProcessWorkflow).toEqual(expect.objectContaining({ status: 'completed', step: 'title' }))
+  })
+
+  it('waits for Review confirmation before briefing and then continues', async () => {
+    const { useSessionStore } = await import('./sessionStore')
+    mockMetadataPersistence(useSessionStore)
+    await configureAutomaticWorkflow('review')
+    const source = session()
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+
+    await useSessionStore.getState().maybeStartAutoAiPostProcess(source.id)
+    const waiting = useSessionStore.getState().sessions[0]
+    expect(waiting.autoPostProcessWorkflow?.status).toBe('waiting-review')
+    expect(postProcess.generateSessionBriefing).not.toHaveBeenCalled()
+
+    const patchIds = waiting.correction!.draft!.proposedPatches.map((patch) => patch.id)
+    await useSessionStore.getState().applySessionCorrectionReview(source.id, patchIds)
+    await vi.waitFor(() => expect(useSessionStore.getState().sessions[0].autoPostProcessWorkflow?.status).toBe('completed'))
+    expect(postProcess.generateSessionBriefing).toHaveBeenCalledTimes(1)
+  })
+
+  it('publishes a zero-candidate Review locally and continues automatically', async () => {
+    correction.requestCorrectionShard.mockResolvedValue({ patches: [] })
+    const { useSessionStore } = await import('./sessionStore')
+    mockMetadataPersistence(useSessionStore)
+    await configureAutomaticWorkflow('review')
+    const source = session()
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+
+    await useSessionStore.getState().maybeStartAutoAiPostProcess(source.id)
+
+    const completed = useSessionStore.getState().sessions[0]
+    expect(completed.correction?.published?.correctedText).toBe(source.transcript)
+    expect(completed.autoPostProcessWorkflow?.status).toBe('completed')
+    expect(postProcess.generateSessionBriefing).toHaveBeenCalledTimes(1)
+  })
+
+  it('preserves a manual title change made while briefing is running', async () => {
+    let releaseBriefing!: () => void
+    postProcess.generateSessionBriefing.mockImplementation(() => new Promise((resolve) => {
+      releaseBriefing = () => resolve({
+        postProcess: { status: 'success', summary: '摘要', titleSuggestion: 'AI 标题', model: 'model' },
+        source: { text: 'corrected', sourceKind: 'published-correction', sourceTextHash: 'hash' },
+      })
+    }))
+    const { useSessionStore } = await import('./sessionStore')
+    mockMetadataPersistence(useSessionStore)
+    await configureAutomaticWorkflow('quick')
+    const source = session()
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+
+    const running = useSessionStore.getState().maybeStartAutoAiPostProcess(source.id)
+    await vi.waitFor(() => expect(postProcess.generateSessionBriefing).toHaveBeenCalledTimes(1))
+    useSessionStore.getState().updateSessionTitle(source.id, '手动标题')
+    releaseBriefing()
+    await running
+
+    expect(useSessionStore.getState().sessions[0].title).toBe('手动标题')
+    expect(useSessionStore.getState().sessions[0].autoPostProcessWorkflow?.status).toBe('completed')
+  })
+
+  it('records configuration and briefing failures without changing the title', async () => {
+    const { useSessionStore } = await import('./sessionStore')
+    mockMetadataPersistence(useSessionStore)
+    const { useSettingsStore } = await import('./settingsStore')
+    const current = useSettingsStore.getState().settings
+    useSettingsStore.setState({
+      settings: {
+        ...current,
+        aiPostProcess: {
+          enabled: true,
+          autoAiPostProcess: true,
+          modelAssignment: { correction: 'model' },
+        },
+      },
+    })
+    const source = session()
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+
+    await useSessionStore.getState().maybeStartAutoAiPostProcess(source.id)
+    expect(useSessionStore.getState().sessions[0].autoPostProcessWorkflow).toEqual(expect.objectContaining({
+      status: 'error',
+      step: 'correction',
+      error: expect.stringMatching(/摘要模型/),
+    }))
+    expect(correction.requestCorrectionShard).not.toHaveBeenCalled()
+
+    useSessionStore.setState({ sessions: [session({ id: 's2' })] })
+    await configureAutomaticWorkflow('quick')
+    postProcess.generateSessionBriefing.mockRejectedValueOnce(new Error('briefing failed'))
+    await useSessionStore.getState().maybeStartAutoAiPostProcess('s2')
+    const failed = useSessionStore.getState().sessions[0]
+    expect(failed.correction?.published).toBeDefined()
+    expect(failed.title).toBe('Session')
+    expect(failed.autoPostProcessWorkflow).toEqual(expect.objectContaining({
+      status: 'error',
+      step: 'briefing',
+      error: 'briefing failed',
+    }))
+  })
+
+  it('keeps a successful briefing but marks an empty title suggestion as an error', async () => {
+    postProcess.generateSessionBriefing.mockResolvedValueOnce({
+      postProcess: { status: 'success', summary: '摘要', model: 'model' },
+      source: { text: 'corrected', sourceKind: 'published-correction', sourceTextHash: 'hash' },
+    })
+    const { useSessionStore } = await import('./sessionStore')
+    mockMetadataPersistence(useSessionStore)
+    await configureAutomaticWorkflow('quick')
+    const source = session()
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+
+    await useSessionStore.getState().maybeStartAutoAiPostProcess(source.id)
+
+    const failed = useSessionStore.getState().sessions[0]
+    expect(failed.postProcess?.summary).toBe('摘要')
+    expect(failed.title).toBe(source.title)
+    expect(failed.autoPostProcessWorkflow).toEqual(expect.objectContaining({ status: 'error', step: 'title' }))
+  })
+
+  it('keeps legacy automatic Review detection when the full workflow is disabled', async () => {
+    const { useSessionStore } = await import('./sessionStore')
+    const { useSettingsStore } = await import('./settingsStore')
+    const current = useSettingsStore.getState().settings
+    useSettingsStore.setState({
+      settings: {
+        ...current,
+        aiPostProcess: {
+          enabled: true,
+          autoAiPostProcess: false,
+          autoCorrectionDetection: true,
+          modelAssignment: { correction: 'model' },
+        },
+      },
+    })
+    const source = session()
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+
+    await useSessionStore.getState().maybeStartAutoAiPostProcess(source.id)
+
+    expect(useSessionStore.getState().sessions[0].correction?.draft?.status).toBe('ready-for-review')
+    expect(useSessionStore.getState().sessions[0].autoPostProcessWorkflow).toBeUndefined()
+    expect(postProcess.generateSessionBriefing).not.toHaveBeenCalled()
+  })
+
+  it('resumes only a queued marked workflow from the briefing step at launch', async () => {
+    vi.stubGlobal('window', { electronAPI: undefined })
+    vi.stubGlobal('localStorage', { getItem: () => null, setItem: () => undefined, removeItem: () => undefined })
+    const queued = session({
+      autoPostProcessWorkflow: {
+        version: 1,
+        status: 'queued',
+        step: 'briefing',
+        correctionMode: 'quick',
+        titleAtStart: 'Session',
+        startedAt: 10,
+        updatedAt: 20,
+      },
+    })
+    repository.loadForLaunch.mockResolvedValue({ sessions: [queued], recoverableSession: null })
+    const { useSessionStore } = await import('./sessionStore')
+    mockMetadataPersistence(useSessionStore)
+    await configureAutomaticWorkflow('quick')
+
+    await useSessionStore.getState().loadSessions()
+    await vi.waitFor(() => expect(useSessionStore.getState().sessions[0].autoPostProcessWorkflow?.status).toBe('completed'))
+
+    expect(correction.requestCorrectionShard).not.toHaveBeenCalled()
+    expect(postProcess.generateSessionBriefing).toHaveBeenCalledTimes(1)
+  })
+
+  it('reuses a current persisted briefing after a crash instead of requesting it twice', async () => {
+    vi.stubGlobal('window', { electronAPI: undefined })
+    vi.stubGlobal('localStorage', { getItem: () => null, setItem: () => undefined, removeItem: () => undefined })
+    const { resolveTranscriptText } = await import('../services/aiPostProcess')
+    const base = session()
+    const source = resolveTranscriptText(base, 'auto')
+    const queued = session({
+      postProcess: {
+        status: 'success',
+        summary: '已持久化摘要',
+        titleSuggestion: '恢复标题',
+        generatedAt: 30,
+        sourceKind: source.sourceKind,
+        sourceTextHash: source.sourceTextHash,
+        sourceResultId: source.sourceResultId,
+      },
+      autoPostProcessWorkflow: {
+        version: 1,
+        status: 'queued',
+        step: 'briefing',
+        correctionMode: 'quick',
+        titleAtStart: 'Session',
+        startedAt: 10,
+        updatedAt: 20,
+      },
+    })
+    repository.loadForLaunch.mockResolvedValue({ sessions: [queued], recoverableSession: null })
+    const { useSessionStore } = await import('./sessionStore')
+    mockMetadataPersistence(useSessionStore)
+    await configureAutomaticWorkflow('quick')
+
+    await useSessionStore.getState().loadSessions()
+    await vi.waitFor(() => expect(useSessionStore.getState().sessions[0].autoPostProcessWorkflow?.status).toBe('completed'))
+
+    expect(postProcess.generateSessionBriefing).not.toHaveBeenCalled()
+    expect(useSessionStore.getState().sessions[0].title).toBe('恢复标题')
   })
 })

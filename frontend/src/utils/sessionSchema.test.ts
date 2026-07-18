@@ -217,4 +217,60 @@ describe('sessionSchema', () => {
     expect(normalized.correction?.draft).toBeUndefined()
     expect(normalized.correction?.status).toBe('error')
   })
+
+  it('round-trips valid automatic workflow state without creating it for old sessions', () => {
+    const normalized = normalizeTranscriptSession({
+      id: 'workflow-session', title: 'Workflow', date: '2026-07-18', time: '10:00',
+      schemaVersion: 4, createdAt: 1, updatedAt: 2, transcript: 'content',
+      autoPostProcessWorkflow: {
+        version: 1,
+        status: 'waiting-review',
+        step: 'correction',
+        correctionMode: 'review',
+        titleAtStart: 'Workflow',
+        startedAt: 10,
+        updatedAt: 20,
+      },
+    })
+    expect(normalized.schemaVersion).toBe(5)
+    expect(normalized.autoPostProcessWorkflow).toEqual({
+      version: 1,
+      status: 'waiting-review',
+      step: 'correction',
+      correctionMode: 'review',
+      titleAtStart: 'Workflow',
+      startedAt: 10,
+      updatedAt: 20,
+      completedAt: undefined,
+      error: undefined,
+    })
+    expect(normalizeTranscriptSession({
+      id: 'old-session', title: 'Old', date: '2026-07-18', time: '10:00',
+      schemaVersion: 4, createdAt: 1, updatedAt: 2, transcript: 'content',
+    }).autoPostProcessWorkflow).toBeUndefined()
+  })
+
+  it('drops malformed automatic workflow state', () => {
+    const normalized = normalizeTranscriptSession({
+      id: 'bad-workflow', title: 'Bad', date: '2026-07-18', time: '10:00',
+      createdAt: 1, updatedAt: 2, transcript: 'content',
+      autoPostProcessWorkflow: { version: 1, status: 'running' } as never,
+    })
+    expect(normalized.autoPostProcessWorkflow).toBeUndefined()
+
+    const invalidCombination = normalizeTranscriptSession({
+      id: 'bad-combination', title: 'Bad', date: '2026-07-18', time: '10:00',
+      createdAt: 1, updatedAt: 2, transcript: 'content',
+      autoPostProcessWorkflow: {
+        version: 1,
+        status: 'completed',
+        step: 'correction',
+        correctionMode: 'quick',
+        titleAtStart: 'Bad',
+        startedAt: 1,
+        updatedAt: 2,
+      },
+    })
+    expect(invalidCombination.autoPostProcessWorkflow).toBeUndefined()
+  })
 })

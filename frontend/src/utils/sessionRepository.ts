@@ -146,6 +146,20 @@ function recoverInterruptedDraft(session: TranscriptSession, now: number): Trans
   }
 }
 
+function recoverInterruptedAutoPostProcessWorkflow(session: TranscriptSession, now: number): TranscriptSession {
+  const workflow = session.autoPostProcessWorkflow
+  if (!workflow || workflow.status !== 'running') return session
+  return {
+    ...session,
+    autoPostProcessWorkflow: {
+      ...workflow,
+      status: 'queued',
+      updatedAt: now,
+    },
+    updatedAt: now,
+  }
+}
+
 export const sessionRepository = {
   async loadForLaunch(): Promise<SessionLaunchState> {
     const loadedSessions = await getSessions()
@@ -156,13 +170,14 @@ export const sessionRepository = {
     const interruptedSessionIds: string[] = []
     const now = Date.now()
 
-    const staleCorrectionSessionIds: string[] = []
+    const staleTaskSessionIds: string[] = []
 
     sessions = sessions.map((session) => {
-      const nextSession = recoverInterruptedDraft(session, now)
+      const recoveredDraftSession = recoverInterruptedDraft(session, now)
+      const nextSession = recoverInterruptedAutoPostProcessWorkflow(recoveredDraftSession, now)
 
       if (nextSession !== session) {
-        staleCorrectionSessionIds.push(session.id)
+        staleTaskSessionIds.push(session.id)
       }
 
       if (session.status !== 'recording') {
@@ -183,9 +198,9 @@ export const sessionRepository = {
       ? Array.from(new Set([
         ...sessions.map((session) => session.id),
         ...interruptedSessionIds,
-        ...staleCorrectionSessionIds,
+        ...staleTaskSessionIds,
       ]))
-      : Array.from(new Set([...interruptedSessionIds, ...staleCorrectionSessionIds]))
+      : Array.from(new Set([...interruptedSessionIds, ...staleTaskSessionIds]))
 
     if (sessionIdsToPersist.length > 0) {
       sessions = await persistSessionBatch(sessionIdsToPersist, sessions)

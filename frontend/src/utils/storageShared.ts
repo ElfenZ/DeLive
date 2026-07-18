@@ -164,6 +164,7 @@ export function getDefaultSettings(): AppSettings {
       promptLanguage: 'zh',
       glossary: [],
       autoCorrectionDetection: false,
+      autoAiPostProcess: false,
     },
     openApi: {
       enabled: false,

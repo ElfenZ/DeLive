@@ -36,6 +36,7 @@ export {
 } from './backupStorage'
 
 export {
+  buildSessionExportFilename,
   exportToTxt,
   exportToMarkdown,
   exportAiAnalysisToTxt,

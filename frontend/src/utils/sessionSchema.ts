@@ -5,6 +5,7 @@ import type {
   CorrectionShardProgress,
   ResolvedCorrectionPatch,
   TranscriptAskTurn,
+  TranscriptAutoPostProcessWorkflow,
   TranscriptChapter,
   TranscriptCorrection,
   TranscriptCorrectionDraft,
@@ -25,7 +26,7 @@ import type {
 } from '../types'
 import { formatDate, formatTime, generateId } from './storageUtils'
 
-export const CURRENT_SESSION_SCHEMA_VERSION = 4
+export const CURRENT_SESSION_SCHEMA_VERSION = 5
 const DEFAULT_SESSION_STATUS: TranscriptSessionStatus = 'completed'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -386,6 +387,41 @@ function normalizePostProcess(value: unknown): TranscriptPostProcess | undefined
   }
 }
 
+function normalizeAutoPostProcessWorkflow(value: unknown): TranscriptAutoPostProcessWorkflow | undefined {
+  if (!isRecord(value) || value.version !== 1) return undefined
+  const status = value.status === 'queued' || value.status === 'running' || value.status === 'waiting-review'
+    || value.status === 'error' || value.status === 'completed'
+    ? value.status
+    : undefined
+  const step = value.step === 'correction' || value.step === 'briefing' || value.step === 'title'
+    ? value.step
+    : undefined
+  const correctionMode = value.correctionMode === 'quick' || value.correctionMode === 'review'
+    ? value.correctionMode
+    : undefined
+  const titleAtStart = getString(value.titleAtStart)
+  const startedAt = getNumber(value.startedAt)
+  const updatedAt = getNumber(value.updatedAt)
+  if (!status || !step || !correctionMode || titleAtStart === undefined || startedAt === undefined || updatedAt === undefined) {
+    return undefined
+  }
+  if ((status === 'waiting-review' && (step !== 'correction' || correctionMode !== 'review'))
+    || (status === 'completed' && step !== 'title')) {
+    return undefined
+  }
+  return {
+    version: 1,
+    status,
+    step,
+    correctionMode,
+    titleAtStart,
+    startedAt,
+    updatedAt,
+    completedAt: getNumber(value.completedAt),
+    error: getString(value.error)?.trim() || undefined,
+  }
+}
+
 const VALID_CORRECTION_STATUSES = new Set<TranscriptCorrectionStatus>([
   'idle', 'detecting', 'reviewing', 'correcting', 'done', 'error',
 ])
@@ -727,6 +763,7 @@ export function normalizeTranscriptSession(session: Partial<TranscriptSession>):
     askHistory: askHistory && askHistory.length > 0 ? askHistory : undefined,
     mindMap: normalizeMindMap(session.mindMap),
     correction: normalizeCorrection(session.correction),
+    autoPostProcessWorkflow: normalizeAutoPostProcessWorkflow(session.autoPostProcessWorkflow),
     providerId: getString(session.providerId),
     status,
     lastPersistedAt: getNumber(session.lastPersistedAt) ?? updatedAt,

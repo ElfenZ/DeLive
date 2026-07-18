@@ -146,12 +146,42 @@ describe('sessionRepository persistence strategy', () => {
 
     expect(result.sessions[0]).toEqual(expect.objectContaining({
       id: 'legacy-1',
-      schemaVersion: 4,
+      schemaVersion: 5,
       tagIds: [],
     }))
     expect(sessionStorageMock.upsertSessions).toHaveBeenCalledTimes(1)
     expect(sessionStorageMock.upsertSessions).toHaveBeenCalledWith([
-      expect.objectContaining({ id: 'legacy-1', schemaVersion: 4 }),
+      expect.objectContaining({ id: 'legacy-1', schemaVersion: 5 }),
+    ])
+  })
+
+  it('restores interrupted automatic workflows to queued on launch', async () => {
+    sessionStorageMock.getSessions.mockResolvedValue([
+      makeSession({
+        id: 'workflow-1',
+        status: 'completed',
+        transcript: 'alpha',
+        autoPostProcessWorkflow: {
+          version: 1,
+          status: 'running',
+          step: 'briefing',
+          correctionMode: 'quick',
+          titleAtStart: 'Test Session',
+          startedAt: 100,
+          updatedAt: 200,
+        },
+      }),
+    ])
+
+    const { sessionRepository } = await import('./sessionRepository')
+    const result = await sessionRepository.loadForLaunch()
+
+    expect(result.sessions[0].autoPostProcessWorkflow).toEqual(expect.objectContaining({
+      status: 'queued',
+      step: 'briefing',
+    }))
+    expect(sessionStorageMock.upsertSessions).toHaveBeenCalledWith([
+      expect.objectContaining({ id: 'workflow-1' }),
     ])
   })
 

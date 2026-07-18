@@ -1082,7 +1082,7 @@ export function useFileTranscription() {
         const currentSessions = useSessionStore.getState().sessions
         sessionRepository.replaceAllSessions([completedSession, ...currentSessions])
         useSessionStore.setState({ sessions: [completedSession, ...currentSessions] })
-        void useSessionStore.getState().maybeAutoDetectSessionCorrection(session.id)
+        void useSessionStore.getState().maybeStartAutoAiPostProcess(session.id)
 
         updateJob(jobId, {
           status: 'completed',

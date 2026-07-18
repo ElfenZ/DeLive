@@ -2,6 +2,11 @@ import type { Tag, TranscriptSession } from '../types'
 import { hasPostProcessContent } from './transcriptState'
 import { formatCorrectionProjection, projectCorrectionOntoSegments } from './correctedSegmentProjection'
 
+const MAX_SESSION_EXPORT_FILENAME_LENGTH = 240
+
+export type SessionExportExtension = 'txt' | 'md' | 'srt' | 'vtt'
+export type SessionExportVariant = 'corrected' | 'ai-analysis'
+
 export function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
 }
@@ -14,6 +19,55 @@ export function formatDate(timestamp: number): string {
 export function formatTime(timestamp: number): string {
   const date = new Date(timestamp)
   return date.toTimeString().slice(0, 5)
+}
+
+function padLocalDatePart(value: number): string {
+  return String(value).padStart(2, '0')
+}
+
+function truncateUtf16Safely(value: string, maxLength: number): string {
+  const truncated = value.slice(0, Math.max(0, maxLength))
+  const lastCodeUnit = truncated.charCodeAt(truncated.length - 1)
+  return lastCodeUnit >= 0xD800 && lastCodeUnit <= 0xDBFF ? truncated.slice(0, -1) : truncated
+}
+
+function replaceControlCharacters(value: string): string {
+  return Array.from(value, (character) => {
+    const code = character.charCodeAt(0)
+    return code <= 31 || (code >= 127 && code <= 159) ? ' ' : character
+  }).join('')
+}
+
+function sanitizeSessionExportTitle(title: string): string {
+  const sanitized = replaceControlCharacters(title)
+    .replace(/[<>:"/\\|?*]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[. ]+$/g, '')
+  return sanitized || 'transcript'
+}
+
+export function buildSessionExportFilename(
+  session: Pick<TranscriptSession, 'createdAt' | 'title'>,
+  extension: SessionExportExtension,
+  variant?: SessionExportVariant,
+): string {
+  const date = new Date(Number.isFinite(session.createdAt) ? session.createdAt : 0)
+  const timestamp = [
+    String(date.getFullYear()).padStart(4, '0'),
+    padLocalDatePart(date.getMonth() + 1),
+    padLocalDatePart(date.getDate()),
+  ].join('-') + `_${[
+    padLocalDatePart(date.getHours()),
+    padLocalDatePart(date.getMinutes()),
+    padLocalDatePart(date.getSeconds()),
+  ].join('-')}`
+  const variantSuffix = variant ? `_${variant}` : ''
+  const fixedLength = timestamp.length + 1 + variantSuffix.length + 1 + extension.length
+  const titleLength = Math.max(1, MAX_SESSION_EXPORT_FILENAME_LENGTH - fixedLength)
+  const title = truncateUtf16Safely(sanitizeSessionExportTitle(session.title), titleLength)
+    .replace(/[. ]+$/g, '') || 'transcript'
+  return `${timestamp}_${title}${variantSuffix}.${extension}`
 }
 
 function triggerDownload(blob: Blob, filename: string): void {
@@ -44,7 +98,7 @@ ${translatedText ? `\n\n${'-'.repeat(20)}\n翻译\n${'-'.repeat(20)}\n\n${transl
 
   triggerDownload(
     new Blob([content], { type: 'text/plain;charset=utf-8' }),
-    `${session.title}_${session.date}_${session.time.replace(':', '-')}.txt`,
+    buildSessionExportFilename(session, 'txt'),
   )
 }
 
@@ -76,7 +130,7 @@ export function exportToMarkdown(session: TranscriptSession, tags?: Tag[]): void
 
   triggerDownload(
     new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' }),
-    `${session.title}_${session.date}_${session.time.replace(':', '-')}.md`,
+    buildSessionExportFilename(session, 'md'),
   )
 }
 
@@ -95,7 +149,7 @@ function formatTimestamp(timestamp: number | undefined): string {
 }
 
 function getAiAnalysisFilename(session: TranscriptSession, extension: 'txt' | 'md'): string {
-  return `${session.title}_${session.date}_${session.time.replace(':', '-')}_ai-analysis.${extension}`
+  return buildSessionExportFilename(session, extension, 'ai-analysis')
 }
 
 export function buildAiAnalysisTxt(session: TranscriptSession): string {

@@ -522,6 +522,30 @@ export function AiPostProcessPanel({
           <div>
             <label className="text-sm font-medium leading-none flex items-center gap-2">
               <Sparkles className="w-3.5 h-3.5 text-muted-foreground" />
+              {isZh ? '自动 AI 后处理' : 'Automatic AI Post-processing'}
+            </label>
+            <p className="text-xs text-muted-foreground mt-2">
+              {isZh
+                ? '转录完成后自动纠错并生成摘要、应用标题。Quick 全自动；Review 会等待确认后继续。'
+                : 'Correct, brief, and title completed transcripts automatically. Quick is fully automatic; Review continues after confirmation.'}
+            </p>
+          </div>
+          <Switch
+            checked={!!cfg.autoAiPostProcess}
+            onChange={(val) => updateAiPostProcessConfig({
+              autoAiPostProcess: val,
+              ...(val ? { autoCorrectionDetection: false } : {}),
+            })}
+            aria-label={isZh ? '自动 AI 后处理' : 'Automatic AI post-processing'}
+          />
+        </div>
+
+        <div className="border-t border-border/70" />
+
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <label className="text-sm font-medium leading-none flex items-center gap-2">
+              <Sparkles className="w-3.5 h-3.5 text-muted-foreground" />
               {isZh ? '自动检测 AI 纠错问题' : 'Auto Detect Correction Issues'}
             </label>
             <p className="text-xs text-muted-foreground mt-2">
@@ -531,8 +555,11 @@ export function AiPostProcessPanel({
             </p>
           </div>
           <Switch
-            checked={!!cfg.autoCorrectionDetection}
-            onChange={(val) => updateAiPostProcessConfig({ autoCorrectionDetection: val })}
+            checked={!!cfg.autoCorrectionDetection && !cfg.autoAiPostProcess}
+            onChange={(val) => updateAiPostProcessConfig({
+              autoCorrectionDetection: val,
+              ...(val ? { autoAiPostProcess: false } : {}),
+            })}
             aria-label={isZh ? '自动检测 AI 纠错问题' : 'Auto detect correction issues'}
           />
         </div>

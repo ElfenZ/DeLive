@@ -197,6 +197,28 @@ describe('resolveTranscriptText', () => {
     expect(resolveTranscriptText(sessionWithCorrection, 'original').text).toBe('  original raw transcript  ')
   })
 
+  it('prefers a published correction in auto mode but honors explicit original mode', () => {
+    const publishedSession = {
+      ...baseSession,
+      correction: {
+        status: 'done',
+        mode: 'quick',
+        published: {
+          id: 'published-1',
+          correctedText: 'published correction',
+          outputTextHash: 'published-hash',
+        },
+      },
+    } as unknown as TranscriptSession
+    expect(resolveTranscriptText(publishedSession, 'auto')).toEqual({
+      text: 'published correction',
+      sourceKind: 'published-correction',
+      sourceTextHash: 'published-hash',
+      sourceResultId: 'published-1',
+    })
+    expect(resolveTranscriptText(publishedSession, 'original').sourceKind).toBe('original')
+  })
+
   it('corrected: uses corrected text when available', () => {
     expect(resolveTranscriptText(sessionWithCorrection, 'corrected').text).toBe('  corrected clean transcript  ')
   })

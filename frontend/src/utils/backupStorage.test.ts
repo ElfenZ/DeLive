@@ -75,7 +75,7 @@ describe('backupStorage', () => {
     expect(upgraded.sessions).toHaveLength(1)
     expect(upgraded.sessions[0]).toEqual(expect.objectContaining({
       id: 'legacy-session',
-      schemaVersion: 4,
+      schemaVersion: 5,
       transcript: 'hello world',
       tagIds: [],
       speakers: [],
@@ -104,6 +104,8 @@ describe('backupStorage', () => {
         languageHints: [],
         aiPostProcess: {
           enabled: true,
+          autoCorrectionDetection: true,
+          autoAiPostProcess: true,
           correctionStructuredOutput: 'json_schema',
           correctionAdvanced: {
             chunkSize: 5000,
@@ -119,6 +121,8 @@ describe('backupStorage', () => {
     })
     expect(upgraded.settings.aiPostProcess).toEqual(expect.objectContaining({
       correctionStructuredOutput: 'json_schema',
+      autoCorrectionDetection: true,
+      autoAiPostProcess: true,
       correctionAdvanced: {
         chunkSize: 5000,
         contextSize: 600,

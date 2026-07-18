@@ -294,6 +294,21 @@ export interface TranscriptPostProcess extends TranscriptTextSourceMetadata {
   error?: string
 }
 
+export type TranscriptAutoPostProcessWorkflowStatus = 'queued' | 'running' | 'waiting-review' | 'error' | 'completed'
+export type TranscriptAutoPostProcessWorkflowStep = 'correction' | 'briefing' | 'title'
+
+export interface TranscriptAutoPostProcessWorkflow {
+  version: 1
+  status: TranscriptAutoPostProcessWorkflowStatus
+  step: TranscriptAutoPostProcessWorkflowStep
+  correctionMode: 'quick' | 'review'
+  titleAtStart: string
+  startedAt: number
+  updatedAt: number
+  completedAt?: number
+  error?: string
+}
+
 export interface TranscriptSourceMeta {
   captureMode?: 'system-audio' | 'microphone' | 'file' | 'mixed' | 'unknown'
   sourceId?: string
@@ -345,6 +360,7 @@ export interface TranscriptSession {
   askHistory?: TranscriptAskTurn[]
   mindMap?: TranscriptMindMap
   correction?: TranscriptCorrection
+  autoPostProcessWorkflow?: TranscriptAutoPostProcessWorkflow
   providerId?: string
   status?: TranscriptSessionStatus
   lastPersistedAt?: number
@@ -390,6 +406,7 @@ export interface AiPostProcessConfig {
   enableStreaming?: boolean
   glossary?: AiGlossaryEntry[]
   autoCorrectionDetection?: boolean
+  autoAiPostProcess?: boolean
   correctionStructuredOutput?: CorrectionStructuredOutputMode
   correctionAdvanced?: Partial<{
     chunkSize: number

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.5.4] - 2026-07-18
+
+### Added / 新增
+- **Automatic AI post-processing** - completed live recordings and file transcriptions can run correction, briefing, and safe title application as one resumable workflow
+- **自动 AI 后处理** - 实时录制和文件转录完成后，可按可恢复流水线执行纠错、摘要和安全标题应用
+
+### Changed / 变更
+- **Unified session export filenames** - TXT, Markdown, SRT, and VTT exports now use local session creation time followed by a Windows-safe title
+- **统一会话导出文件名** - TXT、Markdown、SRT 与 VTT 统一使用本地会话创建时间加 Windows 安全标题
+
+---
+
 ## [2.2.4] - 2026-05-21
 
 ### Added / 新增

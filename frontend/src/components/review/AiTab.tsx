@@ -28,6 +28,9 @@ export function AiTab({ session }: AiTabProps) {
   const addTag = useTagStore((state) => state.addTag)
 
   const postProcess = session.postProcess
+  const workflowError = session.autoPostProcessWorkflow?.status === 'error'
+    ? session.autoPostProcessWorkflow.error
+    : undefined
   const aiConfigured = isAiPostProcessConfigured(settings)
   const aiGenerating = postProcess?.status === 'pending'
   const hasAiContent = Boolean(
@@ -82,6 +85,9 @@ export function AiTab({ session }: AiTabProps) {
             )}
             {postProcess?.status === 'error' && postProcess.error && (
               <p className="text-xs text-destructive">{postProcess.error}</p>
+            )}
+            {workflowError && workflowError !== postProcess?.error && (
+              <p className="text-xs text-destructive">{workflowError}</p>
             )}
           </div>
           <button

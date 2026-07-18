@@ -236,7 +236,10 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
         : settings.apiKey,
       languageHints: normalizedHints,
     })
-    await updateAiPostProcessConfig(aiPostProcessConfig)
+    const normalizedAiConfig = aiPostProcessConfig.autoAiPostProcess
+      ? { ...aiPostProcessConfig, autoCorrectionDetection: false }
+      : aiPostProcessConfig
+    await updateAiPostProcessConfig(normalizedAiConfig)
     onClose()
   }
 
