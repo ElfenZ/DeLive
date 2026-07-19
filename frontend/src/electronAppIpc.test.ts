@@ -132,6 +132,58 @@ describe('recording archive IPC', () => {
     expect(fs.existsSync(`${finalizeResult.path}.tmp`)).toBe(false)
   })
 
+  it('does not truncate an active archive when begin is repeated for the same session', async () => {
+    const { handlers, sender } = await setupHandlers()
+    const request = { sessionId: 'same-session', sampleRate: 16000, channels: 1, bitsPerSample: 16 }
+
+    await handlers.get('begin-recording-archive')?.({ sender }, request)
+    await handlers.get('append-recording-archive')?.(
+      { sender },
+      { sessionId: 'same-session', data: new Int16Array([1, 2]).buffer },
+    )
+    const repeatedBegin = await handlers.get('begin-recording-archive')?.(
+      { sender },
+      request,
+    ) as { ok: boolean; size: number }
+
+    expect(repeatedBegin).toEqual(expect.objectContaining({ ok: true, size: 4 }))
+    const result = await handlers.get('finalize-recording-archive')?.(
+      { sender },
+      { sessionId: 'same-session', fileName: 'source-audio.wav' },
+    ) as { ok: boolean; path: string }
+    const wav = await fs.promises.readFile(result.path)
+    expect(wav.readUInt32LE(40)).toBe(4)
+  })
+
+  it('aborts an unused archive and allows a clean begin for the same session', async () => {
+    const { handlers, sender } = await setupHandlers()
+    const request = { sessionId: 'aborted-session', sampleRate: 16000, channels: 1, bitsPerSample: 16 }
+    await handlers.get('begin-recording-archive')?.({ sender }, request)
+    await handlers.get('append-recording-archive')?.(
+      { sender },
+      { sessionId: request.sessionId, data: new Int16Array([1, 2]).buffer },
+    )
+
+    const aborted = await handlers.get('abort-recording-archive')?.(
+      { sender },
+      { sessionId: request.sessionId },
+    ) as { ok: boolean }
+    expect(aborted).toEqual({ ok: true })
+    expect(fs.existsSync(path.join(electronMock.userDataPath, 'media', request.sessionId, 'source-audio.pcm.tmp'))).toBe(false)
+    const lateAppend = await handlers.get('append-recording-archive')?.(
+      { sender },
+      { sessionId: request.sessionId, data: new Int16Array([9]).buffer },
+    ) as { ok: boolean }
+    expect(lateAppend.ok).toBe(false)
+    expect(fs.existsSync(path.join(electronMock.userDataPath, 'media', request.sessionId, 'source-audio.pcm.tmp'))).toBe(false)
+
+    const restarted = await handlers.get('begin-recording-archive')?.(
+      { sender },
+      request,
+    ) as { ok: boolean; size: number }
+    expect(restarted).toEqual(expect.objectContaining({ ok: true, size: 0 }))
+  })
+
   it('recovers unfinished PCM archives on launch', async () => {
     const { handlers, sender } = await setupHandlers()
 

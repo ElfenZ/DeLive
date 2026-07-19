@@ -12,6 +12,7 @@ import { hasPostProcessContent, type TranscriptRuntimeState } from './transcript
 
 export interface TranscriptPersistenceSnapshot {
   transcript: string
+  duration?: number
   tokens?: TranscriptTokenData[]
   providerId?: string
   speakers?: TranscriptSpeaker[]
@@ -119,6 +120,7 @@ export function buildSourceMeta(options: {
 
 export function buildSessionSnapshot(options: {
   runtimeState: TranscriptRuntimeState
+  duration?: number
   providerId?: string
   providerMode?: TranscriptSourceMeta['providerMode']
   platform?: TranscriptSourceMeta['platform']
@@ -128,6 +130,7 @@ export function buildSessionSnapshot(options: {
 }): TranscriptPersistenceSnapshot {
   const {
     runtimeState,
+    duration,
     providerId,
     providerMode,
     platform,
@@ -149,6 +152,7 @@ export function buildSessionSnapshot(options: {
 
   return {
     transcript,
+    duration,
     translatedTranscript: buildTranslatedTranscript(translatedText, {
       displayMode: captionDisplayMode,
       targetLanguage: translationTargetLanguage,

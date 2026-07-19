@@ -5,6 +5,10 @@ const repository = vi.hoisted(() => ({
   loadForLaunch: vi.fn(),
   updateMetadata: vi.fn(),
   checkpointCorrection: vi.fn(),
+  createDraft: vi.fn(),
+  saveProgress: vi.fn(),
+  completeSession: vi.fn(),
+  deleteSession: vi.fn(),
 }))
 const correction = vi.hoisted(() => ({
   createCorrectionConfigSnapshot: vi.fn(),
@@ -80,6 +84,33 @@ describe('sessionStore patch correction runner', () => {
       useSessionStore.setState({ sessions })
       return sessions
     })
+  })
+
+  it('returns the completed session id and persists effective recording duration', async () => {
+    vi.stubGlobal('window', { electronAPI: undefined })
+    vi.stubGlobal('localStorage', { getItem: () => null, setItem: () => undefined, removeItem: () => undefined })
+    const { useSessionStore } = await import('./sessionStore')
+    const source = session({ status: 'recording', transcript: 'hello' })
+    repository.completeSession.mockImplementation((_id, snapshot) => [{
+      ...source,
+      ...snapshot,
+      status: 'completed',
+    }])
+    useSessionStore.setState({
+      sessions: [source],
+      currentSessionId: source.id,
+      finalTranscript: 'hello',
+      currentTranscript: 'hello',
+    })
+
+    const completedId = useSessionStore.getState().endCurrentSession({ duration: 3_250 })
+
+    expect(completedId).toBe(source.id)
+    expect(repository.completeSession).toHaveBeenCalledWith(
+      source.id,
+      expect.objectContaining({ transcript: 'hello', duration: 3_250 }),
+    )
+    expect(useSessionStore.getState().currentSessionId).toBeNull()
   })
 
   it('quick mode checkpoints shards then atomically publishes deterministic text', async () => {

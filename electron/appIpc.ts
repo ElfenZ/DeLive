@@ -279,6 +279,7 @@ function clearWindowsAutoLaunchEntries(): void {
 }
 
 export function registerAppIpc(options: RegisterAppIpcOptions): void {
+  const activeRecordingArchives = new Set<string>()
   options.ipcMain.handle('get-app-version', () => {
     return app.getVersion()
   })
@@ -420,6 +421,17 @@ export function registerAppIpc(options: RegisterAppIpcOptions): void {
       assertArchivePathAllowed(paths.metaPath)
 
       await fs.promises.mkdir(paths.archiveDir, { recursive: true })
+      if (activeRecordingArchives.has(paths.sessionId)) {
+        const stat = await fs.promises.stat(paths.pcmPath)
+        return {
+          ok: true,
+          sessionId: paths.sessionId,
+          path: paths.pcmPath,
+          size: stat.size,
+          mimeType: 'audio/pcm',
+          fileName: path.basename(paths.pcmPath),
+        }
+      }
       await writeBufferDurably(paths.pcmPath, Buffer.alloc(0))
       const now = Date.now()
       const metadata: RecordingArchiveMetadata = {
@@ -429,6 +441,7 @@ export function registerAppIpc(options: RegisterAppIpcOptions): void {
         updatedAt: now,
       }
       await writeTextDurably(paths.metaPath, JSON.stringify(metadata, null, 2))
+      activeRecordingArchives.add(paths.sessionId)
 
       return {
         ok: true,
@@ -451,6 +464,9 @@ export function registerAppIpc(options: RegisterAppIpcOptions): void {
       const paths = getRecordingArchivePaths(request.sessionId)
       assertArchivePathAllowed(paths.pcmPath)
       assertArchivePathAllowed(paths.metaPath)
+      if (!activeRecordingArchives.has(paths.sessionId)) {
+        throw new Error('Recording archive is not active')
+      }
 
       const data = Buffer.from(new Uint8Array(request.data))
       if (data.byteLength === 0) {
@@ -471,10 +487,31 @@ export function registerAppIpc(options: RegisterAppIpcOptions): void {
   options.ipcMain.handle('finalize-recording-archive', async (event, request: RecordingArchiveFinalizeRequest) => {
     assertTrustedSender(event, 'finalize-recording-archive')
     try {
-      return await finalizePcmRecordingArchive(request.sessionId, request.fileName || 'source-audio.wav')
+      const result = await finalizePcmRecordingArchive(request.sessionId, request.fileName || 'source-audio.wav')
+      if (result.ok && result.sessionId) activeRecordingArchives.delete(result.sessionId)
+      return result
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       console.warn('[RecordingArchive] finalize failed:', message)
+      return { ok: false, error: message }
+    }
+  })
+
+  options.ipcMain.handle('abort-recording-archive', async (event, request: { sessionId: string }) => {
+    assertTrustedSender(event, 'abort-recording-archive')
+    try {
+      const paths = getRecordingArchivePaths(request.sessionId)
+      assertArchivePathAllowed(paths.pcmPath)
+      assertArchivePathAllowed(paths.metaPath)
+      activeRecordingArchives.delete(paths.sessionId)
+      await Promise.all([
+        fs.promises.rm(paths.pcmPath, { force: true }),
+        fs.promises.rm(paths.metaPath, { force: true }),
+      ])
+      return { ok: true }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      console.warn('[RecordingArchive] abort failed:', message)
       return { ok: false, error: message }
     }
   })

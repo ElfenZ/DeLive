@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import type { TranscriptSession } from '../types'
 import type { SessionSummary, SessionDetail } from '../../../shared/electronApi'
-import { toSessionDetail as projectSessionDetail } from './useApiIpcResponder'
+import {
+  projectApiRecordingStatus,
+  toSessionDetail as projectSessionDetail,
+} from './useApiIpcResponder'
 
 function toSessionSummary(session: TranscriptSession): SessionSummary {
   return {
@@ -293,6 +296,22 @@ describe('toSessionDetail', () => {
     })
     expect(detail).not.toHaveProperty('patches')
     expect(JSON.stringify(detail)).not.toContain('baseTranscriptHash')
+  })
+})
+
+describe('projectApiRecordingStatus', () => {
+  it('keeps the active session ID while paused without reporting active recording', () => {
+    expect(projectApiRecordingStatus('paused', 'session-1')).toEqual({
+      isRecording: false,
+      currentSessionId: 'session-1',
+      recordingState: 'paused',
+    })
+  })
+
+  it('reports active recording only for the recording state', () => {
+    expect(projectApiRecordingStatus('recording', 'session-1').isRecording).toBe(true)
+    expect(projectApiRecordingStatus('pausing', 'session-1').isRecording).toBe(false)
+    expect(projectApiRecordingStatus('resuming', 'session-1').isRecording).toBe(false)
   })
 })
 

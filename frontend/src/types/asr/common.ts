@@ -53,10 +53,17 @@ export interface ASRPromptingCapabilities {
   supportsGlossary?: boolean
 }
 
+export type ASRTimestampOrigin = 'connection-relative' | 'session-relative' | 'none'
+
 export interface ASRTimestampCapabilities {
   supportsTokenTimestamps?: boolean
   supportsWordTimestamps?: boolean
   supportsSegmentTimestamps?: boolean
+  /**
+   * Defines the clock used by emitted token timestamps. Connection-relative
+   * values are normalized once by ProviderSessionManager for each epoch.
+   */
+  tokenTimestampOrigin?: ASRTimestampOrigin
 }
 
 export interface ASRWorkloadCapability {

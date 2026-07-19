@@ -25,6 +25,7 @@ const electronAPI: ElectronAPI = {
   beginRecordingArchive: (request) => ipcRenderer.invoke('begin-recording-archive', request),
   appendRecordingArchive: (request) => ipcRenderer.invoke('append-recording-archive', request),
   finalizeRecordingArchive: (request) => ipcRenderer.invoke('finalize-recording-archive', request),
+  abortRecordingArchive: (request) => ipcRenderer.invoke('abort-recording-archive', request),
   recoverRecordingArchives: () => ipcRenderer.invoke('recover-recording-archives'),
   revealRecordingArchive: (targetPath: string) => ipcRenderer.invoke('reveal-recording-archive', targetPath),
 
@@ -163,6 +164,11 @@ const electronAPI: ElectronAPI = {
     const listener = () => callback()
     ipcRenderer.on('toggle-recording', listener)
     return () => ipcRenderer.removeListener('toggle-recording', listener)
+  },
+  onToggleRecordingPause: (callback: () => void) => {
+    const listener = () => callback()
+    ipcRenderer.on('toggle-recording-pause', listener)
+    return () => ipcRenderer.removeListener('toggle-recording-pause', listener)
   },
 
   apiNotifySessionStart: (sessionId: string) => {

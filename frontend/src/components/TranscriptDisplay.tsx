@@ -4,6 +4,7 @@ import { useUIStore } from '../stores/uiStore'
 import { useSettingsStore } from '../stores/settingsStore'
 import { useSessionStore } from '../stores/sessionStore'
 import { getProviderName } from '../utils/providerI18n'
+import { StatusIndicator } from './ui'
 
 interface TranscriptDisplayProps {
   className?: string
@@ -106,6 +107,18 @@ export function TranscriptDisplay({
   const isEmpty = !finalTranscript && !nonFinalTranscript && !translatedText
   const isRecording = recordingState === 'recording'
   const isStarting = recordingState === 'starting'
+  const isPaused = recordingState === 'paused'
+  const isTransitioning = recordingState === 'pausing'
+    || recordingState === 'resuming'
+    || recordingState === 'stopping'
+    || recordingState === 'switching'
+  const recordingStateLabel = recordingState === 'pausing'
+    ? t.recording.pausing
+    : recordingState === 'resuming'
+      ? t.recording.resuming
+      : recordingState === 'stopping'
+        ? t.recording.stopping
+        : t.recording.switching
   return (
     <div className={`workspace-panel overflow-hidden relative ${className}`}>
       {/* Header — minimal: provider badge on right, scroll indicator */}
@@ -116,13 +129,10 @@ export function TranscriptDisplay({
               {t.transcript.scrollPaused}
             </span>
           )}
-          {isStarting && (
-            <div className="inline-flex items-center gap-1.5 text-warning font-medium">
-              <span className="relative flex h-2 w-2">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-warning opacity-75" />
-                <span className="relative inline-flex rounded-full h-2 w-2 bg-warning" />
-              </span>
-              {t.recording.starting.replace('...', '')}
+          {(isStarting || isPaused || isTransitioning) && (
+            <div className="inline-flex items-center gap-1.5 text-warning font-medium" role="status">
+              <StatusIndicator status={recordingState} />
+              <span>{isStarting ? t.recording.starting.replace('...', '') : isPaused ? t.recording.paused : recordingStateLabel}</span>
             </div>
           )}
         </div>
@@ -148,7 +158,22 @@ export function TranscriptDisplay({
           </div>
         ) : isEmpty ? (
           <div className="h-full flex flex-col items-center justify-center text-muted-foreground">
-            {isRecording ? (
+            {isPaused ? (
+              <div className="text-center space-y-3 max-w-md mx-auto">
+                <div className="bg-warning/10 p-4 rounded-full inline-block">
+                  <Mic className="w-8 h-8 text-warning" />
+                </div>
+                <div>
+                  <p className="text-sm font-medium text-foreground">{t.recording.paused}</p>
+                  <p className="text-xs mt-2 leading-relaxed">{t.transcript.pausedPrivacy}</p>
+                </div>
+              </div>
+            ) : isTransitioning ? (
+              <div className="text-center space-y-3 max-w-sm mx-auto">
+                <div className="h-10 w-10 rounded-full border-4 border-warning/20 border-t-warning animate-spin mx-auto" />
+                <p className="text-sm font-medium text-foreground">{recordingStateLabel}</p>
+              </div>
+            ) : isRecording ? (
               <div className="text-center space-y-4 max-w-sm mx-auto animate-in fade-in duration-500">
                 <div className="relative inline-block">
                   <div className="absolute inset-0 bg-destructive/20 rounded-full animate-ping"></div>
@@ -195,6 +220,12 @@ export function TranscriptDisplay({
           </div>
         ) : (
           <div className="prose prose-sm dark:prose-invert max-w-none">
+            {isPaused && (
+              <div className="mb-4 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs leading-relaxed text-warning-foreground">
+                <p className="font-medium">{t.recording.paused}</p>
+                <p className="mt-1 text-muted-foreground">{t.transcript.pausedPrivacy}</p>
+              </div>
+            )}
             {showSource && (
               speakerDiarizationEnabled ? (
                 <div className="space-y-3">

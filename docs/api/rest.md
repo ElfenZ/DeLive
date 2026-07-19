@@ -169,13 +169,17 @@ curl http://localhost:23456/api/v1/status
 
 ```json
 {
-  "version": "1.7.0",
-  "recording": false,
-  "currentSessionId": null,
-  "currentProvider": null,
+  "isRecording": false,
+  "recordingState": "paused",
+  "currentSessionId": "abc123",
+  "version": "2.5.4",
   "liveClients": 0
 }
 ```
+
+`recordingState` is one of `idle`, `starting`, `recording`, `pausing`, `paused`, `resuming`, `stopping`, or `switching`. `isRecording` is `true` only while audio is actively recording (`recordingState: "recording"`). A paused session reports `isRecording: false` while retaining its `currentSessionId`.
+
+The REST API is read-only for recording control: it does not provide pause or resume endpoints. Pause and resume also do not publish `session-start` or `session-end` WebSocket lifecycle events because the session remains the same.
 
 ## Error Responses
 

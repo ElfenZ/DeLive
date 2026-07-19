@@ -20,6 +20,7 @@ export class AudioProcessor {
   private targetSampleRate: number
   private muted: boolean
   private onAudioData: ((pcmData: ArrayBuffer) => void) | null = null
+  private generation = 0
 
   constructor(config: AudioProcessorConfig = {}) {
     this.targetSampleRate = config.sampleRate || 16000
@@ -30,30 +31,42 @@ export class AudioProcessor {
     mediaStream: MediaStream,
     onAudioData: (pcmData: ArrayBuffer) => void,
   ): Promise<void> {
+    this.stop()
+    const generation = ++this.generation
     this.onAudioData = onAudioData
 
-    this.audioContext = new AudioContext({
+    const audioContext = new AudioContext({
       sampleRate: this.targetSampleRate,
     })
+    this.audioContext = audioContext
 
-    const actualSampleRate = this.audioContext.sampleRate
+    const actualSampleRate = audioContext.sampleRate
     console.log(`[AudioProcessor] 目标采样率: ${this.targetSampleRate}, 实际: ${actualSampleRate}`)
 
-    this.sourceNode = this.audioContext.createMediaStreamSource(mediaStream)
+    const sourceNode = audioContext.createMediaStreamSource(mediaStream)
+    this.sourceNode = sourceNode
 
     if (typeof AudioWorkletNode !== 'undefined') {
       try {
-        await this.startWithWorklet(this.audioContext, actualSampleRate)
-        return
+        await this.startWithWorklet(audioContext, sourceNode, generation)
+        if (this.isCurrentGeneration(generation)) {
+          return
+        }
       } catch (err) {
+        if (!this.isCurrentGeneration(generation)) {
+          return
+        }
         console.warn('[AudioProcessor] AudioWorklet 加载失败，回退到 ScriptProcessorNode:', err)
       }
     }
 
-    this.startWithScriptProcessor(this.audioContext, actualSampleRate)
+    if (this.isCurrentGeneration(generation)) {
+      this.startWithScriptProcessor(audioContext, sourceNode, actualSampleRate, generation)
+    }
   }
 
   stop(): void {
+    this.generation += 1
     if (this.workletNode) {
       this.workletNode.port.onmessage = null
       this.workletNode.disconnect()
@@ -88,21 +101,29 @@ export class AudioProcessor {
 
   private async startWithWorklet(
     ctx: AudioContext,
-    _actualSampleRate: number,
+    sourceNode: MediaStreamAudioSourceNode,
+    generation: number,
   ): Promise<void> {
     const url = new URL('./pcm-processor.worklet.js', window.location.href).href
     await ctx.audioWorklet.addModule(url)
 
-    this.workletNode = new AudioWorkletNode(ctx, 'pcm-processor', {
-      processorOptions: { targetSampleRate: this.targetSampleRate },
-    })
-
-    this.workletNode.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
-      this.onAudioData?.(event.data)
+    if (!this.isCurrentGeneration(generation)) {
+      return
     }
 
-    this.sourceNode!.connect(this.workletNode)
-    this.connectProcessorOutput(ctx, this.workletNode)
+    const workletNode = new AudioWorkletNode(ctx, 'pcm-processor', {
+      processorOptions: { targetSampleRate: this.targetSampleRate },
+    })
+    this.workletNode = workletNode
+
+    workletNode.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
+      if (this.isCurrentGeneration(generation)) {
+        this.onAudioData?.(event.data)
+      }
+    }
+
+    sourceNode.connect(workletNode)
+    this.connectProcessorOutput(ctx, workletNode)
     console.log('[AudioProcessor] 已启动（AudioWorklet）')
   }
 
@@ -110,7 +131,9 @@ export class AudioProcessor {
 
   private startWithScriptProcessor(
     ctx: AudioContext,
+    sourceNode: MediaStreamAudioSourceNode,
     actualSampleRate: number,
+    generation: number,
   ): void {
     const bufferSize = 4096
     this.legacyProcessorNode = ctx.createScriptProcessor(bufferSize, 1, 1)
@@ -126,10 +149,12 @@ export class AudioProcessor {
       }
 
       const pcmData = this.float32ToPCM16(outputData)
-      this.onAudioData?.(pcmData.buffer as ArrayBuffer)
+      if (this.isCurrentGeneration(generation)) {
+        this.onAudioData?.(pcmData.buffer as ArrayBuffer)
+      }
     }
 
-    this.sourceNode!.connect(this.legacyProcessorNode)
+    sourceNode.connect(this.legacyProcessorNode)
     this.connectProcessorOutput(ctx, this.legacyProcessorNode)
     console.log('[AudioProcessor] 已启动（ScriptProcessorNode 回退模式）')
   }
@@ -148,6 +173,10 @@ export class AudioProcessor {
     node.connect(gainNode)
     gainNode.connect(ctx.destination)
     this.outputGainNode = gainNode
+  }
+
+  private isCurrentGeneration(generation: number): boolean {
+    return generation === this.generation && this.audioContext !== null
   }
 
   // ── 共享工具方法（回退路径使用）──────────────────────

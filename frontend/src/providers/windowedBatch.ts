@@ -26,6 +26,11 @@ export abstract class WindowedBatchTranscriptionProvider<TChunk> extends BaseASR
   private inFlight = false
   private pendingFinal = false
   private hasPendingAudio = false
+  private acceptingAudio = false
+  private sessionGeneration = 0
+  private activeDrain: Promise<void> | null = null
+  private readonly pendingAudioInputs = new Set<Promise<void>>()
+  private readonly finalizationWaiters = new Set<() => void>()
   private hypothesis = new HypothesisBuffer()
   private committedText = ''
   private lastPartialText = ''
@@ -42,12 +47,18 @@ export abstract class WindowedBatchTranscriptionProvider<TChunk> extends BaseASR
   protected beginWindowedSession(config: ProviderConfig): void {
     this._config = config
     this.resetWindowedSession()
+    this.sessionGeneration += 1
+    this.acceptingAudio = true
     this.setState('connected')
   }
 
   protected endWindowedSession(): void {
+    this.acceptingAudio = false
+    this.sessionGeneration += 1
     this.setState('idle')
     this.resetWindowedSession()
+    this._config = null
+    this.resolveFinalizationWaiters()
   }
 
   protected getBufferedChunks(): TChunk[] {
@@ -89,31 +100,68 @@ export abstract class WindowedBatchTranscriptionProvider<TChunk> extends BaseASR
   }
 
   async disconnect(): Promise<void> {
-    this.clearScheduler()
+    await this.drain()
+  }
 
-    if (this.audioWindow.hasData()) {
-      this.pendingFinal = true
-      await this.transcribe(true)
+  /**
+   * Stops accepting audio, waits for already accepted inputs, then flushes
+   * the final rolling window. ProviderSessionManager supplies the outer
+   * timeout so a slow batch API cannot block session cleanup indefinitely.
+   */
+  async drain(): Promise<void> {
+    if (this.activeDrain) {
+      return this.activeDrain
+    }
+
+    if (!this._config) {
       return
     }
 
-    this.endWindowedSession()
+    this.acceptingAudio = false
+    this.clearScheduler()
+    const generation = this.sessionGeneration
+
+    const drain = (async () => {
+      await Promise.allSettled([...this.pendingAudioInputs])
+      if (generation !== this.sessionGeneration) {
+        return
+      }
+
+      if (!this.audioWindow.hasData() && !this.inFlight) {
+        this.emitFinished()
+        this.endWindowedSession()
+        return
+      }
+
+      this.pendingFinal = true
+      await this.transcribe(true)
+    })()
+
+    this.activeDrain = drain
+    void drain.finally(() => {
+      if (this.activeDrain === drain) {
+        this.activeDrain = null
+      }
+    })
+    return drain
   }
 
   sendAudio(data: Blob | ArrayBuffer): void {
-    if (!this._config) {
+    if (!this._config || !this.acceptingAudio) {
       console.warn(`[${this.id}] 未连接，忽略音频数据`)
       return
     }
 
     this.setState('recording')
-    void this.enqueueAudio(data)
+    const task = this.enqueueAudio(data, this.sessionGeneration)
+    this.pendingAudioInputs.add(task)
+    void task.finally(() => this.pendingAudioInputs.delete(task))
   }
 
-  private async enqueueAudio(data: Blob | ArrayBuffer): Promise<void> {
+  private async enqueueAudio(data: Blob | ArrayBuffer, generation: number): Promise<void> {
     try {
       const resolved = await this.resolveAudioChunk(data)
-      if (!resolved || resolved.durationMs <= 0) {
+      if (!resolved || resolved.durationMs <= 0 || generation !== this.sessionGeneration) {
         return
       }
 
@@ -164,14 +212,18 @@ export abstract class WindowedBatchTranscriptionProvider<TChunk> extends BaseASR
   }
 
   private async transcribe(isFinal: boolean): Promise<void> {
-    const config = this._config
-    if (!config || !this.audioWindow.hasData()) {
-      return
-    }
-
     if (this.inFlight) {
       if (isFinal) {
         this.pendingFinal = true
+        await this.waitForFinalization()
+      }
+      return
+    }
+
+    const config = this._config
+    if (!config || !this.audioWindow.hasData()) {
+      if (isFinal) {
+        this.endWindowedSession()
       }
       return
     }
@@ -278,5 +330,16 @@ export abstract class WindowedBatchTranscriptionProvider<TChunk> extends BaseASR
     this.committedText = ''
     this.lastPartialText = ''
     this.bufferTimeOffsetSec = 0
+  }
+
+  private waitForFinalization(): Promise<void> {
+    return new Promise(resolve => this.finalizationWaiters.add(resolve))
+  }
+
+  private resolveFinalizationWaiters(): void {
+    for (const resolve of this.finalizationWaiters) {
+      resolve()
+    }
+    this.finalizationWaiters.clear()
   }
 }

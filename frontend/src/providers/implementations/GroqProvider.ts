@@ -40,6 +40,9 @@ export class GroqProvider extends WindowedBatchTranscriptionProvider<ArrayBuffer
       prompting: {
         supportsLanguageHints: true,
       },
+      timestamps: {
+        tokenTimestampOrigin: 'none',
+      },
       workloads: {
         liveCapture: {
           availability: 'implemented',

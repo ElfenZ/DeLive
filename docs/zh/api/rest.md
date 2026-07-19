@@ -155,13 +155,17 @@ curl http://localhost:23456/api/v1/status
 
 ```json
 {
-  "version": "1.7.0",
-  "recording": false,
-  "currentSessionId": null,
-  "currentProvider": null,
+  "isRecording": false,
+  "recordingState": "paused",
+  "currentSessionId": "abc123",
+  "version": "2.5.4",
   "liveClients": 0
 }
 ```
+
+`recordingState` 的取值为 `idle`、`starting`、`recording`、`pausing`、`paused`、`resuming`、`stopping` 或 `switching`。仅当音频正在录制（`recordingState: "recording"`）时，`isRecording` 才为 `true`。暂停会话返回 `isRecording: false`，但会保留其 `currentSessionId`。
+
+REST API 仅提供录制状态读取，不提供远程暂停或恢复端点。暂停和恢复不会发送 `session-start` 或 `session-end` WebSocket 生命周期事件，因为会话并未改变。
 
 ## 错误响应
 

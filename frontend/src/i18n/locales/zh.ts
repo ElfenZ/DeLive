@@ -300,8 +300,16 @@ export const zh = {
   // 录制控制
   recording: {
     startRecording: '开始录制',
+    pauseRecording: '暂停录制',
+    resumeRecording: '继续录制',
     stopRecording: '停止录制',
     starting: '正在启动...',
+    pausing: '正在暂停...',
+    paused: '录制已暂停',
+    resuming: '正在恢复...',
+    resumeFailed: '恢复录制失败，录制仍保持暂停，可重试或停止保存已有内容',
+    resumeCancelled: '已取消选择录制源，录制仍保持暂停',
+    sourceUnavailable: '原录制源已失效，请重新选择来源以继续当前会话',
     stopping: '正在停止...',
     switching: '正在切换配置...',
     selectSource: '请在弹出的窗口中选择标签页，并勾选',
@@ -342,6 +350,7 @@ export const zh = {
     translated: '已翻译',
     confirmed: '已确认',
     liveUpdating: '实时更新中',
+    pausedPrivacy: '暂停期间不会保存或上传音频。系统共享或麦克风指示可能因保留授权继续显示。',
     scrollPaused: '已暂停滚动',
     scrollToBottom: '回到底部',
   },
@@ -513,6 +522,8 @@ export const zh = {
     maximize: '最大化',
     restore: '还原',
     close: '关闭',
+    recordingStatus: '录制中',
+    pausedStatus: '已暂停',
   },
 
   // 会话默认标题

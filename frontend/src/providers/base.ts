@@ -15,6 +15,7 @@ import type {
 } from '../types/asr'
 
 type EventCallback = NonNullable<ASREventCallbacks[keyof ASREventCallbacks]>
+const PROVIDER_DISCONNECT_GRACE_MS = 1_800
 
 export abstract class BaseASRProvider implements ASRProvider {
   abstract readonly id: ASRVendor
@@ -128,6 +129,10 @@ export abstract class BaseASRProvider implements ASRProvider {
   // 便捷方法：发送完成事件
   protected emitFinished(): void {
     this.emit('onFinished')
+  }
+
+  protected waitForDisconnectGrace(): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, PROVIDER_DISCONNECT_GRACE_MS))
   }
 
   // 创建标准错误对象

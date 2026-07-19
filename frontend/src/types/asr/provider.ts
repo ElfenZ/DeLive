@@ -19,6 +19,14 @@ export interface ProviderConfig {
   [key: string]: unknown
 }
 
+/**
+ * Connection-scoped timeline options. The offset is immutable for the
+ * connection and is only applied to connection-relative token timestamps.
+ */
+export interface ProviderConnectionOptions {
+  epochOffsetMs?: number
+}
+
 // ASR Provider 核心接口
 export interface ASRProvider {
   // 提供商信息
@@ -32,6 +40,8 @@ export interface ASRProvider {
 
   // 生命周期方法
   connect(config: ProviderConfig): Promise<void>
+  /** Flushes a provider-owned final window when the implementation supports it. */
+  drain?(): Promise<void>
   disconnect(): Promise<void>
 
   // 音频数据发送

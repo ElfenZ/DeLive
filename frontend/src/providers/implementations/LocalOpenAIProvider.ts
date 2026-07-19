@@ -39,6 +39,9 @@ export class LocalOpenAIProvider extends WindowedBatchTranscriptionProvider<Blob
       prompting: {
         supportsLanguageHints: true,
       },
+      timestamps: {
+        tokenTimestampOrigin: 'none',
+      },
       workloads: {
         liveCapture: {
           availability: 'implemented',

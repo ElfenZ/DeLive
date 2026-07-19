@@ -42,6 +42,9 @@ export class AssemblyAIProvider extends BaseASRProvider {
       prompting: {
         supportsLanguageHints: false,
       },
+      timestamps: {
+        tokenTimestampOrigin: 'none',
+      },
       workloads: {
         liveCapture: {
           availability: 'implemented',
@@ -126,7 +129,6 @@ export class AssemblyAIProvider extends BaseASRProvider {
               case 'final':
                 console.log('[AssemblyAIProvider] 最终结果:', msg.text)
                 this.emitFinal(msg.text || '')
-                this.emitFinished()
                 break
 
               case 'error':
@@ -165,7 +167,7 @@ export class AssemblyAIProvider extends BaseASRProvider {
       this.ws.send(JSON.stringify({ type: 'terminate' }))
     }
 
-    await new Promise(resolve => setTimeout(resolve, 500))
+    await this.waitForDisconnectGrace()
 
     if (this.ws) {
       this.ws.close(1000, 'disconnect')

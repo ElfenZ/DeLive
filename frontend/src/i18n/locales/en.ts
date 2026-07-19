@@ -302,8 +302,16 @@ export const en: Translations = {
   // Recording controls
   recording: {
     startRecording: 'Start Recording',
+    pauseRecording: 'Pause Recording',
+    resumeRecording: 'Resume Recording',
     stopRecording: 'Stop Recording',
     starting: 'Starting...',
+    pausing: 'Pausing...',
+    paused: 'Recording paused',
+    resuming: 'Resuming...',
+    resumeFailed: 'Resume failed. Recording remains paused; retry or stop to save existing content.',
+    resumeCancelled: 'Source selection was cancelled. Recording remains paused.',
+    sourceUnavailable: 'The original source is no longer available. Select another source to continue this session.',
     stopping: 'Stopping...',
     switching: 'Switching config...',
     selectSource: 'Please select a tab in the popup window and check',
@@ -344,6 +352,7 @@ export const en: Translations = {
     translated: 'Translated',
     confirmed: 'Confirmed',
     liveUpdating: 'Live updating',
+    pausedPrivacy: 'No audio is saved or uploaded while paused. System sharing or microphone indicators may remain visible because capture permission is retained.',
     scrollPaused: 'Scroll paused',
     scrollToBottom: 'Scroll to bottom',
   },
@@ -515,6 +524,8 @@ export const en: Translations = {
     maximize: 'Maximize',
     restore: 'Restore',
     close: 'Close',
+    recordingStatus: 'Recording',
+    pausedStatus: 'Paused',
   },
 
   // Session default title

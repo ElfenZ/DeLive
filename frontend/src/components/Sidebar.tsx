@@ -76,6 +76,7 @@ export function Sidebar({
     const Icon = item.icon
     const label = getLabel(item.id)
     const showRecDot = item.id === 'live' && recordingState === 'recording'
+    const showPausedDot = item.id === 'live' && recordingState === 'paused'
     const showCaptionDot = item.id === 'caption' && captionEnabled
 
     return (
@@ -101,10 +102,13 @@ export function Sidebar({
         <span className="relative flex-shrink-0">
           <Icon className="h-[18px] w-[18px]" />
           {showRecDot && (
-            <span className="absolute -top-0.5 -right-0.5 flex h-2 w-2">
+            <span className="absolute -top-0.5 -right-0.5 flex h-2 w-2" aria-hidden="true">
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-destructive opacity-75" />
               <span className="relative inline-flex rounded-full h-2 w-2 bg-destructive" />
             </span>
+          )}
+          {showPausedDot && (
+            <span className="absolute -top-0.5 -right-0.5 h-2 w-2 rounded-full bg-amber-500" aria-hidden="true" />
           )}
           {showCaptionDot && (
             <span className="absolute -top-0.5 -right-0.5 h-2 w-2 rounded-full bg-emerald-500" />

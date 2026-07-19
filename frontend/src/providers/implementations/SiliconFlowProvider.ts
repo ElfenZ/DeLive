@@ -40,6 +40,9 @@ export class SiliconFlowProvider extends WindowedBatchTranscriptionProvider<Arra
       prompting: {
         supportsLanguageHints: true,
       },
+      timestamps: {
+        tokenTimestampOrigin: 'none',
+      },
       workloads: {
         liveCapture: {
           availability: 'implemented',

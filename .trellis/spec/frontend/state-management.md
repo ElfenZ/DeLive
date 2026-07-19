@@ -117,3 +117,102 @@ Use Zustand plus Session persistence when work spans components, navigation, or 
 - Resuming marked queued correction drafts through both generic and workflow runners.
 - Reusing a successful AI artifact solely by timestamp without validating source provenance.
 - Downgrading `running` in the schema normalizer, which also runs during ordinary writes.
+
+---
+
+## Scenario: Pausable Live Recording
+
+### 1. Scope / Trigger
+
+Use this contract when changing live capture, ASR connection lifecycle, source-audio archive, recording controls, shortcuts, or elapsed-time display. The workflow spans Zustand, browser media resources, Provider sessions, Electron archive IPC, and UI surfaces.
+
+### 2. Signatures
+
+```ts
+type RecordingState =
+  | 'idle' | 'starting' | 'recording'
+  | 'pausing' | 'paused' | 'resuming'
+  | 'stopping' | 'switching'
+
+pauseRecording(): Promise<void>
+resumeRecording(): Promise<void>
+stopRecording(): Promise<string | null>
+
+pauseCapture(): Promise<void>
+resumeCapture(capabilities: CapturePipelineCapabilities): Promise<void>
+
+ProviderSessionManager.drain(): Promise<ProviderSessionDisconnectResult>
+```
+
+`TranscriptSession.status` remains `recording` while the runtime state is paused. A completed live Session stores effective milliseconds in `TranscriptSession.duration`.
+
+### 3. Contracts
+
+- Source selection happens before Provider connection on initial start. Archive and capture outputs stay gated until both pipelines are ready and the effective timeline starts.
+- Pause order is: block archive output at the boundary, drain the capture tail, flush archive writes, drain/disconnect Provider, freeze residual interim text, freeze the timeline, enter `paused`.
+- Resume reuses a healthy stream. An invalid stream is replaced through a new `prompt` selection without creating a Session or calling archive `begin` again.
+- In mixed mode, `CaptureManager` must strongly own the complete Web Audio graph (`AudioContext`, source nodes, and destination node) until final stop. Pause keeps this local producer graph running and gates/stops all archive, ASR, and waveform consumers; suspending the producer can leave a generated destination track `live` but permanently silent after resume in Chromium.
+- `MediaStreamTrack.readyState === 'live'` proves only that a track has not ended. It does not prove that a retained generated stream is producing audio frames. Do not use readyState alone to justify suspending or discarding the graph that owns that track.
+- Archive `begin` is once per Session. Pause only stops the archive processor and drains its append queue; final stop performs `finalize`.
+- Provider listeners remain attached during the bounded two-second drain. Ordinary `final` segments are not terminal; only `finished` completes drain early.
+- Connection-relative token timestamps receive one immutable epoch offset in `ProviderSessionManager`. Reducers consume session-relative timestamps only.
+- The effective timeline belongs to `sessionStore`; components may use a render timer to read it, but cannot own workflow elapsed state.
+- `Ctrl/Cmd+Shift+R` maps idle to start and recording/paused to stop. `Ctrl/Cmd+Shift+P` maps recording to pause and paused to resume. Transition states are no-op.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+|-----------|-----------------|
+| Duplicate action during a transition | Reject through the recording transition table |
+| Provider drain exceeds two seconds | Disconnect, promote visible interim content, continue pause/stop |
+| Resume Provider or pipeline fails | Return to `paused`; retain Session and existing archive |
+| Retained source ended while paused | Mark invalid; do not complete the Session; prompt on resume |
+| Retained mixed destination track is `live` | Preserve its strongly-owned producer graph; do not infer signal health from readyState alone |
+| Replacement source selection is cancelled | Return to `paused` without resetting Session/archive |
+| Archive resume fails after earlier PCM exists | Keep paused; never return a truncated archive as complete |
+| Empty Session stops | Abort temporary archive and return `null` |
+| Completed non-empty Session stops | Finalize archive, persist effective duration, return its ID |
+
+### 5. Good / Base / Bad Cases
+
+- Good: a WebM recorder delivers its terminal chunk before Provider drain, pause writes no PCM, resume creates a fresh recorder header, and final duration excludes the paused interval.
+- Base: a text-only Provider times out during drain; visible partial text is promoted once and the Session remains resumable.
+- Bad: a component resets elapsed time when state leaves `recording`, resume calls archive `begin`, ordinary Provider `final` ends drain, or device restart stays in `recording` while async resources are replaced.
+
+### 6. Tests Required
+
+- Recording timeline: multiple active segments and long pauses do not add paused milliseconds.
+- Capture manager: WebM tail ordering/generation fence, PCM processor recreation, mixed graph ownership across pause/resume, explicit graph disconnect on final stop, invalid retained source, and replacement mixed source behavior.
+- Provider session: delayed final delivery, ordinary final is non-terminal, bounded timeout, expected close error suppression, late epoch fencing, and timestamp offset exactly once.
+- Transcript reducer: token/text/translation interim promotion, empty final preservation, multiple boundaries without markers or duplication.
+- Archive IPC: idempotent begin, append across active segments, abort rejects late append, final WAV data length.
+- Shortcut mapping: R/P actions for every runtime state and Electron fallback registration.
+- Session completion: effective duration reaches repository and the actual completed ID is returned.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```ts
+setRecordingState('paused')
+capture.pauseRecorder()
+await provider.disconnect()
+beginRecordingArchive({ sessionId })
+```
+
+This bypasses transition single-flight, drops asynchronous WebM tail data, removes the Provider finalization window, and truncates the existing PCM archive.
+
+#### Correct
+
+```ts
+if (!transitionRecordingState('pausing')) return
+archiveOutputEnabled = false
+await capture.pauseCapture()
+await pauseArchiveAndDrainQueue()
+const result = await providerSession.drain()
+freezeTranscriptBoundary(result.status !== 'finished')
+pauseRecordingTimeline(pauseStartedAt)
+transitionRecordingState('paused')
+```
+
+The orchestration layer owns ordering; resource services own their local generation fences and cleanup.

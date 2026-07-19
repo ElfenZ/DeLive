@@ -1,3 +1,5 @@
+import type { RecordingState } from './recordingState'
+
 export interface DesktopSource {
   id: string
   name: string
@@ -220,7 +222,7 @@ export interface SessionDetail {
 export interface ApiRecordingStatus {
   isRecording: boolean
   currentSessionId: string | null
-  recordingState: string
+  recordingState: RecordingState
 }
 
 export interface ApiTopicData {
@@ -329,6 +331,7 @@ export interface ElectronAPI {
   beginRecordingArchive: (request: RecordingArchiveBeginRequest) => Promise<RecordingArchiveSaveResult>
   appendRecordingArchive: (request: RecordingArchiveAppendRequest) => Promise<RecordingArchiveSaveResult>
   finalizeRecordingArchive: (request: RecordingArchiveFinalizeRequest) => Promise<RecordingArchiveSaveResult>
+  abortRecordingArchive: (request: { sessionId: string }) => Promise<{ ok: boolean; error?: string }>
   recoverRecordingArchives: () => Promise<RecordingArchiveRecoverResult>
   revealRecordingArchive: (targetPath: string) => Promise<{ ok: boolean; error?: string }>
   localRuntimeGetStatus: (runtimeId: string, options?: LocalRuntimeLaunchOptions) => Promise<LocalRuntimeSnapshot>
@@ -382,6 +385,7 @@ export interface ElectronAPI {
   safeStorageDelete: (key: string) => Promise<boolean>
   safeStorageAvailable: () => Promise<boolean>
   onToggleRecording: (callback: () => void) => () => void
+  onToggleRecordingPause: (callback: () => void) => () => void
   apiNotifySessionStart: (sessionId: string) => void
   apiNotifySessionEnd: (sessionId: string) => void
 

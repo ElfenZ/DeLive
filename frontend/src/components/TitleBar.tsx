@@ -1,7 +1,9 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 import { Minus, Square, X, Maximize2, Search } from 'lucide-react'
 import { useUIStore } from '../stores/uiStore'
+import { useSessionStore } from '../stores/sessionStore'
 import type { RecordingState } from '../types'
+import { readRecordingElapsedMs } from '../utils/recordingTimeline'
 
 interface TitleBarProps {
   recordingState?: RecordingState
@@ -11,25 +13,25 @@ interface TitleBarProps {
 export function TitleBar({ recordingState, onClickRec }: TitleBarProps) {
   const [isMaximized, setIsMaximized] = useState(false)
   const { t, setCommandPaletteOpen } = useUIStore()
-  const [elapsed, setElapsed] = useState(0)
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const recordingTimeline = useSessionStore((state) => state.recordingTimeline)
+  const [renderNowMs, setRenderNowMs] = useState(() => Date.now())
 
   useEffect(() => {
-    if (recordingState === 'recording') {
-      setElapsed(0)
-      intervalRef.current = setInterval(() => setElapsed(s => s + 1), 1000)
-    } else {
-      if (intervalRef.current) clearInterval(intervalRef.current)
-      setElapsed(0)
-    }
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current) }
+    setRenderNowMs(Date.now())
+    if (recordingState !== 'recording') return
+
+    const interval = window.setInterval(() => setRenderNowMs(Date.now()), 1000)
+    return () => window.clearInterval(interval)
   }, [recordingState])
 
-  const formatTime = (s: number) => {
-    const m = Math.floor(s / 60)
-    const sec = s % 60
+  const formatTime = (elapsedMs: number) => {
+    const elapsedSeconds = Math.floor(elapsedMs / 1000)
+    const m = Math.floor(elapsedSeconds / 60)
+    const sec = elapsedSeconds % 60
     return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
   }
+
+  const elapsed = formatTime(readRecordingElapsedMs(recordingTimeline, renderNowMs))
 
   // 当前平台
   const platform = window.electronAPI?.platform
@@ -93,19 +95,30 @@ export function TitleBar({ recordingState, onClickRec }: TitleBarProps) {
             <kbd className="ml-auto shrink-0 rounded border border-border/40 bg-background/60 px-1 text-[10px] font-mono leading-tight">{shortcutLabel}</kbd>
           </button>
 
-          {/* REC indicator */}
+          {/* Recording state indicator */}
           {recordingState === 'recording' && (
             <button
               onClick={onClickRec}
               className="flex items-center gap-1.5 text-xs font-medium text-destructive hover:text-destructive/80 transition-colors shrink-0"
+              aria-label={`${t.titleBar.recordingStatus} ${elapsed}`}
               style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
             >
               <span className="relative flex h-2 w-2">
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-destructive opacity-75" />
                 <span className="relative inline-flex rounded-full h-2 w-2 bg-destructive" />
               </span>
-              REC {formatTime(elapsed)}
+              REC {elapsed}
             </button>
+          )}
+          {recordingState === 'paused' && (
+            <span
+              className="flex items-center gap-1.5 text-xs font-medium text-warning shrink-0"
+              aria-label={`${t.titleBar.pausedStatus} ${elapsed}`}
+              role="status"
+            >
+              <span className="inline-flex h-2 w-2 rounded-full bg-warning" />
+              {t.titleBar.pausedStatus} {elapsed}
+            </span>
           )}
         </div>
       </div>

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added / 新增
+- **Recording pause and resume** - active recordings can pause and resume within the same session, freezing elapsed time and stopping audio storage, upload, and transcription while paused
+- **录制暂停与恢复** - 实时录制可在同一会话内暂停和恢复；暂停期间计时冻结，且不会保存、上传或转写音频
+
+---
+
 ## [2.5.4] - 2026-07-18
 
 ### Added / 新增

@@ -46,6 +46,7 @@ export function WaveformVisualizer({
     const stream = getStream()
     if (!stream) return
 
+    let cancelled = false
     const audioCtx = new AudioContext()
     const analyser = audioCtx.createAnalyser()
     analyser.fftSize = 128
@@ -53,10 +54,6 @@ export function WaveformVisualizer({
 
     const source = audioCtx.createMediaStreamSource(stream)
     source.connect(analyser)
-
-    contextRef.current = audioCtx
-    analyserRef.current = analyser
-    sourceRef.current = source
 
     const dataArray = new Uint8Array(analyser.frequencyBinCount)
 
@@ -106,9 +103,31 @@ export function WaveformVisualizer({
       animationRef.current = requestAnimationFrame(draw)
     }
 
-    draw()
+    const start = async () => {
+      if (audioCtx.state !== 'running') {
+        await audioCtx.resume()
+      }
+      if (cancelled) return
+      contextRef.current = audioCtx
+      analyserRef.current = analyser
+      sourceRef.current = source
+      draw()
+    }
+    void start().catch((error) => {
+      console.warn('[WaveformVisualizer] AudioContext resume failed:', error)
+      source.disconnect()
+      void audioCtx.close()
+    })
 
-    return cleanup
+    return () => {
+      cancelled = true
+      if (sourceRef.current === source) {
+        cleanup()
+      } else {
+        source.disconnect()
+        if (audioCtx.state !== 'closed') void audioCtx.close()
+      }
+    }
   }, [isActive, getStream, barCount, cleanup])
 
   if (!isActive) return null

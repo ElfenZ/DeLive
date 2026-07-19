@@ -43,6 +43,7 @@ export class SonioxProvider extends BaseASRProvider {
       timestamps: {
         supportsTokenTimestamps: true,
         supportsSegmentTimestamps: true,
+        tokenTimestampOrigin: 'connection-relative',
       },
       workloads: {
         liveCapture: {
@@ -135,6 +136,7 @@ export class SonioxProvider extends BaseASRProvider {
 
   private ws: WebSocket | null = null
   private finalTokens: TranscriptToken[] = []
+  private resolveDrain: (() => void) | null = null
 
   async connect(config: ProviderConfig): Promise<void> {
     if (!config.apiKey) {
@@ -146,6 +148,7 @@ export class SonioxProvider extends BaseASRProvider {
     this._config = config
     this.setState('connecting')
     this.finalTokens = []
+    this.resolveDrain = null
 
     return new Promise((resolve, reject) => {
       try {
@@ -208,14 +211,22 @@ export class SonioxProvider extends BaseASRProvider {
     if (this.ws) {
       const ws = this.ws
       this.ws = null
-      ws.onmessage = null
-      ws.onerror = null
-      ws.onclose = null
       ws.close()
     }
 
     this.setState('idle')
-    this.finalTokens = []
+  }
+
+  async drain(): Promise<void> {
+    const ws = this.ws
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    if (this.resolveDrain) return
+
+    await new Promise<void>((resolve) => {
+      this.resolveDrain = resolve
+      // Soniox uses an empty text frame to mark the end of the audio stream.
+      ws.send('')
+    })
   }
 
   sendAudio(data: Blob | ArrayBuffer): void {
@@ -265,6 +276,8 @@ export class SonioxProvider extends BaseASRProvider {
         const finalText = this.finalTokens.map(t => t.text).join('')
         this.emitFinal(finalText)
         this.emitFinished()
+        this.resolveDrain?.()
+        this.resolveDrain = null
         this.setState('idle')
       }
     } catch (error) {
@@ -281,7 +294,7 @@ export class SonioxProvider extends BaseASRProvider {
     let partialText = ''
 
     // Soniox 特殊标记列表，这些不应该显示给用户
-    const specialMarkers = ['<end>', '<END>', '<unk>', '<UNK>', '<silence>', '<SILENCE>']
+    const specialMarkers = ['<end>', '<END>', '<fin>', '<FIN>', '<unk>', '<UNK>', '<silence>', '<SILENCE>']
 
     for (const st of sonioxTokens) {
       if (!st.text) continue

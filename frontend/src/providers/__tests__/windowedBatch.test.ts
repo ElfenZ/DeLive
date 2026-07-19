@@ -32,6 +32,8 @@ class TestWindowedProvider extends WindowedBatchTranscriptionProvider<string> {
 
   public responses: Array<string | Error> = []
   public transcribeWindowCalls = 0
+  public deferAudioInput = false
+  private releaseDeferredAudioInput: (() => void) | null = null
 
   constructor(
     scheduleMode: 'interval' | 'debounce' = 'interval',
@@ -65,7 +67,17 @@ class TestWindowedProvider extends WindowedBatchTranscriptionProvider<string> {
   }
 
   protected async resolveAudioChunk(): Promise<{ chunk: string; durationMs: number }> {
+    if (this.deferAudioInput) {
+      await new Promise<void>(resolve => {
+        this.releaseDeferredAudioInput = resolve
+      })
+    }
     return { chunk: 'chunk', durationMs: 100 }
+  }
+
+  releaseAudioInput(): void {
+    this.releaseDeferredAudioInput?.()
+    this.releaseDeferredAudioInput = null
   }
 
   protected async transcribeWindow(): Promise<TimestampedWord[]> {
@@ -149,5 +161,37 @@ describe('WindowedBatchTranscriptionProvider', () => {
 
     expect(provider.transcribeWindowCalls).toBe(2)
     expect(errorSpy).not.toHaveBeenCalled()
+  })
+
+  it('flushes audio accepted before drain and rejects audio sent after drain begins', async () => {
+    const provider = new TestWindowedProvider('debounce')
+    provider.responses = ['tail']
+    provider.deferAudioInput = true
+    const finishedSpy = vi.fn()
+    provider.on('onFinished', finishedSpy)
+
+    await provider.connect({})
+    provider.sendAudio(new ArrayBuffer(8))
+    const draining = provider.drain()
+    provider.sendAudio(new ArrayBuffer(8))
+    provider.releaseAudioInput()
+    await draining
+
+    expect(provider.transcribeWindowCalls).toBe(1)
+    expect(finishedSpy).toHaveBeenCalledTimes(1)
+    expect(provider.state).toBe('idle')
+  })
+
+  it('finishes an empty drain without waiting for the manager timeout', async () => {
+    const provider = new TestWindowedProvider('debounce')
+    const finishedSpy = vi.fn()
+    provider.on('onFinished', finishedSpy)
+
+    await provider.connect({})
+    await provider.drain()
+
+    expect(finishedSpy).toHaveBeenCalledTimes(1)
+    expect(provider.transcribeWindowCalls).toBe(0)
+    expect(provider.state).toBe('idle')
   })
 })

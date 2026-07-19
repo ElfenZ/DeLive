@@ -53,4 +53,15 @@ export function registerAppShortcuts(options: RegisterShortcutsOptions): void {
   if (!tryRegister('CommandOrControl+Shift+R', toggleRecording, getElectronStrings().shortcutToggleRecording)) {
     tryRegister('CommandOrControl+Alt+R', toggleRecording, getElectronStrings().shortcutToggleRecordingAlt)
   }
+
+  // ── Toggle recording pause ───────────────────────
+  const toggleRecordingPause = () => {
+    const mainWindow = options.getMainWindow()
+    if (!mainWindow || mainWindow.isDestroyed()) return
+    mainWindow.webContents.send('toggle-recording-pause')
+  }
+
+  if (!tryRegister('CommandOrControl+Shift+P', toggleRecordingPause, getElectronStrings().shortcutToggleRecordingPause)) {
+    tryRegister('CommandOrControl+Alt+P', toggleRecordingPause, getElectronStrings().shortcutToggleRecordingPauseAlt)
+  }
 }

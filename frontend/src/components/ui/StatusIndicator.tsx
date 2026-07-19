@@ -11,7 +11,23 @@ const statusConfig = {
     dotClass: 'bg-warning',
     ping: true,
   },
+  pausing: {
+    dotClass: 'bg-warning',
+    ping: true,
+  },
+  paused: {
+    dotClass: 'bg-amber-500',
+    ping: false,
+  },
+  resuming: {
+    dotClass: 'bg-warning',
+    ping: true,
+  },
   stopping: {
+    dotClass: 'bg-warning',
+    ping: true,
+  },
+  switching: {
     dotClass: 'bg-warning',
     ping: true,
   },

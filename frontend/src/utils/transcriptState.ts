@@ -7,6 +7,8 @@ import type { TranscriptToken } from '../types/asr'
 
 export interface TranscriptRuntimeState {
   finalTokens: TranscriptToken[]
+  /** Latest token-provider interim payload, retained so a timed-out drain can be promoted losslessly. */
+  nonFinalTokens: TranscriptToken[]
   /** Text accumulated from non-token sources (final-text, config-change) before a token-based provider takes over */
   transcriptPrefix: string
   finalTranscript: string
@@ -33,7 +35,7 @@ export type TranscriptRuntimeStateShape = Pick<
   | 'currentSegments'
   | 'currentSpeakers'
   | 'currentPostProcess'
->
+> & Partial<Pick<TranscriptRuntimeState, 'nonFinalTokens'>>
 
 export type TranscriptEvent =
   | { type: 'tokens'; tokens: TranscriptToken[] }
@@ -41,10 +43,12 @@ export type TranscriptEvent =
   | { type: 'final-text'; text: string }
   | { type: 'post-process'; patch: Partial<TranscriptPostProcess> }
   | { type: 'config-change'; description: string }
+  | { type: 'pause-boundary'; promoteInterim?: boolean }
 
 export function createEmptyTranscriptRuntimeState(): TranscriptRuntimeState {
   return {
     finalTokens: [],
+    nonFinalTokens: [],
     transcriptPrefix: '',
     finalTranscript: '',
     nonFinalTranscript: '',
@@ -61,6 +65,7 @@ export function createEmptyTranscriptRuntimeState(): TranscriptRuntimeState {
 export function selectTranscriptRuntimeState(source: TranscriptRuntimeStateShape): TranscriptRuntimeState {
   return {
     finalTokens: source.finalTokens,
+    nonFinalTokens: source.nonFinalTokens ?? [],
     transcriptPrefix: source.transcriptPrefix,
     finalTranscript: source.finalTranscript,
     nonFinalTranscript: source.nonFinalTranscript,
@@ -173,8 +178,9 @@ export function applyTranscriptEvent(
   switch (event.type) {
     case 'tokens': {
       const newFinalTokens = [...state.finalTokens]
-      let nonFinalText = ''
-      let translatedNonFinalText = ''
+      const incomingNonFinalTokens: TranscriptToken[] = []
+      let hasSourceFinal = false
+      let hasTranslationFinal = false
       let translatedFinalText = state.finalTranslatedTranscript
 
       for (const token of event.tokens) {
@@ -185,8 +191,9 @@ export function applyTranscriptEvent(
         if (token.translationStatus === 'translation') {
           if (token.isFinal) {
             translatedFinalText += token.text
+            hasTranslationFinal = true
           } else {
-            translatedNonFinalText += token.text
+            incomingNonFinalTokens.push(token)
           }
           continue
         }
@@ -196,19 +203,54 @@ export function applyTranscriptEvent(
             ...token,
             isFinal: true,
           })
+          hasSourceFinal = true
         } else {
-          nonFinalText += token.text
+          incomingNonFinalTokens.push(token)
         }
       }
 
+      const previousSourceNonFinalTokens = (state.nonFinalTokens ?? []).filter(
+        (token) => token.translationStatus !== 'translation',
+      )
+      const previousTranslationNonFinalTokens = (state.nonFinalTokens ?? []).filter(
+        (token) => token.translationStatus === 'translation',
+      )
+      const incomingSourceNonFinalTokens = incomingNonFinalTokens.filter(
+        (token) => token.translationStatus !== 'translation',
+      )
+      const incomingTranslationNonFinalTokens = incomingNonFinalTokens.filter(
+        (token) => token.translationStatus === 'translation',
+      )
+      const sourceWasUpdated = incomingSourceNonFinalTokens.length > 0 || hasSourceFinal
+      const translationWasUpdated = incomingTranslationNonFinalTokens.length > 0 || hasTranslationFinal
+      const nonFinalSourceTokens = incomingSourceNonFinalTokens.length > 0
+        ? incomingSourceNonFinalTokens
+        : hasSourceFinal
+          ? []
+          : previousSourceNonFinalTokens
+      const nonFinalTranslationTokens = incomingTranslationNonFinalTokens.length > 0
+        ? incomingTranslationNonFinalTokens
+        : hasTranslationFinal
+          ? []
+          : previousTranslationNonFinalTokens
+      const nonFinalTokens = [...nonFinalSourceTokens, ...nonFinalTranslationTokens]
+      const nonFinalText = sourceWasUpdated
+        ? nonFinalSourceTokens.map((token) => token.text).join('')
+        : state.nonFinalTranscript
+      const translatedNonFinalText = translationWasUpdated
+        ? nonFinalTranslationTokens.map((token) => token.text).join('')
+        : state.nonFinalTranslatedTranscript
       const tokenText = newFinalTokens.map((token) => token.text).join('')
-      const finalText = state.transcriptPrefix + tokenText
+      const finalText = newFinalTokens.length > 0
+        ? state.transcriptPrefix + tokenText
+        : state.finalTranscript
       const currentTranscript = finalText + nonFinalText
       const currentTranslatedTranscript = translatedFinalText + translatedNonFinalText
 
       return {
         ...state,
         finalTokens: newFinalTokens,
+        nonFinalTokens,
         finalTranscript: finalText,
         nonFinalTranscript: nonFinalText,
         currentTranscript,
@@ -224,6 +266,9 @@ export function applyTranscriptEvent(
       const nonFinalTranscript = event.text
       return {
         ...state,
+        nonFinalTokens: (state.nonFinalTokens ?? []).filter(
+          (token) => token.translationStatus === 'translation',
+        ),
         nonFinalTranscript,
         currentTranscript: state.finalTranscript + nonFinalTranscript,
       }
@@ -231,16 +276,15 @@ export function applyTranscriptEvent(
 
     case 'final-text': {
       if (!event.text) {
-        return {
-          ...state,
-          nonFinalTranscript: '',
-          currentTranscript: state.finalTranscript,
-        }
+        return state
       }
 
       const finalTranscript = state.finalTranscript + event.text
       return {
         ...state,
+        nonFinalTokens: (state.nonFinalTokens ?? []).filter(
+          (token) => token.translationStatus === 'translation',
+        ),
         finalTranscript,
         nonFinalTranscript: '',
         currentTranscript: finalTranscript,
@@ -271,9 +315,47 @@ export function applyTranscriptEvent(
         ...state,
         transcriptPrefix: finalTranscript,
         finalTokens: [],
+        nonFinalTokens: [],
         finalTranscript,
         nonFinalTranscript: '',
         currentTranscript: finalTranscript,
+      }
+    }
+
+    case 'pause-boundary': {
+      if (!event.promoteInterim) {
+        return state
+      }
+
+      const sourceInterimTokens = (state.nonFinalTokens ?? []).filter(
+        (token) => token.translationStatus !== 'translation' && token.text,
+      )
+      const translationInterimTokens = (state.nonFinalTokens ?? []).filter(
+        (token) => token.translationStatus === 'translation' && token.text,
+      )
+      const finalTokens = [
+        ...state.finalTokens,
+        ...sourceInterimTokens.map((token) => ({ ...token, isFinal: true })),
+      ]
+      const finalTranscript = sourceInterimTokens.length > 0
+        ? state.transcriptPrefix + finalTokens.map((token) => token.text).join('')
+        : state.finalTranscript + state.nonFinalTranscript
+      const finalTranslatedTranscript = translationInterimTokens.length > 0
+        ? state.finalTranslatedTranscript + translationInterimTokens.map((token) => token.text).join('')
+        : state.finalTranslatedTranscript + state.nonFinalTranslatedTranscript
+
+      return {
+        ...state,
+        finalTokens,
+        nonFinalTokens: [],
+        finalTranscript,
+        nonFinalTranscript: '',
+        currentTranscript: finalTranscript,
+        finalTranslatedTranscript,
+        nonFinalTranslatedTranscript: '',
+        currentTranslatedTranscript: finalTranslatedTranscript,
+        currentSegments: buildSegmentsFromTokens(finalTokens),
+        currentSpeakers: buildSpeakersFromTokens(finalTokens),
       }
     }
   }

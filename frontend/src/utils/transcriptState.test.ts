@@ -55,6 +55,10 @@ describe('transcriptState', () => {
 
     expect(next.finalTranscript).toBe('Hello ')
     expect(next.nonFinalTranscript).toBe('world')
+    expect(next.nonFinalTokens).toEqual([
+      { text: 'world', isFinal: false },
+      { text: ' le monde', isFinal: false, translationStatus: 'translation' },
+    ])
     expect(next.currentTranscript).toBe('Hello world')
     expect(next.finalTranslatedTranscript).toBe('Bonjour')
     expect(next.nonFinalTranslatedTranscript).toBe(' le monde')
@@ -84,6 +88,161 @@ describe('transcriptState', () => {
     expect(withCommittedFinal.finalTranscript).toBe('Hello world.')
     expect(withCommittedFinal.nonFinalTranscript).toBe('')
     expect(withCommittedFinal.currentTranscript).toBe('Hello world.')
+  })
+
+  it('keeps visible partial text when an empty final payload arrives', () => {
+    const withPartial = applyTranscriptEvent(createEmptyTranscriptRuntimeState(), {
+      type: 'partial-text',
+      text: 'Still visible',
+    })
+
+    const afterEmptyFinal = applyTranscriptEvent(withPartial, {
+      type: 'final-text',
+      text: '',
+    })
+
+    expect(afterEmptyFinal).toEqual(withPartial)
+  })
+
+  it('promotes text-provider interims at a timed-out pause boundary', () => {
+    const withPartial = applyTranscriptEvent(createEmptyTranscriptRuntimeState(), {
+      type: 'partial-text',
+      text: 'Text provider interim',
+    })
+
+    const paused = applyTranscriptEvent(withPartial, {
+      type: 'pause-boundary',
+      promoteInterim: true,
+    })
+
+    expect(paused.finalTranscript).toBe('Text provider interim')
+    expect(paused.nonFinalTranscript).toBe('')
+    expect(paused.currentTranscript).toBe('Text provider interim')
+  })
+
+  it('promotes token and translation interims at a timed-out pause boundary', () => {
+    const withInterims = applyTranscriptEvent(createEmptyTranscriptRuntimeState(), {
+      type: 'tokens',
+      tokens: [
+        { text: 'Hello ', isFinal: true, speaker: 'speaker_1', startMs: 0, endMs: 400 },
+        {
+          text: 'world',
+          isFinal: false,
+          speaker: 'speaker_2',
+          language: 'en',
+          startMs: 400,
+          endMs: 900,
+          confidence: 0.92,
+        },
+        { text: '你好', isFinal: false, translationStatus: 'translation' },
+      ],
+    })
+
+    const paused = applyTranscriptEvent(withInterims, {
+      type: 'pause-boundary',
+      promoteInterim: true,
+    })
+
+    expect(paused.finalTokens).toEqual([
+      { text: 'Hello ', isFinal: true, speaker: 'speaker_1', startMs: 0, endMs: 400 },
+      {
+        text: 'world',
+        isFinal: true,
+        speaker: 'speaker_2',
+        language: 'en',
+        startMs: 400,
+        endMs: 900,
+        confidence: 0.92,
+      },
+    ])
+    expect(paused.finalTranscript).toBe('Hello world')
+    expect(paused.nonFinalTranscript).toBe('')
+    expect(paused.finalTranslatedTranscript).toBe('你好')
+    expect(paused.nonFinalTranslatedTranscript).toBe('')
+    expect(paused.currentSegments).toEqual([
+      {
+        text: 'Hello ',
+        startMs: 0,
+        endMs: 400,
+        speakerId: 'speaker_1',
+        language: undefined,
+        isFinal: true,
+      },
+      {
+        text: 'world',
+        startMs: 400,
+        endMs: 900,
+        speakerId: 'speaker_2',
+        language: 'en',
+        isFinal: true,
+      },
+    ])
+    expect(paused.currentSpeakers).toEqual([
+      { id: 'speaker_1', label: 'speaker_1', displayName: 'speaker_1' },
+      { id: 'speaker_2', label: 'speaker_2', displayName: 'speaker_2' },
+    ])
+  })
+
+  it('preserves translation interims for an empty final translation token', () => {
+    const withTranslationInterim = applyTranscriptEvent(createEmptyTranscriptRuntimeState(), {
+      type: 'tokens',
+      tokens: [{ text: 'Hello', isFinal: false, translationStatus: 'translation' }],
+    })
+
+    const afterEmptyFinal = applyTranscriptEvent(withTranslationInterim, {
+      type: 'tokens',
+      tokens: [{ text: '', isFinal: true, translationStatus: 'translation' }],
+    })
+
+    expect(afterEmptyFinal.nonFinalTranslatedTranscript).toBe('Hello')
+    expect(afterEmptyFinal.currentTranslatedTranscript).toBe('Hello')
+    expect(afterEmptyFinal.nonFinalTokens).toEqual([
+      { text: 'Hello', isFinal: false, translationStatus: 'translation' },
+    ])
+  })
+
+  it('does not duplicate successful token finals and leaves a non-promoting boundary unchanged', () => {
+    let state = applyTranscriptEvent(createEmptyTranscriptRuntimeState(), {
+      type: 'tokens',
+      tokens: [{ text: 'Completed text', isFinal: false, speaker: 'speaker_1' }],
+    })
+    state = applyTranscriptEvent(state, {
+      type: 'tokens',
+      tokens: [{ text: 'Completed text', isFinal: true, speaker: 'speaker_1' }],
+    })
+
+    const afterSuccessfulDrain = applyTranscriptEvent(state, {
+      type: 'pause-boundary',
+      promoteInterim: true,
+    })
+    const nonPromotingBoundary = applyTranscriptEvent(afterSuccessfulDrain, {
+      type: 'pause-boundary',
+    })
+
+    expect(afterSuccessfulDrain.finalTranscript).toBe('Completed text')
+    expect(nonPromotingBoundary).toBe(afterSuccessfulDrain)
+  })
+
+  it('appends each resumed interim once without adding pause markers', () => {
+    let state = createEmptyTranscriptRuntimeState()
+
+    state = applyTranscriptEvent(state, {
+      type: 'tokens',
+      tokens: [{ text: 'First ', isFinal: false, speaker: 'speaker_1', startMs: 0, endMs: 500 }],
+    })
+    state = applyTranscriptEvent(state, { type: 'pause-boundary', promoteInterim: true })
+    state = applyTranscriptEvent(state, {
+      type: 'tokens',
+      tokens: [{ text: 'second.', isFinal: false, speaker: 'speaker_2', startMs: 500, endMs: 1100 }],
+    })
+    state = applyTranscriptEvent(state, { type: 'pause-boundary', promoteInterim: true })
+
+    expect(state.finalTranscript).toBe('First second.')
+    expect(state.currentTranscript).toBe('First second.')
+    expect(state.finalTokens).toHaveLength(2)
+    expect(state.currentSegments).toHaveLength(2)
+    expect(state.finalTranscript).not.toContain('---')
+    expect(state.finalTranscript).not.toContain('pause')
   })
 
   it('preserves text from prior providers after config-change + tokens', () => {

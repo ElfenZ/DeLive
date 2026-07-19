@@ -30,6 +30,7 @@ import { TopicsView } from './components/TopicsView'
 import { TopicPicker } from './components/TopicPicker'
 import { FileTranscriptionView } from './components/FileTranscriptionView'
 import { initStorage } from './utils/storage'
+import { resolveRecordingShortcutAction } from '../../shared/recordingState'
 
 function App() {
   const [showSourcePicker, setShowSourcePicker] = useState(false)
@@ -49,20 +50,9 @@ function App() {
   const { loadTags } = useTagStore()
   const { loadTopics } = useTopicStore()
   const hasCheckedApiKey = useRef(false)
-  const prevRecordingState = useRef(recordingState)
   const [lastFinishedSessionId, setLastFinishedSessionId] = useState<string | null>(null)
   const [whatsNewOpen, setWhatsNewOpen] = useState(false)
   const [whatsNewShowAll, setWhatsNewShowAll] = useState(false)
-
-  useEffect(() => {
-    if (prevRecordingState.current === 'recording' && recordingState === 'idle') {
-      const sessions = useSessionStore.getState().sessions
-      if (sessions.length > 0) {
-        setLastFinishedSessionId(sessions[0].id)
-      }
-    }
-    prevRecordingState.current = recordingState
-  }, [recordingState])
 
   // Toast 管理
   const addToast = useCallback((type: 'success' | 'error' | 'warning', message: string) => {
@@ -81,24 +71,54 @@ function App() {
   useApiIpcResponder()
 
   // ASR — lifted to App so global shortcut can reach it
-  const { startRecording, stopRecording, switchConfig, switchProvider, getMediaStream } = useASR({
+  const {
+    startRecording,
+    pauseRecording,
+    resumeRecording,
+    stopRecording,
+    switchConfig,
+    switchProvider,
+    getMediaStream,
+  } = useASR({
     onError: handleError,
     onWarning: (message) => addToast('warning', message),
     onStarted: () => console.log('[App] Recording started'),
   })
+
+  const handleStopRecording = useCallback(async (): Promise<string | null> => {
+    const sessionId = await stopRecording()
+    if (sessionId) {
+      setLastFinishedSessionId(sessionId)
+    }
+    return sessionId
+  }, [stopRecording])
 
   // Global shortcut: toggle recording from Electron
   useEffect(() => {
     if (!window.electronAPI?.onToggleRecording) return
     return window.electronAPI.onToggleRecording(() => {
       const state = useSessionStore.getState().recordingState
-      if (state === 'idle') {
-        startRecording()
-      } else if (state === 'recording') {
-        stopRecording()
+      const action = resolveRecordingShortcutAction('recording-toggle', state)
+      if (action === 'start') {
+        void startRecording()
+      } else if (action === 'stop') {
+        void handleStopRecording()
       }
     })
-  }, [startRecording, stopRecording])
+  }, [handleStopRecording, startRecording])
+
+  useEffect(() => {
+    if (!window.electronAPI?.onToggleRecordingPause) return
+    return window.electronAPI.onToggleRecordingPause(() => {
+      const state = useSessionStore.getState().recordingState
+      const action = resolveRecordingShortcutAction('pause-toggle', state)
+      if (action === 'pause') {
+        void pauseRecording()
+      } else if (action === 'resume') {
+        void resumeRecording()
+      }
+    })
+  }, [pauseRecording, resumeRecording])
 
   // 初始化加载
   useEffect(() => {
@@ -357,7 +377,15 @@ function App() {
 
               <div className="workspace-panel p-6 animate-reveal-up delay-2 space-y-4">
                 {recordingState === 'idle' && <TopicPicker />}
-                <RecordingControls onError={handleError} startRecording={startRecording} stopRecording={stopRecording} switchConfig={switchConfig} switchProvider={switchProvider} />
+                <RecordingControls
+                  onError={handleError}
+                  startRecording={startRecording}
+                  pauseRecording={pauseRecording}
+                  resumeRecording={resumeRecording}
+                  stopRecording={handleStopRecording}
+                  switchConfig={switchConfig}
+                  switchProvider={switchProvider}
+                />
                 <WaveformVisualizer
                   getStream={getMediaStream}
                   isActive={recordingState === 'recording'}

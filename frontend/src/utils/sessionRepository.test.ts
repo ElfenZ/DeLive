@@ -95,6 +95,27 @@ describe('sessionRepository persistence strategy', () => {
     expect(sessionStorageMock.saveSessions).not.toHaveBeenCalled()
   })
 
+  it('persists effective duration when completing a live session', async () => {
+    const { sessionRepository } = await import('./sessionRepository')
+    sessionRepository.createDraft(makeSession({ id: 'draft-duration' }))
+    await vi.waitFor(() => expect(sessionStorageMock.upsertSession).toHaveBeenCalledTimes(1))
+    sessionStorageMock.upsertSession.mockClear()
+
+    const sessions = sessionRepository.completeSession('draft-duration', {
+      transcript: 'recorded text',
+      duration: 4_250,
+    })
+
+    expect(sessions[0]).toMatchObject({
+      id: 'draft-duration',
+      duration: 4_250,
+      status: 'completed',
+    })
+    await vi.waitFor(() => expect(sessionStorageMock.upsertSession).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'draft-duration', duration: 4_250 }),
+    ))
+  })
+
   it('restores interrupted patch drafts to queued without discarding published output', async () => {
     const draft = {
       runId: 'run-1', revision: 1, trigger: 'manual-quick', mode: 'quick', status: 'running',

@@ -15,6 +15,8 @@ export interface CaptureAudioOptions {
 
 type CapturePipelineCapabilities = Pick<ASRProviderCapabilities, 'audioInputMode' | 'audioProfile'>
 
+const RECORDER_STOP_TIMEOUT_MS = 2_000
+
 function resolvePreferredMimeTypes(profile?: ASRAudioProfileCapabilities): string[] {
   if (profile?.payloadFormat === 'wav') {
     return ['audio/wav', 'audio/webm;codecs=opus', 'audio/webm', 'audio/mp4']
@@ -51,12 +53,19 @@ export class CaptureManager {
   private mediaRecorder: MediaRecorder | null = null
   private audioProcessor: AudioProcessor | null = null
   private mixedAudioContext: AudioContext | null = null
+  private mixedDestinationNode: MediaStreamAudioDestinationNode | null = null
+  private mixedSourceNodes: MediaStreamAudioSourceNode[] = []
   private sourceStreams: MediaStream[] = []
   private sourceTrackEndedCleanup: Array<() => void> = []
   private deviceChangeCleanup: (() => void) | null = null
   private callbacks: CaptureCallbacks | null = null
   private _isRestarting = false
   private captureMode: 'system-audio' | 'microphone' | 'mixed' = 'system-audio'
+  private pipelineGeneration = 0
+  private isCapturePaused = false
+  private sourceInvalid = false
+  private pausePromise: Promise<void> | null = null
+  private deviceChangeTimer: ReturnType<typeof setTimeout> | null = null
 
   async start(
     capabilities: CapturePipelineCapabilities,
@@ -67,6 +76,7 @@ export class CaptureManager {
 
     const stream = await this.requestDisplayAudio(audioOptions)
     this.mediaStream = stream
+    this.sourceInvalid = false
 
     await this.startPipeline(capabilities, stream)
     this.listenDeviceChanges()
@@ -82,6 +92,7 @@ export class CaptureManager {
   async acquireStream(audioOptions: CaptureAudioOptions): Promise<MediaStream> {
     const stream = await this.requestDisplayAudio(audioOptions)
     this.mediaStream = stream
+    this.sourceInvalid = false
     return stream
   }
 
@@ -120,6 +131,7 @@ export class CaptureManager {
     try {
       const stream = await this.requestDisplayAudio(audioOptions)
       this.mediaStream = stream
+      this.sourceInvalid = false
 
       await this.startPipeline(capabilities, stream)
 
@@ -145,6 +157,7 @@ export class CaptureManager {
     try {
       const stream = await this.requestDisplayAudio(audioOptions)
       this.mediaStream = stream
+      this.sourceInvalid = false
       return stream
     } catch (error) {
       this._isRestarting = false
@@ -160,6 +173,8 @@ export class CaptureManager {
     this.removeDeviceListener()
     this.stopPipeline()
     this.stopStream()
+    this.isCapturePaused = false
+    this.sourceInvalid = false
     this.callbacks = null
   }
 
@@ -171,6 +186,96 @@ export class CaptureManager {
   pauseRecorder(): void {
     this.stopPipeline()
     console.log('[CaptureManager] Recorder paused (stream kept alive)')
+  }
+
+  /**
+   * Stops audio delivery while retaining the capture source and its permissions.
+   * WebM recorders are drained before this promise resolves so their final chunk
+   * reaches the current consumer. Subsequent callbacks from that pipeline are
+   * rejected by its generation gate.
+   */
+  async pauseCapture(): Promise<void> {
+    if (this.pausePromise) {
+      return this.pausePromise
+    }
+    if (this.isCapturePaused) {
+      return
+    }
+
+    this.isCapturePaused = true
+    this.cancelPendingDeviceChange()
+    this.pausePromise = this.pauseActivePipeline()
+
+    try {
+      await this.pausePromise
+    } finally {
+      this.pausePromise = null
+    }
+  }
+
+  /**
+   * Restarts the active audio pipeline on the retained stream. Callers must
+   * replace an invalid source before resuming.
+   */
+  async resumeCapture(capabilities: CapturePipelineCapabilities): Promise<void> {
+    if (this.pausePromise) {
+      await this.pausePromise
+    }
+    if (!this.isCapturePaused) {
+      return
+    }
+    if (!this.isRetainedStreamHealthy()) {
+      throw new Error('Retained capture source is unavailable. Acquire a new source before resuming.')
+    }
+
+    const stream = this.mediaStream!
+    try {
+      if (this.mixedAudioContext && this.mixedAudioContext.state !== 'running') {
+        await this.mixedAudioContext.resume()
+      }
+      await this.startPipeline(capabilities, stream)
+      this.isCapturePaused = false
+      console.log('[CaptureManager] Capture resumed with retained stream')
+    } catch (error) {
+      this.stopPipeline()
+      throw error
+    }
+  }
+
+  /**
+   * Returns whether the retained source can be used for resume. Calling this
+   * also records a source invalidation detected without an ended event.
+   */
+  isRetainedStreamHealthy(): boolean {
+    const streams = this.mediaStream ? [this.mediaStream, ...this.sourceStreams] : []
+    const healthy = !this.sourceInvalid
+      && streams.length > 0
+      && streams.every((stream) => stream.getAudioTracks().some((track) => track.readyState !== 'ended'))
+
+    if (!healthy) {
+      this.markSourceInvalid()
+    }
+
+    return healthy
+  }
+
+  get hasInvalidSource(): boolean {
+    return this.sourceInvalid
+  }
+
+  /**
+   * Releases only a source already known to be invalid. This lets the caller
+   * prompt for a replacement while keeping the surrounding recording session
+   * paused. Normal resource release remains owned by stop().
+   */
+  clearInvalidSource(): void {
+    if (!this.sourceInvalid) {
+      return
+    }
+
+    this.stopPipeline()
+    this.clearTrackEndedHandler()
+    this.stopStream()
   }
 
   /**
@@ -198,26 +303,12 @@ export class CaptureManager {
       console.warn('[CaptureManager] No active stream, cannot restart recorder')
       return
     }
-    if (capabilities.audioInputMode === 'pcm16') {
-      console.log('[CaptureManager] PCM16 mode, no need to restart recorder')
-      return
-    }
-
     this.stopPipeline()
-
-    console.log('[CaptureManager] Restarting MediaRecorder for new WebM header')
-    const recorder = createCompatibleMediaRecorder(this.mediaStream, capabilities.audioProfile)
-    this.mediaRecorder = recorder
-    recorder.ondataavailable = (event) => {
-      if (event.data.size > 0) {
-        this.callbacks?.onAudioData(event.data)
-      }
-    }
-    recorder.onerror = (event) => {
-      console.error('[CaptureManager] MediaRecorder error:', event)
-    }
-    recorder.start(capabilities.audioProfile?.preferredChunkMs ?? 100)
-    console.log('[CaptureManager] MediaRecorder restarted')
+    const pipelineName = capabilities.audioInputMode === 'pcm16' ? 'AudioProcessor' : 'MediaRecorder'
+    console.log(`[CaptureManager] Restarting ${pipelineName} for a new pipeline generation`)
+    void this.startPipeline(capabilities, this.mediaStream).catch((error) => {
+      console.error(`[CaptureManager] Failed to restart ${pipelineName}:`, error)
+    })
   }
 
   get currentStream(): MediaStream | null {
@@ -249,14 +340,7 @@ export class CaptureManager {
         if (microphoneStream) {
           this.captureMode = 'microphone'
           this.sourceStreams = [microphoneStream]
-          microphoneStream.getAudioTracks()[0].onended = () => {
-            if (this._isRestarting) {
-              console.log('[CaptureManager] Microphone track ended (ignored: restarting)')
-              return
-            }
-            console.log('[CaptureManager] Microphone track ended')
-            this.callbacks?.onTrackEnded()
-          }
+          microphoneStream.getAudioTracks()[0].onended = () => this.handleCaptureTrackEnded()
           return microphoneStream
         }
       }
@@ -267,14 +351,7 @@ export class CaptureManager {
 
     const systemAudioStream = new MediaStream(audioTracks)
     const audioStream = await this.mixMicrophoneIfAvailable(systemAudioStream, audioOptions)
-    audioStream.getAudioTracks()[0].onended = () => {
-      if (this._isRestarting) {
-        console.log('[CaptureManager] Audio track ended (ignored: restarting)')
-        return
-      }
-      console.log('[CaptureManager] Audio track ended')
-      this.callbacks?.onTrackEnded()
-    }
+    audioStream.getAudioTracks()[0].onended = () => this.handleCaptureTrackEnded()
 
     return audioStream
   }
@@ -325,6 +402,8 @@ export class CaptureManager {
     }
 
     this.mixedAudioContext = audioContext
+    this.mixedDestinationNode = destination
+    this.mixedSourceNodes = [systemSource, microphoneSource]
     this.sourceStreams = [systemAudioStream, microphoneStream]
     this.captureMode = 'mixed'
     const mixedStream = destination.stream
@@ -335,7 +414,10 @@ export class CaptureManager {
 
     this.registerSourceTrackEndedHandlers(
       [...systemAudioStream.getAudioTracks(), ...microphoneStream.getAudioTracks()],
-      stopMixedStream,
+      () => {
+        stopMixedStream()
+        this.handleCaptureTrackEnded()
+      },
     )
 
     return mixedStream
@@ -373,6 +455,7 @@ export class CaptureManager {
     stream: MediaStream,
   ): Promise<void> {
     const { audioInputMode, audioProfile } = capabilities
+    const generation = ++this.pipelineGeneration
 
     if (audioInputMode === 'pcm16') {
       console.log('[CaptureManager] Using AudioProcessor (PCM16)')
@@ -382,8 +465,14 @@ export class CaptureManager {
       })
       this.audioProcessor = processor
       await processor.start(stream, (pcmData) => {
-        this.callbacks?.onAudioData(pcmData)
+        this.deliverAudioData(generation, pcmData)
       })
+      if (generation !== this.pipelineGeneration) {
+        processor.stop()
+        if (this.audioProcessor === processor) {
+          this.audioProcessor = null
+        }
+      }
       return
     }
 
@@ -392,7 +481,7 @@ export class CaptureManager {
     this.mediaRecorder = recorder
     recorder.ondataavailable = (event) => {
       if (event.data.size > 0) {
-        this.callbacks?.onAudioData(event.data)
+        this.deliverAudioData(generation, event.data)
       }
     }
     recorder.onerror = (event) => {
@@ -403,6 +492,7 @@ export class CaptureManager {
   }
 
   private stopPipeline(): void {
+    this.pipelineGeneration += 1
     if (this.audioProcessor) {
       this.audioProcessor.stop()
       this.audioProcessor = null
@@ -414,7 +504,7 @@ export class CaptureManager {
   }
 
   private stopStream(): void {
-    this.clearSourceTrackEndedHandlers()
+    this.clearTrackEndedHandler()
     if (this.mediaStream) {
       this.mediaStream.getTracks().forEach((track) => track.stop())
       this.mediaStream = null
@@ -423,10 +513,18 @@ export class CaptureManager {
       stream.getTracks().forEach((track) => track.stop())
     }
     this.sourceStreams = []
+    for (const sourceNode of this.mixedSourceNodes) {
+      sourceNode.disconnect()
+    }
+    this.mixedSourceNodes = []
+    this.mixedDestinationNode?.disconnect()
+    this.mixedDestinationNode = null
     if (this.mixedAudioContext) {
       void this.mixedAudioContext.close()
       this.mixedAudioContext = null
     }
+    this.sourceInvalid = false
+    this.captureMode = 'system-audio'
   }
 
   private registerSourceTrackEndedHandlers(tracks: MediaStreamTrack[], onEnded: () => void): void {
@@ -447,13 +545,21 @@ export class CaptureManager {
   }
 
   private listenDeviceChanges(): void {
-    let timer: ReturnType<typeof setTimeout> | null = null
+    if (this.deviceChangeCleanup) {
+      return
+    }
+
     const handler = () => {
-      console.log('[CaptureManager] Detected audio device change')
-      if (timer) {
-        clearTimeout(timer)
+      if (this.isCapturePaused) {
+        return
       }
-      timer = setTimeout(() => {
+      console.log('[CaptureManager] Detected audio device change')
+      this.cancelPendingDeviceChange()
+      this.deviceChangeTimer = setTimeout(() => {
+        this.deviceChangeTimer = null
+        if (this.isCapturePaused) {
+          return
+        }
         this.callbacks?.onDeviceChange()
       }, 1500)
     }
@@ -461,9 +567,7 @@ export class CaptureManager {
     navigator.mediaDevices.addEventListener('devicechange', handler)
     this.deviceChangeCleanup = () => {
       navigator.mediaDevices.removeEventListener('devicechange', handler)
-      if (timer) {
-        clearTimeout(timer)
-      }
+      this.cancelPendingDeviceChange()
     }
   }
 
@@ -472,6 +576,81 @@ export class CaptureManager {
       this.deviceChangeCleanup()
       this.deviceChangeCleanup = null
     }
+  }
+
+  private cancelPendingDeviceChange(): void {
+    if (this.deviceChangeTimer) {
+      clearTimeout(this.deviceChangeTimer)
+      this.deviceChangeTimer = null
+    }
+  }
+
+  private deliverAudioData(generation: number, data: Blob | ArrayBuffer): void {
+    if (generation === this.pipelineGeneration) {
+      this.callbacks?.onAudioData(data)
+    }
+  }
+
+  private async pauseActivePipeline(): Promise<void> {
+    const processor = this.audioProcessor
+    const recorder = this.mediaRecorder
+
+    this.audioProcessor = null
+    this.mediaRecorder = null
+    processor?.stop()
+
+    try {
+      if (recorder && recorder.state !== 'inactive') {
+        await this.stopMediaRecorder(recorder)
+      }
+    } finally {
+      // Keep the current generation until the WebM terminal chunk has been
+      // delivered, then reject all late callbacks from the stopped pipeline.
+      this.pipelineGeneration += 1
+    }
+
+    console.log('[CaptureManager] Capture paused (stream and mixer kept alive)')
+  }
+
+  private stopMediaRecorder(recorder: MediaRecorder): Promise<void> {
+    return new Promise((resolve) => {
+      let settled = false
+      let timeout: ReturnType<typeof setTimeout> | null = null
+      const complete = () => {
+        if (settled) {
+          return
+        }
+        settled = true
+        if (timeout) {
+          clearTimeout(timeout)
+        }
+        recorder.removeEventListener('stop', complete)
+        resolve()
+      }
+      timeout = setTimeout(complete, RECORDER_STOP_TIMEOUT_MS)
+
+      recorder.addEventListener('stop', complete)
+      recorder.stop()
+    })
+  }
+
+  private handleCaptureTrackEnded(): void {
+    if (this._isRestarting) {
+      console.log('[CaptureManager] Audio track ended (ignored: restarting)')
+      return
+    }
+    if (this.isCapturePaused) {
+      this.markSourceInvalid()
+      return
+    }
+
+    console.log('[CaptureManager] Audio track ended')
+    this.callbacks?.onTrackEnded()
+  }
+
+  private markSourceInvalid(): void {
+    this.sourceInvalid = true
+    console.log('[CaptureManager] Retained capture source is invalid')
   }
 
   private clearTrackEndedHandler(): void {

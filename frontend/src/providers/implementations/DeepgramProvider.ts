@@ -42,6 +42,9 @@ export class DeepgramProvider extends BaseASRProvider {
       prompting: {
         supportsLanguageHints: true,
       },
+      timestamps: {
+        tokenTimestampOrigin: 'none',
+      },
       workloads: {
         liveCapture: {
           availability: 'implemented',
@@ -135,7 +138,6 @@ export class DeepgramProvider extends BaseASRProvider {
               case 'final':
                 console.log('[DeepgramProvider] 最终结果:', msg.text)
                 this.emitFinal(msg.text || '')
-                this.emitFinished()
                 break
 
               case 'error':
@@ -174,7 +176,7 @@ export class DeepgramProvider extends BaseASRProvider {
       this.ws.send(JSON.stringify({ type: 'audio_end' }))
     }
 
-    await new Promise(resolve => setTimeout(resolve, 500))
+    await this.waitForDisconnectGrace()
 
     if (this.ws) {
       this.ws.close(1000, 'disconnect')

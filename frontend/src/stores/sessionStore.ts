@@ -70,6 +70,15 @@ import {
 import { useSettingsStore } from './settingsStore'
 import { useUIStore } from './uiStore'
 import { generateId } from '../utils/storageUtils'
+import {
+  createRecordingTimeline,
+  finalizeRecordingTimeline,
+  pauseRecordingTimeline,
+  resumeRecordingTimeline,
+  startRecordingTimeline,
+  type RecordingTimeline,
+} from '../utils/recordingTimeline'
+import { canTransitionRecordingState } from '../../../shared/recordingState'
 
 const SESSION_AUTOSAVE_DELAY_MS = 1200
 let sessionAutosaveTimer: ReturnType<typeof setTimeout> | null = null
@@ -118,6 +127,13 @@ function getTranslationTargetLanguage(): string | undefined {
 export interface SessionState {
   recordingState: RecordingState
   setRecordingState: (state: RecordingState) => void
+  transitionRecordingState: (state: RecordingState) => boolean
+  recordingTimeline: RecordingTimeline
+  resetRecordingTimeline: () => void
+  startRecordingTimeline: (nowMs?: number) => void
+  pauseRecordingTimeline: (nowMs?: number) => number
+  resumeRecordingTimeline: (nowMs?: number) => void
+  finalizeRecordingTimeline: (nowMs?: number) => number
 
   transcriptPrefix: string
   currentTranscript: string
@@ -136,8 +152,12 @@ export interface SessionState {
   currentSessionId: string | null
   recoverySession: TranscriptSession | null
   currentCaptureMode: NonNullable<TranscriptSession['sourceMeta']>['captureMode']
+  setCurrentCaptureMode: (captureMode: NonNullable<TranscriptSession['sourceMeta']>['captureMode']) => void
   startNewSession: (options?: { captureMode?: NonNullable<TranscriptSession['sourceMeta']>['captureMode'] }) => string
-  endCurrentSession: (options?: { sourceMetaPatch?: Partial<NonNullable<TranscriptSession['sourceMeta']>> }) => void
+  endCurrentSession: (options?: {
+    sourceMetaPatch?: Partial<NonNullable<TranscriptSession['sourceMeta']>>
+    duration?: number
+  }) => string | null
   restoreRecoverySession: () => void
   dismissRecoverySession: () => void
 
@@ -197,11 +217,13 @@ export interface SessionState {
   revertAllSessionCorrectionPatches: (sessionId: string) => Promise<void>
 
   finalTokens: TranscriptToken[]
+  nonFinalTokens: TranscriptToken[]
 }
 
 export const useSessionStore = create<SessionState>((set, get) => {
   const buildCurrentSessionSnapshot = (overrides?: {
     finalTokens?: TranscriptToken[]
+    nonFinalTokens?: TranscriptToken[]
     finalTranscript?: string
     nonFinalTranscript?: string
     currentTranscript?: string
@@ -210,6 +232,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
     currentTranslatedTranscript?: string
     currentPostProcess?: TranscriptPostProcess
     sourceMetaPatch?: Partial<NonNullable<TranscriptSession['sourceMeta']>>
+    duration?: number
   }) => {
     const state = resolveTranscriptRuntimeState(
       selectTranscriptRuntimeState(get()),
@@ -230,6 +253,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
       captureMode: get().currentCaptureMode || 'system-audio',
       translationTargetLanguage: getTranslationTargetLanguage(),
       captionDisplayMode,
+      duration: overrides?.duration,
     })
 
     return overrides?.sourceMetaPatch
@@ -245,6 +269,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
 
   const syncCurrentSessionInMemory = (overrides?: {
     finalTokens?: TranscriptToken[]
+    nonFinalTokens?: TranscriptToken[]
     finalTranscript?: string
     nonFinalTranscript?: string
     currentTranscript?: string
@@ -884,6 +909,30 @@ export const useSessionStore = create<SessionState>((set, get) => {
   return {
     recordingState: 'idle',
     setRecordingState: (state) => set({ recordingState: state }),
+    transitionRecordingState: (state) => {
+      const current = get().recordingState
+      if (!canTransitionRecordingState(current, state)) return false
+      set({ recordingState: state })
+      return true
+    },
+    recordingTimeline: createRecordingTimeline(),
+    resetRecordingTimeline: () => set({ recordingTimeline: createRecordingTimeline() }),
+    startRecordingTimeline: (nowMs = Date.now()) => {
+      set({ recordingTimeline: startRecordingTimeline(nowMs) })
+    },
+    pauseRecordingTimeline: (nowMs = Date.now()) => {
+      const recordingTimeline = pauseRecordingTimeline(get().recordingTimeline, nowMs)
+      set({ recordingTimeline })
+      return recordingTimeline.accumulatedMs
+    },
+    resumeRecordingTimeline: (nowMs = Date.now()) => {
+      set({ recordingTimeline: resumeRecordingTimeline(get().recordingTimeline, nowMs) })
+    },
+    finalizeRecordingTimeline: (nowMs = Date.now()) => {
+      const recordingTimeline = finalizeRecordingTimeline(get().recordingTimeline, nowMs)
+      set({ recordingTimeline })
+      return recordingTimeline.accumulatedMs
+    },
 
     ...createEmptyTranscriptRuntimeState(),
     applyTranscriptEvent: (event) => {
@@ -894,6 +943,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
 
       const sessions = syncCurrentSessionInMemory({
         finalTokens: nextTranscriptState.finalTokens,
+        nonFinalTokens: nextTranscriptState.nonFinalTokens,
         finalTranscript: nextTranscriptState.finalTranscript,
         nonFinalTranscript: nextTranscriptState.nonFinalTranscript,
         currentTranscript: nextTranscriptState.currentTranscript,
@@ -922,6 +972,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
     currentSessionId: null,
     recoverySession: null,
     currentCaptureMode: 'system-audio',
+    setCurrentCaptureMode: (currentCaptureMode) => set({ currentCaptureMode }),
     startNewSession: (options) => {
       clearSessionAutosaveTimer()
       const now = Date.now()
@@ -953,7 +1004,10 @@ export const useSessionStore = create<SessionState>((set, get) => {
     endCurrentSession: (options) => {
       clearSessionAutosaveTimer()
       const { currentSessionId } = get()
-      const snapshot = buildCurrentSessionSnapshot({ sourceMetaPatch: options?.sourceMetaPatch })
+      const snapshot = buildCurrentSessionSnapshot({
+        sourceMetaPatch: options?.sourceMetaPatch,
+        duration: options?.duration,
+      })
       const hasContent = hasPersistenceSnapshotContent(snapshot)
 
       if (currentSessionId && hasContent) {
@@ -961,6 +1015,8 @@ export const useSessionStore = create<SessionState>((set, get) => {
         set({ sessions })
         void get().maybeStartAutoAiPostProcess(currentSessionId)
         console.log('[SessionStore] 会话已保存, 文本长度:', snapshot.transcript.length)
+        set({ currentSessionId: null, currentCaptureMode: 'system-audio' })
+        return currentSessionId
       } else if (currentSessionId) {
         const sessions = sessionRepository.deleteSession(currentSessionId)
         set({ sessions })
@@ -969,6 +1025,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
         console.log('[SessionStore] 会话未保存: currentSessionId=', currentSessionId)
       }
       set({ currentSessionId: null, currentCaptureMode: 'system-audio' })
+      return null
     },
     restoreRecoverySession: () => {
       const { recoverySession } = get()

@@ -12,11 +12,12 @@ import { useSessionStore } from '../stores/sessionStore'
 import { useTopicStore } from '../stores/topicStore'
 import { CaptureManager, type CaptureAudioOptions } from '../services/captureManager'
 import { CaptionBridge } from '../services/captionBridge'
-import { ProviderSessionManager } from '../services/providerSession'
-import type { ASRVendor } from '../types/asr'
+import { ProviderSessionManager, type ProviderSetup } from '../services/providerSession'
+import type { ASRVendor, ProviderConfig } from '../types/asr'
 import type { ProviderConfigData, TranscriptSourceMeta } from '../types'
 import { buildPcmWavBlob } from '../utils/pcmWav'
 import { AudioProcessor } from '../utils/audioProcessor'
+import { readRecordingElapsedMs } from '../utils/recordingTimeline'
 
 interface UseASROptions {
   onError?: (message: string) => void
@@ -49,7 +50,7 @@ export function useASR(options: UseASROptions = {}) {
   const isRestartingRef = useRef(false)
   const lastRestartTimeRef = useRef(0)
   const selectedVendorRef = useRef<ASRVendor | null>(null)
-  const stopRecordingRef = useRef<() => Promise<void>>(async () => {})
+  const stopRecordingRef = useRef<() => Promise<string | null>>(async () => null)
   const microphoneWarningShownRef = useRef(false)
   const activeCaptureAudioOptionsRef = useRef<CaptureAudioOptions | null>(null)
   const sourceAudioChunksRef = useRef<Array<Blob | ArrayBuffer>>([])
@@ -62,14 +63,53 @@ export function useASR(options: UseASROptions = {}) {
   const sourceAudioPendingChunksRef = useRef<ArrayBuffer[]>([])
   const sourceAudioPendingBytesRef = useRef(0)
   const sourceAudioFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const sourceAudioArchiveGenerationRef = useRef(0)
+  const sourceAudioArchiveFallbackRef = useRef(false)
+  const captureDeliveryEnabledRef = useRef(false)
+  const archiveDeliveryEnabledRef = useRef(false)
+  const lockedProviderRef = useRef<{
+    vendorId: ASRVendor
+    setup: ProviderSetup
+  } | null>(null)
 
   const { settings } = useSettingsStore()
   const {
     applyTranscriptEvent,
     setRecordingState,
+    transitionRecordingState,
+    resetRecordingTimeline,
+    startRecordingTimeline,
+    pauseRecordingTimeline,
+    resumeRecordingTimeline,
+    finalizeRecordingTimeline,
+    setCurrentCaptureMode,
     startNewSession,
     endCurrentSession,
   } = useSessionStore()
+
+  const lockProviderSetup = useCallback((vendorId: ASRVendor, setup: ProviderSetup) => {
+    const connectConfig: ProviderConfig = {
+      ...setup.connectConfig,
+      ...(setup.connectConfig.languageHints
+        ? { languageHints: [...setup.connectConfig.languageHints] }
+        : {}),
+    }
+    lockedProviderRef.current = {
+      vendorId,
+      setup: {
+        ...setup,
+        connectConfig,
+      },
+    }
+  }, [])
+
+  const getConnectionEpochOffset = useCallback(() => {
+    const store = useSessionStore.getState()
+    return Math.max(
+      readRecordingElapsedMs(store.recordingTimeline, Date.now()),
+      providerSessionRef.current.getMaxConfirmedTokenEndMs(),
+    )
+  }, [])
 
   const buildCaptureAudioOptions = useCallback((): CaptureAudioOptions => {
     const captureSettings = settings.capture || {}
@@ -99,6 +139,7 @@ export function useASR(options: UseASROptions = {}) {
   const queueSourceAudioAppend = useCallback((sessionId: string, data: ArrayBuffer) => {
     sourceAudioAppendQueueRef.current = sourceAudioAppendQueueRef.current
       .then(async () => {
+        if (sourceAudioArchiveSessionIdRef.current !== sessionId) return
         const result = await window.electronAPI?.appendRecordingArchive?.({ sessionId, data })
         if (!result?.ok) {
           throw new Error(result?.error || '录音源音频写入失败')
@@ -134,6 +175,9 @@ export function useASR(options: UseASROptions = {}) {
   }, [flushBufferedSourceAudio])
 
   const resetSourceAudioArchive = useCallback(() => {
+    sourceAudioArchiveGenerationRef.current += 1
+    sourceAudioProcessorRef.current?.stop()
+    sourceAudioProcessorRef.current = null
     clearSourceAudioFlushTimer()
     sourceAudioChunksRef.current = []
     sourceAudioMimeTypeRef.current = 'audio/wav'
@@ -141,11 +185,15 @@ export function useASR(options: UseASROptions = {}) {
     sourceAudioArchiveSessionIdRef.current = null
     sourceAudioAppendQueueRef.current = Promise.resolve()
     sourceAudioArchiveFailedRef.current = false
+    sourceAudioArchiveFallbackRef.current = false
+    captureDeliveryEnabledRef.current = false
+    archiveDeliveryEnabledRef.current = false
     sourceAudioPendingChunksRef.current = []
     sourceAudioPendingBytesRef.current = 0
   }, [clearSourceAudioFlushTimer])
 
   const stopSourceAudioArchive = useCallback(() => {
+    sourceAudioArchiveGenerationRef.current += 1
     if (sourceAudioProcessorRef.current) {
       sourceAudioProcessorRef.current.stop()
       sourceAudioProcessorRef.current = null
@@ -154,13 +202,57 @@ export function useASR(options: UseASROptions = {}) {
     sourceAudioArchiveActiveRef.current = false
   }, [clearSourceAudioFlushTimer])
 
+  const pauseSourceAudioArchive = useCallback(async (): Promise<void> => {
+    const sessionId = sourceAudioArchiveSessionIdRef.current
+    stopSourceAudioArchive()
+    if (!sessionId) return
+
+    try {
+      await flushBufferedSourceAudio(sessionId)
+      await sourceAudioAppendQueueRef.current
+    } catch (error) {
+      sourceAudioArchiveFailedRef.current = true
+      console.warn('[useASR] 暂停录音源音频归档时冲刷失败:', error)
+      options.onWarning?.('录音源音频暂停冲刷失败，转录文本已保留')
+    }
+  }, [flushBufferedSourceAudio, options, stopSourceAudioArchive])
+
+  const abortSourceAudioArchive = useCallback(async (): Promise<void> => {
+    const sessionId = sourceAudioArchiveSessionIdRef.current
+    const appendQueue = sourceAudioAppendQueueRef.current
+    stopSourceAudioArchive()
+    sourceAudioPendingChunksRef.current = []
+    sourceAudioPendingBytesRef.current = 0
+    sourceAudioArchiveSessionIdRef.current = null
+    await appendQueue
+    if (sessionId) {
+      try {
+        const result = await window.electronAPI?.abortRecordingArchive?.({ sessionId })
+        if (result && !result.ok) {
+          console.warn('[useASR] 放弃录音源音频归档失败:', result.error)
+        }
+      } catch (error) {
+        console.warn('[useASR] 放弃录音源音频归档失败:', error)
+      }
+    }
+    sourceAudioAppendQueueRef.current = Promise.resolve()
+  }, [stopSourceAudioArchive])
+
   const startSourceAudioArchive = useCallback(async (sessionId: string, stream: MediaStream): Promise<boolean> => {
+    if (sourceAudioArchiveFallbackRef.current) return false
+    if (sourceAudioArchiveActiveRef.current
+      && sourceAudioArchiveSessionIdRef.current === sessionId) {
+      return true
+    }
     stopSourceAudioArchive()
     if (!window.electronAPI?.beginRecordingArchive || !window.electronAPI.appendRecordingArchive) {
+      sourceAudioArchiveFallbackRef.current = true
       return false
     }
 
+    const resumingExistingArchive = sourceAudioArchiveSessionIdRef.current === sessionId
     const processor = new AudioProcessor({ sampleRate: 16000, channels: 1, muted: true })
+    const generation = sourceAudioArchiveGenerationRef.current
 
     try {
       if (sourceAudioArchiveSessionIdRef.current !== sessionId) {
@@ -173,9 +265,20 @@ export function useASR(options: UseASROptions = {}) {
         if (!beginResult.ok) {
           throw new Error(beginResult.error || '录音源音频归档初始化失败')
         }
+        // Set the guard before AudioProcessor.start() awaits AudioWorklet setup.
+        // Resume must append to this run instead of truncating it with begin().
+        sourceAudioArchiveSessionIdRef.current = sessionId
       }
 
+      sourceAudioProcessorRef.current = processor
+      sourceAudioArchiveActiveRef.current = true
       await processor.start(stream, (pcmData) => {
+        if (sourceAudioArchiveGenerationRef.current !== generation
+          || sourceAudioArchiveSessionIdRef.current !== sessionId
+          || !sourceAudioArchiveActiveRef.current
+          || !archiveDeliveryEnabledRef.current) {
+          return
+        }
         const chunk = pcmData.slice(0)
         sourceAudioPendingChunksRef.current.push(chunk)
         sourceAudioPendingBytesRef.current += chunk.byteLength
@@ -185,18 +288,30 @@ export function useASR(options: UseASROptions = {}) {
           scheduleBufferedSourceAudioFlush(sessionId)
         }
       })
+      if (sourceAudioArchiveGenerationRef.current !== generation
+        || sourceAudioArchiveSessionIdRef.current !== sessionId
+        || !sourceAudioArchiveActiveRef.current) {
+        processor.stop()
+        return false
+      }
       sourceAudioProcessorRef.current = processor
       sourceAudioMimeTypeRef.current = 'audio/wav'
       sourceAudioArchiveActiveRef.current = true
-      sourceAudioArchiveSessionIdRef.current = sessionId
       return true
     } catch (error) {
       console.warn('[useASR] 录音源音频 WAV 归档启动失败，回退到 provider 原始格式:', error)
       processor.stop()
-      sourceAudioArchiveActiveRef.current = false
+      if (sourceAudioArchiveGenerationRef.current === generation) {
+        sourceAudioProcessorRef.current = null
+        sourceAudioArchiveActiveRef.current = false
+      }
+      if (!resumingExistingArchive) {
+        await abortSourceAudioArchive()
+        sourceAudioArchiveFallbackRef.current = true
+      }
       return false
     }
-  }, [flushBufferedSourceAudio, scheduleBufferedSourceAudioFlush, stopSourceAudioArchive])
+  }, [abortSourceAudioArchive, flushBufferedSourceAudio, scheduleBufferedSourceAudioFlush, stopSourceAudioArchive])
 
   const appendSourceAudioChunk = useCallback((data: Blob | ArrayBuffer) => {
     if (data instanceof Blob) {
@@ -215,7 +330,9 @@ export function useASR(options: UseASROptions = {}) {
     if (!sessionId) return undefined
     const incrementalSessionId = sourceAudioArchiveSessionIdRef.current
 
-    if (incrementalSessionId && window.electronAPI?.finalizeRecordingArchive) {
+    if (incrementalSessionId
+      && !sourceAudioArchiveFallbackRef.current
+      && window.electronAPI?.finalizeRecordingArchive) {
       try {
         await flushBufferedSourceAudio(incrementalSessionId)
         await sourceAudioAppendQueueRef.current
@@ -224,33 +341,30 @@ export function useASR(options: UseASROptions = {}) {
           fileName: 'source-audio.wav',
         })
 
-        if (!result.ok || !result.path) {
-          options.onWarning?.(result.error || '录音源音频保存失败')
-          return undefined
-        }
+        if (result.ok && result.path) {
+          const captureAudioSource = captureMode === 'mixed'
+            ? 'mixed'
+            : captureMode === 'microphone'
+              ? 'microphone'
+              : 'system'
 
-        const captureAudioSource = captureMode === 'mixed'
-          ? 'mixed'
-          : captureMode === 'microphone'
-            ? 'microphone'
-            : 'system'
+          if (sourceAudioArchiveFailedRef.current) {
+            options.onWarning?.('录音源音频曾发生写入错误，已保存可恢复的部分音频')
+          }
 
-        if (sourceAudioArchiveFailedRef.current) {
-          options.onWarning?.('录音源音频曾发生写入错误，已保存可恢复的部分音频')
+          return {
+            sourceKind: 'recording-audio',
+            audioPath: result.path,
+            audioMimeType: result.mimeType || 'audio/wav',
+            audioFileName: result.fileName || 'source-audio.wav',
+            audioSize: result.size,
+            captureAudioSource,
+          }
         }
-
-        return {
-          sourceKind: 'recording-audio',
-          audioPath: result.path,
-          audioMimeType: result.mimeType || 'audio/wav',
-          audioFileName: result.fileName || 'source-audio.wav',
-          audioSize: result.size,
-          captureAudioSource,
-        }
+        options.onWarning?.(result.error || '录音源音频增量归档失败，正在尝试回退格式')
       } catch (error) {
         console.warn('[useASR] 完成录音源音频归档失败:', error)
-        options.onWarning?.('录音源音频保存失败，转录文本已保留')
-        return undefined
+        options.onWarning?.('录音源音频增量归档失败，正在尝试回退格式')
       }
     }
 
@@ -305,32 +419,93 @@ export function useASR(options: UseASROptions = {}) {
     }
   }, [flushBufferedSourceAudio, options])
 
+  const freezeTranscriptBoundary = useCallback((promoteInterim: boolean) => {
+    const before = useSessionStore.getState()
+    const hasVisibleInterim = Boolean(
+      before.nonFinalTranscript
+      || before.nonFinalTranslatedTranscript
+      || before.nonFinalTokens.length,
+    )
+    applyTranscriptEvent({
+      type: 'pause-boundary',
+      promoteInterim: promoteInterim || hasVisibleInterim,
+    })
+    const state = useSessionStore.getState()
+    captionRef.current.update(
+      state.finalTranscript,
+      '',
+      state.finalTranslatedTranscript,
+      '',
+    )
+  }, [applyTranscriptEvent])
+
   // ── 停止录制 ──────────────────────────────────────
 
-  const stopRecording = useCallback(async () => {
+  const stopRecording = useCallback(async (): Promise<string | null> => {
+    const initialState = useSessionStore.getState().recordingState
+    if (initialState !== 'recording' && initialState !== 'paused') {
+      return null
+    }
+    if (!transitionRecordingState('stopping')) {
+      return null
+    }
+
     console.log('[useASR] 停止录制...')
-    setRecordingState('stopping')
+    const stopStartedAt = Date.now()
+    archiveDeliveryEnabledRef.current = false
     const sessionId = useSessionStore.getState().currentSessionId
     const captureMode = captureRef.current.currentCaptureMode
     let sourceMetaPatch: Partial<TranscriptSourceMeta> | undefined
+    let completedSessionId: string | null = null
 
     try {
-      stopSourceAudioArchive()
-      captureRef.current.stop()
+      if (initialState === 'recording') {
+        await captureRef.current.pauseCapture()
+        captureDeliveryEnabledRef.current = false
+        await pauseSourceAudioArchive()
+        const drainResult = await providerSessionRef.current.drain()
+        freezeTranscriptBoundary(drainResult.status !== 'finished')
+      }
+      const duration = finalizeRecordingTimeline(stopStartedAt)
       sourceMetaPatch = await finalizeSourceAudioArchive(sessionId, captureMode)
+      captureRef.current.stop()
       await providerSessionRef.current.disconnect()
+      completedSessionId = endCurrentSession({ sourceMetaPatch, duration })
     } finally {
+      captureRef.current.stop()
+      await providerSessionRef.current.disconnect()
       captionRef.current.clear()
       microphoneWarningShownRef.current = false
       activeCaptureAudioOptionsRef.current = null
 
       selectedVendorRef.current = null
-      endCurrentSession({ sourceMetaPatch })
+      lockedProviderRef.current = null
+      if (useSessionStore.getState().currentSessionId) {
+        const duration = finalizeRecordingTimeline(stopStartedAt)
+        completedSessionId = endCurrentSession({ sourceMetaPatch, duration })
+      }
+      if (!completedSessionId) {
+        await abortSourceAudioArchive()
+      }
       resetSourceAudioArchive()
-      setRecordingState('idle')
+      providerSessionRef.current.resetTimestampTracking()
+      if (!transitionRecordingState('idle')) {
+        setRecordingState('idle')
+      }
       console.log('[useASR] 录制已停止')
     }
-  }, [setRecordingState, finalizeSourceAudioArchive, endCurrentSession, resetSourceAudioArchive, stopSourceAudioArchive])
+    return completedSessionId
+  }, [
+    endCurrentSession,
+    abortSourceAudioArchive,
+    finalizeRecordingTimeline,
+    finalizeSourceAudioArchive,
+    freezeTranscriptBoundary,
+    pauseSourceAudioArchive,
+    resetSourceAudioArchive,
+    setRecordingState,
+    transitionRecordingState,
+  ])
 
   stopRecordingRef.current = stopRecording
 
@@ -386,18 +561,148 @@ export function useASR(options: UseASROptions = {}) {
 
     onError(error: import('../types/asr').ASRError) {
       const currentState = useSessionStore.getState().recordingState
-      if (currentState === 'switching') {
-        console.warn('[useASR] 配置切换中收到 Provider 错误（忽略）:', error.code, error.message)
+      if (currentState === 'switching'
+        || currentState === 'pausing'
+        || currentState === 'paused'
+        || currentState === 'resuming'
+        || currentState === 'stopping') {
+        console.warn('[useASR] 生命周期切换中收到 Provider 错误（忽略）:', error.code, error.message)
         return
       }
       options.onError?.(`${error.code}: ${error.message}`)
-      void stopRecordingRef.current()
+      if (currentState === 'recording') {
+        void stopRecordingRef.current()
+      }
     },
 
     onFinished() {
       options.onFinished?.()
     },
   }), [applyTranscriptEvent, options])
+
+  const pauseRecording = useCallback(async (): Promise<void> => {
+    if (!transitionRecordingState('pausing')) return
+
+    const pauseStartedAt = Date.now()
+    archiveDeliveryEnabledRef.current = false
+    console.log('[useASR] 暂停录制...')
+    try {
+      await captureRef.current.pauseCapture()
+      captureDeliveryEnabledRef.current = false
+      await pauseSourceAudioArchive()
+      const drainResult = await providerSessionRef.current.drain()
+      freezeTranscriptBoundary(drainResult.status !== 'finished')
+      pauseRecordingTimeline(pauseStartedAt)
+      if (!transitionRecordingState('paused')) {
+        setRecordingState('paused')
+      }
+      console.log('[useASR] 录制已暂停')
+    } catch (error) {
+      console.warn('[useASR] 暂停录制时发生错误，保留已捕获内容:', error)
+      captureDeliveryEnabledRef.current = false
+      archiveDeliveryEnabledRef.current = false
+      await pauseSourceAudioArchive()
+      await providerSessionRef.current.disconnect()
+      freezeTranscriptBoundary(true)
+      pauseRecordingTimeline(pauseStartedAt)
+      setRecordingState('paused')
+      options.onWarning?.('暂停收尾未完整完成，当前可见文本和录音已保留')
+    }
+  }, [
+    freezeTranscriptBoundary,
+    options,
+    pauseRecordingTimeline,
+    pauseSourceAudioArchive,
+    setRecordingState,
+    transitionRecordingState,
+  ])
+
+  const resumeRecording = useCallback(async (): Promise<void> => {
+    if (!transitionRecordingState('resuming')) return
+    captureDeliveryEnabledRef.current = false
+    archiveDeliveryEnabledRef.current = false
+
+    const locked = lockedProviderRef.current
+    const sessionId = useSessionStore.getState().currentSessionId
+    if (!locked || !sessionId) {
+      setRecordingState('paused')
+      options.onError?.('无法恢复录制：录制会话信息已失效')
+      return
+    }
+
+    const capture = captureRef.current
+    let providerConnected = false
+    try {
+      if (!capture.isRetainedStreamHealthy()) {
+        options.onWarning?.(useUIStore.getState().t.recording.sourceUnavailable)
+        capture.clearInvalidSource()
+        await window.electronAPI?.prepareSourceCapture?.('prompt')
+        const audioOptions = activeCaptureAudioOptionsRef.current || buildCaptureAudioOptions()
+        await capture.acquireStream(audioOptions)
+        setCurrentCaptureMode(capture.currentCaptureMode)
+      }
+
+      const epochOffsetMs = getConnectionEpochOffset()
+      await providerSessionRef.current.connect(
+        locked.vendorId,
+        locked.setup.connectConfig,
+        buildProviderCallbacks(),
+        { epochOffsetMs },
+      )
+      providerConnected = true
+
+      const stream = capture.currentStream
+      if (!stream) throw new Error('录制源不可用')
+      const requiresIncrementalArchive = sourceAudioArchiveSessionIdRef.current === sessionId
+        && !sourceAudioArchiveFallbackRef.current
+      const archiveStarted = await startSourceAudioArchive(sessionId, stream)
+      if (requiresIncrementalArchive && !archiveStarted) {
+        throw new Error('录音源音频归档恢复失败')
+      }
+      await capture.resumeCapture(locked.setup.providerInfo.capabilities)
+
+      resumeRecordingTimeline(Date.now())
+      captureDeliveryEnabledRef.current = true
+      archiveDeliveryEnabledRef.current = true
+      if (!transitionRecordingState('recording')) {
+        setRecordingState('recording')
+      }
+      console.log('[useASR] 录制已恢复')
+    } catch (error) {
+      console.warn('[useASR] 恢复录制失败:', error)
+      captureDeliveryEnabledRef.current = false
+      archiveDeliveryEnabledRef.current = false
+      try {
+        await capture.pauseCapture()
+      } catch {
+        // The capture may still be fully paused from before this resume attempt.
+      }
+      await pauseSourceAudioArchive()
+      if (providerConnected || providerSessionRef.current.currentProvider) {
+        await providerSessionRef.current.disconnect()
+      }
+      setRecordingState('paused')
+      const t = useUIStore.getState().t
+      const cancelled = error instanceof Error
+        && (error.name === 'NotAllowedError' || error.name === 'AbortError')
+      if (cancelled) {
+        options.onWarning?.(t.recording.resumeCancelled)
+      } else {
+        options.onError?.(t.recording.resumeFailed)
+      }
+    }
+  }, [
+    buildCaptureAudioOptions,
+    buildProviderCallbacks,
+    getConnectionEpochOffset,
+    options,
+    pauseSourceAudioArchive,
+    resumeRecordingTimeline,
+    setCurrentCaptureMode,
+    setRecordingState,
+    startSourceAudioArchive,
+    transitionRecordingState,
+  ])
 
   // ── 设备变化后自动重启采集 ─────────────────────────
 
@@ -407,6 +712,7 @@ export function useASR(options: UseASROptions = {}) {
     if (now - lastRestartTimeRef.current < 10_000) return
     const vendorId = selectedVendorRef.current
     if (!vendorId) return
+    if (!transitionRecordingState('switching')) return
 
     console.log('[useASR] 音频设备变化，自动重新采集')
     isRestartingRef.current = true
@@ -419,67 +725,91 @@ export function useASR(options: UseASROptions = {}) {
       const capture = captureRef.current
       const audioOptions = activeCaptureAudioOptionsRef.current || buildCaptureAudioOptions()
 
-      await window.electronAPI?.prepareSourceCapture?.('reuse-if-available')
-      stopSourceAudioArchive()
-
+      archiveDeliveryEnabledRef.current = false
+      await capture.pauseCapture()
+      captureDeliveryEnabledRef.current = false
+      await pauseSourceAudioArchive()
       if (needReconnect) {
-        // WebM 流 provider（Soniox）：必须先获取新 stream，再 connect，最后启动 recorder
-        // 确保新 WebSocket 接收到完整的 WebM 文件头
-        await psm.disconnect()
+        const drainResult = await psm.drain()
+        freezeTranscriptBoundary(drainResult.status !== 'finished')
+      }
+      await window.electronAPI?.prepareSourceCapture?.('reuse-if-available')
 
-        const stream = await capture.restartStreamOnly(audioOptions)
-        const sessionId = useSessionStore.getState().currentSessionId
-        if (sessionId) await startSourceAudioArchive(sessionId, stream)
-
-        await psm.connect(vendorId, setup.connectConfig, buildProviderCallbacks())
-
-        capture.restartRecorder(setup.providerInfo.capabilities)
-        capture.finishRestart()
-
-        stream.getAudioTracks()[0].onended = () => {
-          if (capture.isRestarting) return
-          console.log('[useASR] 音频轨道结束（用户停止共享）')
-          void stopRecordingRef.current()
-        }
-      } else {
-        const stream = await capture.restartPipeline(
-          setup.providerInfo.capabilities,
-          audioOptions,
+      const stream = await capture.restartStreamOnly(audioOptions)
+      setCurrentCaptureMode(capture.currentCaptureMode)
+      const sessionId = useSessionStore.getState().currentSessionId
+      if (needReconnect) {
+        await psm.connect(
+          vendorId,
+          setup.connectConfig,
+          buildProviderCallbacks(),
+          { epochOffsetMs: getConnectionEpochOffset() },
         )
-        const sessionId = useSessionStore.getState().currentSessionId
-        if (sessionId) await startSourceAudioArchive(sessionId, stream)
-
-        if (!psm.currentProvider) {
-          await psm.connect(vendorId, setup.connectConfig, buildProviderCallbacks())
-        }
-
-        stream.getAudioTracks()[0].onended = () => {
-          if (capture.isRestarting) return
-          console.log('[useASR] 音频轨道结束（用户停止共享）')
-          void stopRecordingRef.current()
+      } else if (!psm.currentProvider) {
+        await psm.connect(vendorId, setup.connectConfig, buildProviderCallbacks())
+      }
+      if (sessionId) {
+        const requiresIncrementalArchive = sourceAudioArchiveSessionIdRef.current === sessionId
+          && !sourceAudioArchiveFallbackRef.current
+        const archiveStarted = await startSourceAudioArchive(sessionId, stream)
+        if (requiresIncrementalArchive && !archiveStarted) {
+          throw new Error('录音源音频归档重启失败')
         }
       }
+      await capture.resumeCapture(setup.providerInfo.capabilities)
+      capture.finishRestart()
+      captureDeliveryEnabledRef.current = true
+      archiveDeliveryEnabledRef.current = true
+      if (!transitionRecordingState('recording')) setRecordingState('recording')
 
       console.log('[useASR] 音频重新采集成功')
     } catch (error) {
       console.error('[useASR] 音频重新采集失败:', error)
+      transitionRecordingState('stopping')
       captureRef.current.finishRestart()
-      stopSourceAudioArchive()
+      await pauseSourceAudioArchive()
+      const sessionId = useSessionStore.getState().currentSessionId
+      const captureMode = captureRef.current.currentCaptureMode
       captureRef.current.stop()
       await providerSessionRef.current.disconnect()
-      endCurrentSession()
+      const sourceMetaPatch = await finalizeSourceAudioArchive(sessionId, captureMode)
+      const duration = finalizeRecordingTimeline(Date.now())
+      endCurrentSession({ sourceMetaPatch, duration })
+      resetSourceAudioArchive()
+      selectedVendorRef.current = null
+      lockedProviderRef.current = null
+      providerSessionRef.current.resetTimestampTracking()
       activeCaptureAudioOptionsRef.current = null
       microphoneWarningShownRef.current = false
-      setRecordingState('idle')
+      if (!transitionRecordingState('idle')) setRecordingState('idle')
       options.onError?.('音频设备切换后重新捕获失败，录制已停止')
     } finally {
       isRestartingRef.current = false
     }
-  }, [settings, buildCaptureAudioOptions, buildProviderCallbacks, endCurrentSession, setRecordingState, options, startSourceAudioArchive, stopSourceAudioArchive])
+  }, [
+    settings,
+    buildCaptureAudioOptions,
+    buildProviderCallbacks,
+    endCurrentSession,
+    finalizeRecordingTimeline,
+    finalizeSourceAudioArchive,
+    freezeTranscriptBoundary,
+    getConnectionEpochOffset,
+    options,
+    pauseSourceAudioArchive,
+    resetSourceAudioArchive,
+    setCurrentCaptureMode,
+    setRecordingState,
+    startSourceAudioArchive,
+    transitionRecordingState,
+  ])
 
   // ── 开始录制 ──────────────────────────────────────
 
   const startRecording = useCallback(async () => {
+    if (!transitionRecordingState('starting')) return
+    resetRecordingTimeline()
+
     const vendorId = (settings.currentVendor || 'soniox') as ASRVendor
     const psm = providerSessionRef.current
 
@@ -487,12 +817,14 @@ export function useASR(options: UseASROptions = {}) {
     try {
       setup = psm.resolveSetup(vendorId, settings)
     } catch (e) {
+      transitionRecordingState('idle')
       options.onError?.((e as Error).message)
       return
     }
 
     captionRef.current.clear()
     resetSourceAudioArchive()
+    psm.resetTimestampTracking()
     console.log(
       `[useASR] 开始录制，提供商: ${vendorId}, transport=${setup.providerInfo.capabilities.transport.type}`,
     )
@@ -506,12 +838,11 @@ export function useASR(options: UseASROptions = {}) {
     // user is choosing a desktop source.
     let acquiredStream: MediaStream
     try {
-      setRecordingState('starting')
       await window.electronAPI?.prepareSourceCapture?.('prompt')
       acquiredStream = await capture.acquireStream(audioOptions)
     } catch (error) {
       stopSourceAudioArchive()
-      setRecordingState('idle')
+      if (!transitionRecordingState('idle')) setRecordingState('idle')
       if (error instanceof Error) {
         options.onError?.(
           error.name === 'NotAllowedError' ? '用户取消了屏幕共享' : error.message,
@@ -523,19 +854,21 @@ export function useASR(options: UseASROptions = {}) {
       return
     }
 
-    // Phase 2: Create the session/archive before starting the audio pipeline.
+    // Phase 2: Prepare archive output behind a closed gate, connect the
+    // provider, start capture, then open both gates at the timeline boundary.
     let sessionId: string | null = null
     try {
       sessionId = startNewSession({ captureMode: capture.currentCaptureMode })
       await startSourceAudioArchive(sessionId, acquiredStream)
 
       const providerCallbacks = buildProviderCallbacks()
-      await psm.connect(vendorId, setup.connectConfig, providerCallbacks)
+      await psm.connect(vendorId, setup.connectConfig, providerCallbacks, { epochOffsetMs: 0 })
 
       await capture.startWithStream(
         setup.providerInfo.capabilities,
         {
           onAudioData: (data) => {
+            if (!captureDeliveryEnabledRef.current) return
             if (!sourceAudioArchiveActiveRef.current) {
               appendSourceAudioChunk(data)
             }
@@ -557,25 +890,34 @@ export function useASR(options: UseASROptions = {}) {
         },
       )
 
+      selectedVendorRef.current = vendorId
+      lockProviderSetup(vendorId, setup)
+      startRecordingTimeline(Date.now())
+      captureDeliveryEnabledRef.current = true
+      archiveDeliveryEnabledRef.current = true
+      if (!transitionRecordingState('recording')) setRecordingState('recording')
+
       const activeTopicId = useTopicStore.getState().activeTopicId
       if (activeTopicId) {
         const sid = useSessionStore.getState().currentSessionId
         if (sid) useSessionStore.getState().updateSessionTopic(sid, activeTopicId)
       }
 
-      selectedVendorRef.current = vendorId
-      setRecordingState('recording')
       options.onStarted?.()
       console.log('[useASR] 录制已开始')
     } catch (error) {
       console.error('[useASR] 启动失败:', error)
-      stopSourceAudioArchive()
+      await abortSourceAudioArchive()
       capture.stop()
       await providerSessionRef.current.disconnect()
       if (useSessionStore.getState().currentSessionId) {
-        endCurrentSession()
+        endCurrentSession({ duration: finalizeRecordingTimeline(Date.now()) })
       }
-      setRecordingState('idle')
+      resetSourceAudioArchive()
+      lockedProviderRef.current = null
+      selectedVendorRef.current = null
+      psm.resetTimestampTracking()
+      if (!transitionRecordingState('idle')) setRecordingState('idle')
 
       if (error instanceof Error) {
         options.onError?.(error.message)
@@ -587,13 +929,19 @@ export function useASR(options: UseASROptions = {}) {
   }, [
     settings,
     setRecordingState,
+    transitionRecordingState,
+    startRecordingTimeline,
+    finalizeRecordingTimeline,
     startNewSession,
     endCurrentSession,
     options,
     buildCaptureAudioOptions,
     buildProviderCallbacks,
     appendSourceAudioChunk,
+    abortSourceAudioArchive,
+    lockProviderSetup,
     resetSourceAudioArchive,
+    resetRecordingTimeline,
     restartCapture,
     startSourceAudioArchive,
     stopSourceAudioArchive,
@@ -608,7 +956,7 @@ export function useASR(options: UseASROptions = {}) {
     const previousConfig = useSettingsStore.getState().settings.providerConfigs?.[vendorId]
 
     try {
-      setRecordingState('switching')
+      if (!transitionRecordingState('switching')) return
 
       useSettingsStore.getState().updateProviderConfig(vendorId, configPatch)
 
@@ -616,17 +964,20 @@ export function useASR(options: UseASROptions = {}) {
       const psm = providerSessionRef.current
       const setup = psm.resolveSetup(vendorId, newSettings)
 
+      await captureRef.current.pauseCapture()
+      const drainResult = await psm.drain()
+      freezeTranscriptBoundary(drainResult.status !== 'finished')
       applyTranscriptEvent({ type: 'config-change', description: changeDescription })
+      await psm.connect(
+        vendorId,
+        setup.connectConfig,
+        buildProviderCallbacks(),
+        { epochOffsetMs: getConnectionEpochOffset() },
+      )
+      await captureRef.current.resumeCapture(setup.providerInfo.capabilities)
+      lockProviderSetup(vendorId, setup)
 
-      // 关键：先停止 MediaRecorder 的数据产出，防止旧数据（无 WebM 头）被发到新连接
-      captureRef.current.pauseRecorder()
-
-      await psm.reconnect(vendorId, setup.connectConfig, buildProviderCallbacks())
-
-      // reconnect 完成后再重启 MediaRecorder，生成新的 WebM 文件头
-      captureRef.current.restartRecorder(setup.providerInfo.capabilities)
-
-      setRecordingState('recording')
+      if (!transitionRecordingState('recording')) setRecordingState('recording')
       console.log('[useASR] 配置热切换成功:', changeDescription)
     } catch (error) {
       console.error('[useASR] 配置热切换失败:', error)
@@ -640,24 +991,52 @@ export function useASR(options: UseASROptions = {}) {
         const psm = providerSessionRef.current
         const fallbackSetup = psm.resolveSetup(vendorId, fallbackSettings)
 
-        captureRef.current.pauseRecorder()
-        await psm.reconnect(vendorId, fallbackSetup.connectConfig, buildProviderCallbacks())
-        captureRef.current.restartRecorder(fallbackSetup.providerInfo.capabilities)
+        await captureRef.current.pauseCapture()
+        await psm.disconnect()
+        await psm.connect(
+          vendorId,
+          fallbackSetup.connectConfig,
+          buildProviderCallbacks(),
+          { epochOffsetMs: getConnectionEpochOffset() },
+        )
+        await captureRef.current.resumeCapture(fallbackSetup.providerInfo.capabilities)
+        lockProviderSetup(vendorId, fallbackSetup)
 
-        setRecordingState('recording')
+        if (!transitionRecordingState('recording')) setRecordingState('recording')
         options.onError?.('配置切换失败，已恢复之前的配置')
       } catch {
-        stopSourceAudioArchive()
+        await pauseSourceAudioArchive()
+        const sessionId = useSessionStore.getState().currentSessionId
+        const captureMode = captureRef.current.currentCaptureMode
         captureRef.current.stop()
         await providerSessionRef.current.disconnect()
-        endCurrentSession()
+        const duration = finalizeRecordingTimeline(Date.now())
+        const sourceMetaPatch = await finalizeSourceAudioArchive(sessionId, captureMode)
+        endCurrentSession({ sourceMetaPatch, duration })
+        resetSourceAudioArchive()
+        selectedVendorRef.current = null
+        lockedProviderRef.current = null
         activeCaptureAudioOptionsRef.current = null
         microphoneWarningShownRef.current = false
-        setRecordingState('idle')
+        if (!transitionRecordingState('idle')) setRecordingState('idle')
         options.onError?.('配置切换失败且无法恢复，录制已停止')
       }
     }
-  }, [setRecordingState, endCurrentSession, applyTranscriptEvent, buildProviderCallbacks, options, stopSourceAudioArchive])
+  }, [
+    applyTranscriptEvent,
+    buildProviderCallbacks,
+    endCurrentSession,
+    finalizeRecordingTimeline,
+    finalizeSourceAudioArchive,
+    freezeTranscriptBoundary,
+    getConnectionEpochOffset,
+    lockProviderSetup,
+    options,
+    pauseSourceAudioArchive,
+    resetSourceAudioArchive,
+    setRecordingState,
+    transitionRecordingState,
+  ])
 
   const switchProvider = useCallback(async (newVendorId: ASRVendor) => {
     const oldVendorId = selectedVendorRef.current
@@ -676,25 +1055,31 @@ export function useASR(options: UseASROptions = {}) {
     }
 
     try {
-      setRecordingState('switching')
+      if (!transitionRecordingState('switching')) return
 
       const oldName = oldVendorId
       const newName = newVendorId
+      await captureRef.current.pauseCapture()
+      const drainResult = await psm.drain()
+      freezeTranscriptBoundary(drainResult.status !== 'finished')
       applyTranscriptEvent({
         type: 'config-change',
         description: `Provider: ${oldName} → ${newName}`,
       })
+      await psm.connect(
+        newVendorId,
+        newSetup.connectConfig,
+        buildProviderCallbacks(),
+        { epochOffsetMs: getConnectionEpochOffset() },
+      )
 
-      captureRef.current.pauseRecorder()
-
-      await psm.reconnect(newVendorId, newSetup.connectConfig, buildProviderCallbacks())
-
-      await captureRef.current.switchPipeline(newSetup.providerInfo.capabilities)
+      await captureRef.current.resumeCapture(newSetup.providerInfo.capabilities)
 
       useSettingsStore.getState().setCurrentVendor(newVendorId)
       selectedVendorRef.current = newVendorId
+      lockProviderSetup(newVendorId, newSetup)
 
-      setRecordingState('recording')
+      if (!transitionRecordingState('recording')) setRecordingState('recording')
       console.log(`[useASR] Provider 热切换成功: ${oldName} → ${newName}`)
     } catch (error) {
       console.error('[useASR] Provider 热切换失败:', error)
@@ -703,31 +1088,61 @@ export function useASR(options: UseASROptions = {}) {
         const fallbackSettings = useSettingsStore.getState().settings
         const fallbackSetup = psm.resolveSetup(oldVendorId, fallbackSettings)
 
-        captureRef.current.pauseRecorder()
-        await psm.reconnect(oldVendorId, fallbackSetup.connectConfig, buildProviderCallbacks())
-        await captureRef.current.switchPipeline(fallbackSetup.providerInfo.capabilities)
+        await captureRef.current.pauseCapture()
+        await psm.disconnect()
+        await psm.connect(
+          oldVendorId,
+          fallbackSetup.connectConfig,
+          buildProviderCallbacks(),
+          { epochOffsetMs: getConnectionEpochOffset() },
+        )
+        await captureRef.current.resumeCapture(fallbackSetup.providerInfo.capabilities)
 
         selectedVendorRef.current = oldVendorId
-        setRecordingState('recording')
+        lockProviderSetup(oldVendorId, fallbackSetup)
+        if (!transitionRecordingState('recording')) setRecordingState('recording')
         options.onError?.('Provider 切换失败，已恢复之前的配置')
       } catch {
-        stopSourceAudioArchive()
+        await pauseSourceAudioArchive()
+        const sessionId = useSessionStore.getState().currentSessionId
+        const captureMode = captureRef.current.currentCaptureMode
         captureRef.current.stop()
         await providerSessionRef.current.disconnect()
-        endCurrentSession()
+        const duration = finalizeRecordingTimeline(Date.now())
+        const sourceMetaPatch = await finalizeSourceAudioArchive(sessionId, captureMode)
+        endCurrentSession({ sourceMetaPatch, duration })
+        resetSourceAudioArchive()
+        selectedVendorRef.current = null
+        lockedProviderRef.current = null
         activeCaptureAudioOptionsRef.current = null
         microphoneWarningShownRef.current = false
-        setRecordingState('idle')
+        if (!transitionRecordingState('idle')) setRecordingState('idle')
         options.onError?.('Provider 切换失败且无法恢复，录制已停止')
       }
     }
-  }, [setRecordingState, endCurrentSession, applyTranscriptEvent, buildProviderCallbacks, options, stopSourceAudioArchive])
+  }, [
+    applyTranscriptEvent,
+    buildProviderCallbacks,
+    endCurrentSession,
+    finalizeRecordingTimeline,
+    finalizeSourceAudioArchive,
+    freezeTranscriptBoundary,
+    getConnectionEpochOffset,
+    lockProviderSetup,
+    options,
+    pauseSourceAudioArchive,
+    resetSourceAudioArchive,
+    setRecordingState,
+    transitionRecordingState,
+  ])
 
   const getMediaStream = useCallback(() => captureRef.current.currentStream, [])
 
   return {
     startRecording,
     stopRecording,
+    pauseRecording,
+    resumeRecording,
     switchConfig,
     switchProvider,
     getMediaStream,

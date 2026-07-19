@@ -259,6 +259,7 @@ export const sessionRepository = {
     const now = Date.now()
     const sessions = updateSessionCollection(getCachedSessions(), sessionId, {
       transcript: snapshot.transcript,
+      duration: snapshot.duration,
       tokens: snapshot.tokens,
       providerId: snapshot.providerId,
       speakers: snapshot.speakers,
@@ -277,6 +278,7 @@ export const sessionRepository = {
     const now = Date.now()
     const sessions = updateSessionCollection(getCachedSessions(), sessionId, {
       transcript: snapshot.transcript,
+      duration: snapshot.duration,
       tokens: snapshot.tokens,
       providerId: snapshot.providerId,
       speakers: snapshot.speakers,

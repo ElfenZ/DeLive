@@ -39,6 +39,9 @@ export class CloudflareProvider extends WindowedBatchTranscriptionProvider<Array
       prompting: {
         supportsLanguageHints: true,
       },
+      timestamps: {
+        tokenTimestampOrigin: 'none',
+      },
       workloads: {
         liveCapture: {
           availability: 'implemented',

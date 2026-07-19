@@ -6,7 +6,19 @@ import type {
   SessionDetail,
   ApiRecordingStatus,
 } from '../../../shared/electronApi'
+import type { RecordingState } from '../../../shared/recordingState'
 import type { TranscriptSession } from '../types'
+
+export function projectApiRecordingStatus(
+  recordingState: RecordingState,
+  currentSessionId: string | null,
+): ApiRecordingStatus {
+  return {
+    isRecording: recordingState === 'recording',
+    currentSessionId,
+    recordingState,
+  }
+}
 
 export function toSessionSummary(session: TranscriptSession): SessionSummary {
   return {
@@ -171,12 +183,7 @@ export function useApiIpcResponder(): void {
     cleanups.push(
       api.onApiGetRecordingStatus(() => {
         const { recordingState, currentSessionId } = useSessionStore.getState()
-        const status: ApiRecordingStatus = {
-          isRecording: recordingState === 'recording',
-          currentSessionId,
-          recordingState,
-        }
-        api.apiRespondRecordingStatus(status)
+        api.apiRespondRecordingStatus(projectApiRecordingStatus(recordingState, currentSessionId))
       }),
     )
 
