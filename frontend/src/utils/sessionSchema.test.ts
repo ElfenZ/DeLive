@@ -173,7 +173,7 @@ describe('sessionSchema', () => {
           baseTranscriptHash: 'hash', requestedAt: 1, updatedAt: 2,
           config: {
             model: 'm', baseUrl: 'http://localhost/v1', promptLanguage: 'zh', promptVersion: 'patch-v1', schemaVersion: '1',
-            structuredOutput: 'prompt-json', temperature: 0.1, glossary: [], chunkSize: 4000, contextSize: 500,
+            structuredOutput: 'prompt-json', temperature: 0.1, glossary: [], background: '', correctionGuidance: '', chunkSize: 4000, contextSize: 500,
             concurrency: 1, safetyLimits: { maxPatchTextLength: 1000, maxPatchesPerShard: 100, maxCumulativeEditRatio: 0.2, maxNetLengthChangeRatio: 0.1 },
             credentialRef: 'ai-post-process',
           },
@@ -232,7 +232,7 @@ describe('sessionSchema', () => {
         updatedAt: 20,
       },
     })
-    expect(normalized.schemaVersion).toBe(5)
+    expect(normalized.schemaVersion).toBe(6)
     expect(normalized.autoPostProcessWorkflow).toEqual({
       version: 1,
       status: 'waiting-review',
@@ -272,5 +272,48 @@ describe('sessionSchema', () => {
       },
     })
     expect(invalidCombination.autoPostProcessWorkflow).toBeUndefined()
+  })
+
+  it('round-trips credential-free meeting and Soniox recognition snapshots', () => {
+    const normalized = normalizeTranscriptSession({
+      id: 'context-session', title: 'Context', date: '2026-07-19', time: '10:00',
+      createdAt: 1, updatedAt: 2, transcript: 'content',
+      meetingContext: {
+        schemaVersion: 1,
+        background: 'Developer meeting',
+        correctionGuidance: 'Keep DeLive case',
+        useForAiCorrection: true,
+        useForSoniox: true,
+        glossary: [{ id: 'term', target: 'TypeScript' }],
+      },
+      recognitionConfig: {
+        schemaVersion: 1,
+        providerId: 'soniox',
+        model: 'stt-rt-v5',
+        apiKey: 'must-be-dropped',
+        soniox: {
+          model: 'stt-rt-v5',
+          languageHints: ['zh', 'en'],
+          languageHintsStrict: true,
+          enableSpeakerDiarization: true,
+          enableEndpointDetection: true,
+          endpointSensitivity: 0,
+          maxEndpointDelayMs: 1500,
+          endpointLatencyAdjustmentLevel: 2,
+          context: { text: 'Developer meeting', terms: ['TypeScript'] },
+          api_key: 'must-also-be-dropped',
+        },
+      } as never,
+    })
+    expect(normalized.meetingContext?.glossary).toEqual([
+      { id: 'term', target: 'TypeScript', enabled: true },
+    ])
+    expect(normalized.recognitionConfig?.soniox).toEqual(expect.objectContaining({
+      endpointSensitivity: 0,
+      maxEndpointDelayMs: 1500,
+      endpointLatencyAdjustmentLevel: 2,
+      context: { text: 'Developer meeting', terms: ['TypeScript'] },
+    }))
+    expect(JSON.stringify(normalized.recognitionConfig)).not.toContain('must-be-dropped')
   })
 })

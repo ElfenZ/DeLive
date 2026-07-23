@@ -1,4 +1,5 @@
 import type { AppSettings, CaptionStyle } from '../types'
+import { DEFAULT_MEETING_CONTEXT } from './meetingContext'
 
 export const STORAGE_KEYS = {
   SESSIONS: 'desktoplive_sessions',
@@ -166,6 +167,7 @@ export function getDefaultSettings(): AppSettings {
       autoCorrectionDetection: false,
       autoAiPostProcess: false,
     },
+    meetingContext: { ...DEFAULT_MEETING_CONTEXT },
     openApi: {
       enabled: false,
       token: '',

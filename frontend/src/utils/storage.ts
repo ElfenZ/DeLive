@@ -30,6 +30,7 @@ export {
   getBackupValidationErrors,
   importDataMerge,
   importDataOverwrite,
+  sanitizeSettingsForBackup,
   type BackupData,
   upgradeBackupData,
   validateBackupData,

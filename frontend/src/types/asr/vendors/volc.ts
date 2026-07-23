@@ -17,6 +17,15 @@ export interface VolcUtterance {
   start_time: number
   end_time: number
   definite: boolean
+  speaker?: string | number | null
+  speaker_id?: string | number | null
+  speakerId?: string | number | null
+  additions?: {
+    speaker?: string | number | null
+    speaker_id?: string | number | null
+    speakerId?: string | number | null
+    [key: string]: unknown
+  }
   words?: VolcWord[]
 }
 
@@ -39,6 +48,7 @@ export interface VolcProviderConfig {
   enableVad?: boolean // VAD 判停
   modelV2?: boolean // 使用 V2 模型
   bidiStreaming?: boolean // 双向流式
+  enableSpeakerDiarization?: boolean
 }
 
 // 火山引擎常量

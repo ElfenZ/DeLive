@@ -9,7 +9,7 @@ DeLive supports twelve ASR backends through a unified provider registry. Each pr
 | Provider | Type | Transport | Audio | Streaming | Translation | Diarization | File |
 |----------|------|-----------|-------|-----------|-------------|-------------|------|
 | Soniox V5 | Cloud | WebSocket | MediaRecorder (WebM/Opus) | Yes | Yes | Yes | Yes |
-| Volcengine | Cloud | WebSocket (via proxy) | AudioWorklet (PCM16) | Yes | No | No | Yes |
+| Volcengine | Cloud | WebSocket (via proxy) | AudioWorklet (PCM16) | Yes | No | Best effort | Yes |
 | ElevenLabs | Cloud | WebSocket (via proxy) | AudioWorklet (PCM16) | Yes | No | No | Yes |
 | Mistral AI | Cloud | WebSocket (via proxy) | AudioWorklet (PCM16) | Yes | No | No | Yes |
 | Gladia | Cloud | WebSocket (via proxy) | AudioWorklet (PCM16) | Yes | No | No | Yes |
@@ -28,7 +28,7 @@ DeLive supports twelve ASR backends through a unified provider registry. Each pr
 Used by **Soniox**, **Volcengine**, **ElevenLabs**, **Mistral AI**, **Gladia**, **Deepgram**, and **AssemblyAI**. Audio chunks are sent continuously over a WebSocket connection, and transcript updates arrive in real-time.
 
 - Soniox emits **token-level events** (`prefersTokenEvents: true`) for fine-grained text updates
-- Volcengine, ElevenLabs, Mistral AI, Gladia, Deepgram, and AssemblyAI use local proxies on port 23456 to inject required authentication headers
+- Volcengine, ElevenLabs, Mistral AI, Gladia, Deepgram, and AssemblyAI share Electron's local proxy server. It prefers port 23456 and falls back through 23457–23460 when needed; renderer providers discover the selected port through IPC.
 
 ### Windowed Batch
 
@@ -53,12 +53,15 @@ The most feature-rich provider with real-time streaming, translation, and speake
 
 **Required:** `apiKey`
 
-**Optional:** `model`, `languageHints`, `translationEnabled`, `translationTargetLanguage`, `enableSpeakerDiarization`
+**Optional:** `model`, `languageHints`, strict language hints, translation, speaker diarization, endpoint detection, endpoint sensitivity, maximum endpoint delay, and endpoint latency adjustment.
 
 **Features:**
 - Token-level real-time transcription
 - Real-time translation with dual-line captions
 - Speaker diarization with labeled tokens
+- Meeting-oriented endpoint sensitivity defaults to `-0.5`; explicit `0` and values from `-1` through `1` are preserved
+- Endpoint tuning affects real-time requests only; file transcription uses language strictness, diarization, and context without real-time endpoint fields
+- Meeting background and enabled glossary targets can be sent as Soniox context only when the independent Soniox destination switch is enabled
 - Audio format: `auto` (WebM/Opus from MediaRecorder)
 
 ## Volcengine (火山引擎)
@@ -67,9 +70,11 @@ Chinese-focused real-time streaming through an embedded proxy.
 
 **Required:** `appKey`, `accessKey`
 
-**Optional:** `languageHints`
+**Optional:** `languageHints`, speaker diarization
 
 The browser cannot set custom WebSocket headers, so DeLive runs an embedded HTTP proxy in the Electron main process that forwards PCM16 audio to ByteDance's `openspeech.bytedance.com` endpoint with the required authentication headers.
+
+Volcengine's speaker option enables server-side speaker clustering (`enable_speaker_info`), not channel splitting. Results depend on the audio and the service response. DeLive separates the transcript only when Volcengine returns multiple speaker IDs; if every utterance has the same ID, the transcript remains a single speaker.
 
 ## Groq
 
@@ -95,7 +100,7 @@ Voxtral Realtime streaming ASR through the Mistral API.
 
 **Optional:** `model`, `languageHints`
 
-Uses a local WebSocket proxy (`/ws/mistral` on port 23456) to inject `Authorization` headers. Supports the Voxtral model family for real-time transcription.
+Uses the shared local WebSocket proxy at `/ws/mistral` to inject `Authorization` headers. The renderer discovers the runtime port through IPC (preferred port: 23456).
 
 ## Deepgram
 
@@ -105,7 +110,7 @@ Nova-3 and Nova-2 real-time streaming ASR through Deepgram's API.
 
 **Optional:** `model`, `languageHints`
 
-Uses a local WebSocket proxy (`/ws/deepgram` on port 23456) to inject `Authorization: Token` headers. Best for English and multilingual content.
+Uses the shared local WebSocket proxy at `/ws/deepgram` to inject `Authorization: Token` headers. Best for English and multilingual content.
 
 ## AssemblyAI
 
@@ -115,7 +120,7 @@ Universal-3 Pro real-time streaming ASR through AssemblyAI's WebSocket API.
 
 **Optional:** `model`
 
-Uses a local WebSocket proxy (`/ws/assemblyai` on port 23456) to inject `Authorization` headers. Supports 6 streaming languages; best suited for English content.
+Uses the shared local WebSocket proxy at `/ws/assemblyai` to inject `Authorization` headers. Supports 6 streaming languages; best suited for English content.
 
 ## ElevenLabs
 
@@ -125,7 +130,7 @@ Scribe v2 Realtime ASR through ElevenLabs' WebSocket API.
 
 **Optional:** `model`, `languageHints`
 
-Uses a local WebSocket proxy (`/ws/elevenlabs` on port 23456) to inject `xi-api-key` headers. Supports 90+ languages including Mandarin Chinese. Audio is sent as base64-encoded JSON payloads.
+Uses the shared local WebSocket proxy at `/ws/elevenlabs` to inject `xi-api-key` headers. Supports 90+ languages including Mandarin Chinese. Audio is sent as base64-encoded JSON payloads.
 
 ## Gladia
 
@@ -135,7 +140,7 @@ Solaria-1 real-time streaming ASR with sub-300ms latency and 100+ language suppo
 
 **Optional:** `model`, `languageHints`
 
-Uses a local WebSocket proxy (`/ws/gladia` on port 23456) that handles HTTP POST session initialization and injects the `x-gladia-key` authentication header. Supports live capture via system audio.
+Uses the shared local WebSocket proxy at `/ws/gladia`; it handles HTTP POST session initialization and injects the `x-gladia-key` authentication header. Supports live capture via system audio.
 
 ## Cloudflare Workers AI
 

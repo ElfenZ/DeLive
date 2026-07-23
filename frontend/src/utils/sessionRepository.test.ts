@@ -167,12 +167,12 @@ describe('sessionRepository persistence strategy', () => {
 
     expect(result.sessions[0]).toEqual(expect.objectContaining({
       id: 'legacy-1',
-      schemaVersion: 5,
+      schemaVersion: 6,
       tagIds: [],
     }))
     expect(sessionStorageMock.upsertSessions).toHaveBeenCalledTimes(1)
     expect(sessionStorageMock.upsertSessions).toHaveBeenCalledWith([
-      expect.objectContaining({ id: 'legacy-1', schemaVersion: 5 }),
+      expect.objectContaining({ id: 'legacy-1', schemaVersion: 6 }),
     ])
   })
 

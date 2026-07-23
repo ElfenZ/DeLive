@@ -11,7 +11,7 @@ flowchart TB
     entry["main.ts → mainWindow · captionWindow · tray · shortcuts"]
     subgraph services["Core Services"]
       direction LR
-      volc["🌐 Multi-Provider Proxy\n/ws/volc · /ws/mistral · /ws/deepgram\n/ws/assemblyai · /ws/elevenlabs\nPort 23456"]
+      volc["🌐 Multi-Provider Proxy\n/ws/volc · /ws/mistral · /ws/deepgram\n/ws/assemblyai · /ws/elevenlabs · /ws/gladia\nPreferred 23456 · fallback through 23460"]
       api["⚡ API Server\n/api/v1/* · /ws/live"]
       runtime["🔧 Local Runtime\nwhisper.cpp Lifecycle"]
     end
@@ -142,7 +142,7 @@ All session data lives in the Renderer's IndexedDB with an in-memory cache in `s
 
 ### Single HTTP Server
 
-Port 23456 hosts multiple WebSocket proxies (`/ws/volc`, `/ws/mistral`, `/ws/deepgram`, `/ws/assemblyai`, `/ws/elevenlabs`), the REST API (`/api/v1/*`), and the live transcript WebSocket (`/ws/live`) on a single `http.createServer()`. Each proxy uses `noServer: true` mode with manual `upgrade` event routing.
+One `http.createServer()` hosts all provider WebSocket proxies (`/ws/volc`, `/ws/mistral`, `/ws/deepgram`, `/ws/assemblyai`, `/ws/elevenlabs`, `/ws/gladia`), the REST API (`/api/v1/*`), and the live transcript WebSocket (`/ws/live`). Electron binds `23456` first, retries `23457–23460` only for `EADDRINUSE`, and blocks normal window creation until binding succeeds. The selected port is exposed to the renderer through typed IPC.
 
 ### MCP as Separate Process
 

@@ -4,6 +4,7 @@ import type {
   CorrectionPatchSafetyLimits,
   CorrectionShardProgress,
   ResolvedCorrectionPatch,
+  RecognitionConfigSnapshot,
   TranscriptAskTurn,
   TranscriptAutoPostProcessWorkflow,
   TranscriptChapter,
@@ -25,8 +26,13 @@ import type {
   TranscriptTextSourceMetadata,
 } from '../types'
 import { formatDate, formatTime, generateId } from './storageUtils'
+import {
+  normalizeGlossaryEntries,
+  normalizeMeetingContextConfig,
+  normalizeMeetingContextSnapshot,
+} from './meetingContext'
 
-export const CURRENT_SESSION_SCHEMA_VERSION = 5
+export const CURRENT_SESSION_SCHEMA_VERSION = 6
 const DEFAULT_SESSION_STATUS: TranscriptSessionStatus = 'completed'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -201,6 +207,50 @@ function normalizeSourceMeta(value: unknown): TranscriptSourceMeta | undefined {
     audioFileName: audioFileName || undefined,
     audioSize,
     captureAudioSource,
+  }
+}
+
+function normalizeRecognitionConfig(value: unknown): RecognitionConfigSnapshot | undefined {
+  if (!isRecord(value)) return undefined
+  const providerId = getString(value.providerId)?.trim()
+  if (!providerId) return undefined
+
+  const sonioxValue = isRecord(value.soniox) ? value.soniox : undefined
+  const sonioxModel = sonioxValue ? getString(sonioxValue.model)?.trim() : undefined
+  const enableEndpointDetection = sonioxValue?.enableEndpointDetection !== false
+  const sensitivity = sonioxValue ? getNumber(sonioxValue.endpointSensitivity) : undefined
+  const maxDelay = sonioxValue ? getNumber(sonioxValue.maxEndpointDelayMs) : undefined
+  const latencyLevel = sonioxValue ? getNumber(sonioxValue.endpointLatencyAdjustmentLevel) : undefined
+  const contextValue = sonioxValue && isRecord(sonioxValue.context) ? sonioxValue.context : undefined
+  const contextText = contextValue ? getString(contextValue.text)?.trim() : undefined
+  const contextTerms = contextValue ? normalizeStringArray(contextValue.terms) : []
+  const validSensitivity = sensitivity !== undefined && sensitivity >= -1 && sensitivity <= 1
+  const validMaxDelay = maxDelay !== undefined && Number.isInteger(maxDelay) && maxDelay >= 500 && maxDelay <= 3000
+  const validLatencyLevel = latencyLevel !== undefined && Number.isInteger(latencyLevel) && latencyLevel >= 0 && latencyLevel <= 3
+
+  return {
+    schemaVersion: 1,
+    providerId,
+    model: getString(value.model)?.trim() || sonioxModel || undefined,
+    ...(sonioxValue && sonioxModel ? {
+      soniox: {
+        model: sonioxModel,
+        languageHints: normalizeStringArray(sonioxValue.languageHints),
+        languageHintsStrict: Boolean(sonioxValue.languageHintsStrict)
+          && normalizeStringArray(sonioxValue.languageHints).length > 0,
+        enableSpeakerDiarization: Boolean(sonioxValue.enableSpeakerDiarization),
+        enableEndpointDetection,
+        ...(enableEndpointDetection && validSensitivity ? { endpointSensitivity: sensitivity } : {}),
+        ...(enableEndpointDetection && validMaxDelay ? { maxEndpointDelayMs: maxDelay } : {}),
+        ...(enableEndpointDetection && validLatencyLevel ? { endpointLatencyAdjustmentLevel: latencyLevel } : {}),
+        ...(contextText || contextTerms.length > 0 ? {
+          context: {
+            ...(contextText ? { text: contextText } : {}),
+            ...(contextTerms.length > 0 ? { terms: contextTerms } : {}),
+          },
+        } : {}),
+      },
+    } : {}),
   }
 }
 
@@ -523,14 +573,11 @@ function normalizeCorrectionConfig(value: unknown): CorrectionConfigSnapshot | n
   const concurrency = getNumber(value.concurrency)
   if (!model || !baseUrl || !promptLanguage || !structuredOutput || !safetyLimits || !chunkSize
     || contextSize === undefined || !concurrency || value.credentialRef !== 'ai-post-process') return null
-  const glossary = Array.isArray(value.glossary)
-    ? value.glossary.filter(isRecord).flatMap((entry) => {
-      const id = getString(entry.id)
-      const source = getString(entry.source)
-      const target = getString(entry.target)
-      return id && source && target ? [{ id, source, target, note: getString(entry.note), enabled: typeof entry.enabled === 'boolean' ? entry.enabled : undefined }] : []
-    })
-    : []
+  const glossary = normalizeGlossaryEntries(value.glossary).value
+  const context = normalizeMeetingContextConfig({
+    background: value.background,
+    correctionGuidance: value.correctionGuidance,
+  }).value
   return {
     model,
     baseUrl,
@@ -540,6 +587,8 @@ function normalizeCorrectionConfig(value: unknown): CorrectionConfigSnapshot | n
     structuredOutput,
     temperature: getNumber(value.temperature) ?? 0.1,
     glossary,
+    background: context.background,
+    correctionGuidance: context.correctionGuidance,
     chunkSize,
     contextSize,
     concurrency,
@@ -764,6 +813,10 @@ export function normalizeTranscriptSession(session: Partial<TranscriptSession>):
     mindMap: normalizeMindMap(session.mindMap),
     correction: normalizeCorrection(session.correction),
     autoPostProcessWorkflow: normalizeAutoPostProcessWorkflow(session.autoPostProcessWorkflow),
+    meetingContext: isRecord(session.meetingContext)
+      ? normalizeMeetingContextSnapshot(session.meetingContext).value
+      : undefined,
+    recognitionConfig: normalizeRecognitionConfig(session.recognitionConfig),
     providerId: getString(session.providerId),
     status,
     lastPersistedAt: getNumber(session.lastPersistedAt) ?? updatedAt,

@@ -1,4 +1,5 @@
-import { SONIOX_DEFAULT_ASYNC_MODEL } from '../types/asr/vendors/soniox'
+import type { EffectiveSonioxConfig } from './sonioxConfig'
+import { buildSonioxAsyncRequest } from './sonioxConfig'
 
 const SONIOX_API_BASE = 'https://api.soniox.com/v1'
 const POLL_INTERVAL_MS = 3000
@@ -40,11 +41,7 @@ export interface SonioxTranscriptResult {
 export interface SonioxCreateTranscriptionParams {
   fileId?: string
   audioUrl?: string
-  model?: string
-  languageHints?: string[]
-  translation?: { type: 'one_way'; target_language: string }
-  enableSpeakerDiarization?: boolean
-  context?: string
+  config: EffectiveSonioxConfig
 }
 
 async function apiFetch<T>(
@@ -97,16 +94,10 @@ export async function createTranscription(
   apiKey: string,
   params: SonioxCreateTranscriptionParams,
 ): Promise<SonioxTranscriptionInfo> {
-  const body: Record<string, unknown> = {
-    model: params.model || SONIOX_DEFAULT_ASYNC_MODEL,
-  }
-
-  if (params.fileId) body.file_id = params.fileId
-  if (params.audioUrl) body.audio_url = params.audioUrl
-  if (params.languageHints?.length) body.language_hints = params.languageHints
-  if (params.enableSpeakerDiarization) body.enable_speaker_diarization = true
-  if (params.translation) body.translation = params.translation
-  if (params.context) body.context = params.context
+  const body = buildSonioxAsyncRequest(params.config, {
+    fileId: params.fileId,
+    audioUrl: params.audioUrl,
+  })
 
   return apiFetch<SonioxTranscriptionInfo>(apiKey, '/transcriptions', {
     method: 'POST',

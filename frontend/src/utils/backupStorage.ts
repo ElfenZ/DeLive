@@ -12,6 +12,7 @@ import { getSettings, getTags, getTopics, saveSettings, saveTags, saveTopics } f
 import { normalizeTranscriptSessions } from './sessionSchema'
 import { getDefaultSettings } from './storageShared'
 import { generateId } from './storageUtils'
+import { normalizeGlossaryEntries, normalizeMeetingContextConfig } from './meetingContext'
 
 export const CURRENT_BACKUP_VERSION = '4.0'
 export const CURRENT_BACKUP_SCHEMA_VERSION = 4
@@ -101,6 +102,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }
 
+function getString(value: unknown): string {
+  return typeof value === 'string' ? value : ''
+}
+
 function normalizeStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) {
     return []
@@ -179,18 +184,10 @@ function normalizeAiPostProcessConfig(value: unknown): AiPostProcessConfig | und
     || value.preferCorrectedText === 'corrected'
     ? value.preferCorrectedText
     : undefined
-  const glossary = Array.isArray(value.glossary)
-    ? value.glossary
-      .filter(isRecord)
-      .map((entry) => ({
-        id: typeof entry.id === 'string' ? entry.id : generateId(),
-        source: typeof entry.source === 'string' ? entry.source : '',
-        target: typeof entry.target === 'string' ? entry.target : '',
-        note: typeof entry.note === 'string' ? entry.note : undefined,
-        enabled: typeof entry.enabled === 'boolean' ? entry.enabled : undefined,
-      }))
-      .filter((entry) => entry.source.trim() || entry.target.trim())
-    : undefined
+  const glossary = value.glossary === undefined
+    ? undefined
+    : normalizeGlossaryEntries(value.glossary, { includeDisabled: true }).value
+      .map((entry) => ({ ...entry, id: entry.id || generateId() }))
   const correctionStructuredOutput = value.correctionStructuredOutput === 'prompt-json'
     || value.correctionStructuredOutput === 'json_object'
     || value.correctionStructuredOutput === 'json_schema'
@@ -248,6 +245,43 @@ function normalizeAiPostProcessConfig(value: unknown): AiPostProcessConfig | und
   }
 }
 
+const SECRET_SETTING_KEY = /(api.?key|api.?token|access.?key|app.?key|secret|password|token)$/i
+
+export function sanitizeSettingsForBackup(settings: AppSettings): AppSettings {
+  const providerConfigs = settings.providerConfigs
+    ? Object.fromEntries(Object.entries(settings.providerConfigs).map(([providerId, config]) => [
+        providerId,
+        Object.fromEntries(Object.entries(config).map(([key, value]) => [
+          key,
+          SECRET_SETTING_KEY.test(key) ? '' : value,
+        ])),
+      ]))
+    : undefined
+
+  return {
+    ...settings,
+    apiKey: '',
+    providerConfigs,
+    aiPostProcess: settings.aiPostProcess
+      ? { ...settings.aiPostProcess, apiKey: '' }
+      : undefined,
+    openApi: settings.openApi
+      ? { ...settings.openApi, token: '' }
+      : undefined,
+    cloudBackup: settings.cloudBackup
+      ? {
+          ...settings.cloudBackup,
+          s3: settings.cloudBackup.s3
+            ? { ...settings.cloudBackup.s3, accessKeyId: '', secretAccessKey: '' }
+            : undefined,
+          webdav: settings.cloudBackup.webdav
+            ? { ...settings.cloudBackup.webdav, password: '' }
+            : undefined,
+        }
+      : undefined,
+  }
+}
+
 function normalizeSettings(value: unknown): AppSettings {
   const defaults = getDefaultSettings()
   const record = isRecord(value) ? value : {}
@@ -267,6 +301,7 @@ function normalizeSettings(value: unknown): AppSettings {
       ...defaults.aiPostProcess,
       ...(normalizeAiPostProcessConfig(record.aiPostProcess) || {}),
     },
+    meetingContext: normalizeMeetingContextConfig(record.meetingContext).value,
     openApi: {
       ...defaults.openApi,
       ...(isRecord(record.openApi) ? {
@@ -282,6 +317,23 @@ function normalizeSettings(value: unknown): AppSettings {
           ? record.cloudBackup.provider : 's3',
         autoBackupOnComplete: typeof record.cloudBackup.autoBackupOnComplete === 'boolean'
           ? record.cloudBackup.autoBackupOnComplete : false,
+        s3: isRecord(record.cloudBackup.s3) ? {
+          endpoint: getString(record.cloudBackup.s3.endpoint),
+          region: getString(record.cloudBackup.s3.region),
+          bucket: getString(record.cloudBackup.s3.bucket),
+          prefix: getString(record.cloudBackup.s3.prefix),
+          accessKeyId: getString(record.cloudBackup.s3.accessKeyId),
+          secretAccessKey: getString(record.cloudBackup.s3.secretAccessKey),
+          forcePathStyle: typeof record.cloudBackup.s3.forcePathStyle === 'boolean'
+            ? record.cloudBackup.s3.forcePathStyle
+            : undefined,
+        } : undefined,
+        webdav: isRecord(record.cloudBackup.webdav) ? {
+          url: getString(record.cloudBackup.webdav.url),
+          username: getString(record.cloudBackup.webdav.username),
+          password: getString(record.cloudBackup.webdav.password),
+          basePath: getString(record.cloudBackup.webdav.basePath),
+        } : undefined,
       } : {}),
     },
   }
@@ -294,7 +346,7 @@ export async function exportAllData(): Promise<void> {
     exportedAt: new Date().toISOString(),
     sessions: normalizeTranscriptSessions(await getSessions()),
     tags: getTags(),
-    settings: getSettings(),
+    settings: sanitizeSettingsForBackup(getSettings()),
     topics: getTopics(),
   }
 
@@ -346,10 +398,34 @@ export async function importDataOverwrite(
     currentSettings.providerConfigs,
     normalized.settings.providerConfigs,
   )
+  const baseS3 = normalized.settings.cloudBackup?.s3 || currentSettings.cloudBackup?.s3
+  const mergedS3 = baseS3 ? {
+    ...baseS3,
+    accessKeyId: currentSettings.cloudBackup?.s3?.accessKeyId || baseS3.accessKeyId,
+    secretAccessKey: currentSettings.cloudBackup?.s3?.secretAccessKey || baseS3.secretAccessKey,
+  } : undefined
+  const baseWebdav = normalized.settings.cloudBackup?.webdav || currentSettings.cloudBackup?.webdav
+  const mergedWebdav = baseWebdav ? {
+    ...baseWebdav,
+    password: currentSettings.cloudBackup?.webdav?.password || baseWebdav.password,
+  } : undefined
   saveSettings({
     ...normalized.settings,
     apiKey: currentSettings.apiKey || normalized.settings.apiKey,
     providerConfigs: mergedProviderConfigs,
+    aiPostProcess: {
+      ...(normalized.settings.aiPostProcess || {}),
+      apiKey: currentSettings.aiPostProcess?.apiKey || normalized.settings.aiPostProcess?.apiKey,
+    },
+    openApi: {
+      ...(normalized.settings.openApi || {}),
+      token: currentSettings.openApi?.token || normalized.settings.openApi?.token,
+    },
+    cloudBackup: {
+      ...(normalized.settings.cloudBackup || {}),
+      s3: mergedS3,
+      webdav: mergedWebdav,
+    },
   })
 
   return {

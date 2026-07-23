@@ -1,6 +1,8 @@
 # REST API
 
-DeLive exposes a local REST API on port **23456** when the Open API is enabled in Settings.
+DeLive exposes a local REST API when the Open API is enabled in Settings. Electron prefers port **23456** and automatically falls back through **23457–23460** if the preferred port is occupied.
+
+The endpoint shown in **Settings > Open API** is the runtime source of truth. The examples below use the normal `23456` address; replace it when Settings shows a fallback port.
 
 ## Base URL
 
@@ -172,7 +174,7 @@ curl http://localhost:23456/api/v1/status
   "isRecording": false,
   "recordingState": "paused",
   "currentSessionId": "abc123",
-  "version": "2.5.4",
+  "version": "2.5.5",
   "liveClients": 0
 }
 ```

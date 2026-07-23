@@ -14,10 +14,11 @@ import { CaptureManager, type CaptureAudioOptions } from '../services/captureMan
 import { CaptionBridge } from '../services/captionBridge'
 import { ProviderSessionManager, type ProviderSetup } from '../services/providerSession'
 import type { ASRVendor, ProviderConfig } from '../types/asr'
-import type { ProviderConfigData, TranscriptSourceMeta } from '../types'
+import type { MeetingContextOverride, ProviderConfigData, TranscriptSourceMeta } from '../types'
 import { buildPcmWavBlob } from '../utils/pcmWav'
 import { AudioProcessor } from '../utils/audioProcessor'
 import { readRecordingElapsedMs } from '../utils/recordingTimeline'
+import { resolveMeetingContextSnapshot } from '../utils/meetingContext'
 
 interface UseASROptions {
   onError?: (message: string) => void
@@ -88,17 +89,16 @@ export function useASR(options: UseASROptions = {}) {
   } = useSessionStore()
 
   const lockProviderSetup = useCallback((vendorId: ASRVendor, setup: ProviderSetup) => {
-    const connectConfig: ProviderConfig = {
-      ...setup.connectConfig,
-      ...(setup.connectConfig.languageHints
-        ? { languageHints: [...setup.connectConfig.languageHints] }
-        : {}),
-    }
+    const meetingContext = structuredClone(setup.meetingContext)
+    const connectConfig: ProviderConfig = structuredClone(setup.connectConfig)
+    if (vendorId === 'soniox') connectConfig.meetingContext = meetingContext
     lockedProviderRef.current = {
       vendorId,
       setup: {
         ...setup,
         connectConfig,
+        meetingContext,
+        recognitionConfig: structuredClone(setup.recognitionConfig),
       },
     }
   }, [])
@@ -720,7 +720,9 @@ export function useASR(options: UseASROptions = {}) {
 
     try {
       const psm = providerSessionRef.current
-      const setup = psm.resolveSetup(vendorId, settings)
+      const locked = lockedProviderRef.current
+      if (!locked || locked.vendorId !== vendorId) throw new Error('录制配置快照已失效')
+      const setup = locked.setup
       const needReconnect = setup.captureRestartStrategy === 'reconnect-session'
       const capture = captureRef.current
       const audioOptions = activeCaptureAudioOptionsRef.current || buildCaptureAudioOptions()
@@ -787,7 +789,6 @@ export function useASR(options: UseASROptions = {}) {
       isRestartingRef.current = false
     }
   }, [
-    settings,
     buildCaptureAudioOptions,
     buildProviderCallbacks,
     endCurrentSession,
@@ -806,7 +807,7 @@ export function useASR(options: UseASROptions = {}) {
 
   // ── 开始录制 ──────────────────────────────────────
 
-  const startRecording = useCallback(async () => {
+  const startRecording = useCallback(async (meetingContextOverride?: MeetingContextOverride) => {
     if (!transitionRecordingState('starting')) return
     resetRecordingTimeline()
 
@@ -815,7 +816,12 @@ export function useASR(options: UseASROptions = {}) {
 
     let setup: ReturnType<typeof psm.resolveSetup>
     try {
-      setup = psm.resolveSetup(vendorId, settings)
+      const meetingContext = resolveMeetingContextSnapshot(
+        settings.meetingContext,
+        settings.aiPostProcess?.glossary,
+        meetingContextOverride,
+      )
+      setup = psm.resolveSetup(vendorId, settings, meetingContext)
     } catch (e) {
       transitionRecordingState('idle')
       options.onError?.((e as Error).message)
@@ -858,7 +864,12 @@ export function useASR(options: UseASROptions = {}) {
     // provider, start capture, then open both gates at the timeline boundary.
     let sessionId: string | null = null
     try {
-      sessionId = startNewSession({ captureMode: capture.currentCaptureMode })
+      sessionId = startNewSession({
+        captureMode: capture.currentCaptureMode,
+        providerId: vendorId,
+        meetingContext: setup.meetingContext,
+        recognitionConfig: setup.recognitionConfig,
+      })
       await startSourceAudioArchive(sessionId, acquiredStream)
 
       const providerCallbacks = buildProviderCallbacks()
@@ -962,7 +973,7 @@ export function useASR(options: UseASROptions = {}) {
 
       const newSettings = useSettingsStore.getState().settings
       const psm = providerSessionRef.current
-      const setup = psm.resolveSetup(vendorId, newSettings)
+      const setup = psm.resolveSetup(vendorId, newSettings, lockedProviderRef.current?.setup.meetingContext)
 
       await captureRef.current.pauseCapture()
       const drainResult = await psm.drain()
@@ -989,7 +1000,7 @@ export function useASR(options: UseASROptions = {}) {
       try {
         const fallbackSettings = useSettingsStore.getState().settings
         const psm = providerSessionRef.current
-        const fallbackSetup = psm.resolveSetup(vendorId, fallbackSettings)
+        const fallbackSetup = psm.resolveSetup(vendorId, fallbackSettings, lockedProviderRef.current?.setup.meetingContext)
 
         await captureRef.current.pauseCapture()
         await psm.disconnect()
@@ -1048,7 +1059,11 @@ export function useASR(options: UseASROptions = {}) {
 
     let newSetup: ReturnType<typeof psm.resolveSetup>
     try {
-      newSetup = psm.resolveSetup(newVendorId, useSettingsStore.getState().settings)
+      newSetup = psm.resolveSetup(
+        newVendorId,
+        useSettingsStore.getState().settings,
+        lockedProviderRef.current?.setup.meetingContext,
+      )
     } catch (e) {
       options.onError?.((e as Error).message)
       return
@@ -1086,7 +1101,11 @@ export function useASR(options: UseASROptions = {}) {
 
       try {
         const fallbackSettings = useSettingsStore.getState().settings
-        const fallbackSetup = psm.resolveSetup(oldVendorId, fallbackSettings)
+        const fallbackSetup = psm.resolveSetup(
+          oldVendorId,
+          fallbackSettings,
+          lockedProviderRef.current?.setup.meetingContext,
+        )
 
         await captureRef.current.pauseCapture()
         await psm.disconnect()

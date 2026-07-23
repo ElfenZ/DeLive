@@ -12,6 +12,11 @@ import { buildProviderConnectConfig, isProviderConfigured } from '../utils/provi
 import { getProviderName, getProviderDescription } from '../utils/providerI18n'
 import { getProviderLogo } from './icons/getProviderLogo'
 import type { FileTranscriptionConfig } from '../types/fileTranscription'
+import type { MeetingContextOverride, RecognitionConfigSnapshot } from '../types'
+import { MeetingContextEditor } from './MeetingContextEditor'
+import { getDefaultSettings } from '../utils/storageShared'
+import { resolveMeetingContextSnapshot } from '../utils/meetingContext'
+import { createSonioxRecognitionSnapshot, parseSonioxConfig } from '../utils/sonioxConfig'
 
 export function FileTranscriptionView() {
   const { jobs, submitFile, cancelJob, openResult } = useFileTranscription()
@@ -29,6 +34,7 @@ export function FileTranscriptionView() {
     return 'soniox'
   })
   const [isOpen, setIsOpen] = useState(false)
+  const [meetingContextOverride, setMeetingContextOverride] = useState<MeetingContextOverride>({ mode: 'inherit' })
 
   const selectedProvider = fileProviders.find((p) => p.id === selectedProviderId) ?? fileProviders[0]
   const providerConfig = useSettingsStore((s) => s.getProviderConfig(selectedProviderId))
@@ -63,12 +69,44 @@ export function FileTranscriptionView() {
       languageHints = rawHints.split(',').map(s => s.trim()).filter(Boolean)
     }
 
+    const meetingContext = resolveMeetingContextSnapshot(
+      settings.meetingContext,
+      settings.aiPostProcess?.glossary,
+      meetingContextOverride,
+    )
+    let recognitionConfig: RecognitionConfigSnapshot = {
+      schemaVersion: 1,
+      providerId: selectedProviderId,
+      ...(typeof providerConfig?.model === 'string' && providerConfig.model.trim()
+        ? { model: providerConfig.model.trim() }
+        : {}),
+    }
+    if (selectedProviderId === 'soniox') {
+      const effectiveSoniox = parseSonioxConfig({
+        ...providerConfig,
+        asyncModel: providerConfig?.asyncModel,
+      }, { meetingContext }).value
+      recognitionConfig = {
+        schemaVersion: 1,
+        providerId: 'soniox',
+        model: effectiveSoniox.asyncModel,
+        soniox: {
+          ...createSonioxRecognitionSnapshot(effectiveSoniox),
+          model: effectiveSoniox.asyncModel,
+        },
+      }
+    }
+
     const config: FileTranscriptionConfig = {
       provider: selectedProviderId as FileTranscriptionConfig['provider'],
       languageHints: languageHints?.length ? languageHints : undefined,
       enableSpeakerDiarization: Boolean(providerConfig?.enableSpeakerDiarization),
       translationEnabled: Boolean(providerConfig?.translationEnabled),
       translationTargetLanguage: (providerConfig?.translationTargetLanguage as string) || 'en',
+      languageHintsStrict: Boolean(providerConfig?.languageHintsStrict),
+      model: typeof providerConfig?.asyncModel === 'string' ? providerConfig.asyncModel : undefined,
+      meetingContext,
+      recognitionConfig,
     }
 
     for (const file of files) {
@@ -76,7 +114,8 @@ export function FileTranscriptionView() {
         console.error('[FileTranscription] Submit failed:', err)
       })
     }
-  }, [submitFile, providerConfig, selectedProviderId])
+    setMeetingContextOverride({ mode: 'inherit' })
+  }, [meetingContextOverride, providerConfig, selectedProviderId, settings.aiPostProcess?.glossary, settings.meetingContext, submitFile])
 
   const getExecutionModeBadge = (provider: ASRProviderInfo): { label: string; className: string } | null => {
     const workloads = provider.capabilities.workloads
@@ -283,6 +322,22 @@ export function FileTranscriptionView() {
               {t.file?.cloudflareSizeWarning || 'Cloudflare Workers AI limits file size to ~2 MB.'}
             </p>
           </div>
+        )}
+
+        {hasApiKey && !isProcessing && (
+          <details className="rounded-xl border border-border/70 bg-muted/20 p-4">
+            <summary className="cursor-pointer text-sm font-semibold text-foreground">
+              {t.settings.oneShotContextTitle}
+            </summary>
+            <div className="pt-4">
+              <MeetingContextEditor
+                t={t}
+                globalConfig={settings.meetingContext || getDefaultSettings().meetingContext!}
+                value={meetingContextOverride}
+                onChange={setMeetingContextOverride}
+              />
+            </div>
+          </details>
         )}
 
         {/* Drop Zone */}

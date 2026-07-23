@@ -216,3 +216,85 @@ transitionRecordingState('paused')
 ```
 
 The orchestration layer owns ordering; resource services own their local generation fences and cleanup.
+
+---
+
+## Scenario: Task-Scoped Recognition Context
+
+### 1. Scope / Trigger
+
+Use this contract when changing meeting context, glossary behavior, Provider setup, file transcription, Session recognition metadata, or AI correction. Mutable settings are inputs to task creation, not live task state.
+
+### 2. Signatures
+
+```ts
+resolveMeetingContextSnapshot(
+  globalConfig: unknown,
+  globalGlossary: unknown,
+  override?: MeetingContextOverride,
+): MeetingContextSnapshot
+
+ProviderSessionManager.resolveSetup(
+  vendorId: ASRVendor,
+  settings: AppSettings,
+  meetingContext?: MeetingContextSnapshot,
+): ProviderSetup
+
+createCorrectionConfigSnapshot(
+  settings: AppSettings,
+  meetingContext?: MeetingContextSnapshot,
+): CorrectionConfigSnapshot
+```
+
+### 3. Contracts
+
+- Resolve `inherit`, `override`, or `clear` exactly once when recording or file work starts.
+- Persist normalized, credential-free `meetingContext` and `recognitionConfig` on the Session; do not increment IndexedDB for fields inside existing records.
+- Pause/resume and device reconnect reuse the locked Provider setup. Intentional Provider/config hot-switches may create a new setup but retain the task's meeting-context snapshot.
+- Automatic and historical correction use the Session snapshot. A persisted correction draft always uses its own `CorrectionConfigSnapshot`.
+- Soniox receives only enabled glossary `target` values. AI receives separate mapping and candidate-term JSON data.
+- Prompt reference data is delimiter-escaped, subordinate to the fixed Patch system contract, and capped by `MAX_CORRECTION_REFERENCE_CHARACTERS` before transcript regions are appended.
+- Session/schema/backup normalizers whitelist snapshot fields and never persist API keys.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+|-----------|-----------------|
+| Missing global context | Use default empty background/guidance; AI destination on, Soniox destination off |
+| One-shot `clear` | Store an empty snapshot with both destinations disabled and no glossary |
+| Invalid one-shot length or glossary conflict | Reject task start; do not silently clamp user input |
+| Invalid legacy/import data | Normalize to safe values and surface diagnostics where available |
+| Global settings change after task start | Active request, reconnect, and automatic correction remain unchanged |
+| Old Session lacks snapshots | Load normally; correction falls back to current settings only because no historical snapshot exists |
+| Snapshot contains unknown or credential-like fields | Drop them during schema normalization |
+
+### 5. Good / Base / Bad Cases
+
+- Good: a file task freezes context, global settings change while it runs, and the completed Session's automatic correction still uses the frozen values.
+- Base: an old Session without context loads and remains usable.
+- Bad: a reconnect calls `resolveMeetingContextSnapshot` from current settings, or automatic correction reads the current global glossary instead of `session.meetingContext`.
+
+### 6. Tests Required
+
+- Cover inherit/override/clear, Unicode budgets, target-only terms, deduplication, conflicts, and Soniox target projection.
+- Assert Soniox realtime/async field isolation and credential-free recognition snapshots.
+- Round-trip new and old Sessions and backups; assert serialized snapshots contain no credentials.
+- Assert correction prompt order, delimiter escaping, aggregate reference budget, fixed system policy, and restored draft context.
+- Exercise recording reconnect and file completion paths when changing snapshot plumbing.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```ts
+const setup = providerSession.resolveSetup(vendorId, useSettingsStore.getState().settings)
+const correction = createCorrectionConfigSnapshot(useSettingsStore.getState().settings)
+```
+
+#### Correct
+
+```ts
+const meetingContext = resolveMeetingContextSnapshot(globalContext, glossary, oneShotOverride)
+const setup = providerSession.resolveSetup(vendorId, settingsAtStart, meetingContext)
+const correction = createCorrectionConfigSnapshot(currentAiCredentials, session.meetingContext)
+```

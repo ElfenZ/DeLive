@@ -15,8 +15,7 @@ import {
   ELEVENLABS_DEFAULT_MODEL,
   ELEVENLABS_SUPPORTED_LANGUAGES,
 } from '../../types/asr/vendors/elevenlabs'
-
-const PROXY_WS_URL = 'ws://localhost:23456/ws/elevenlabs'
+import { getProxyWebSocketUrl } from '../../utils/proxyUrl'
 
 export class ElevenLabsProvider extends BaseASRProvider {
   readonly id: ASRVendor = 'elevenlabs' as ASRVendor
@@ -99,15 +98,15 @@ export class ElevenLabsProvider extends BaseASRProvider {
     this._config = config
     this.setState('connecting')
 
+    const params = new URLSearchParams({
+      apiKey,
+      model: ELEVENLABS_DEFAULT_MODEL,
+      language: (config.language as string) || '',
+    })
+    const proxyUrl = await getProxyWebSocketUrl('/ws/elevenlabs', params)
+
     return new Promise((resolve, reject) => {
       try {
-        const params = new URLSearchParams({
-          apiKey,
-          model: ELEVENLABS_DEFAULT_MODEL,
-          language: (config.language as string) || '',
-        })
-
-        const proxyUrl = `${PROXY_WS_URL}?${params.toString()}`
         console.log('[ElevenLabsProvider] 连接到代理服务器...')
 
         this.ws = new WebSocket(proxyUrl)

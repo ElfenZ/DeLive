@@ -8,7 +8,7 @@ The MCP server is a lightweight Node.js script (`mcp/delive-mcp-server.js`) that
 
 1. Runs as a **child process** launched by the MCP client (e.g. Claude Desktop)
 2. Uses **stdio** transport (standard MCP protocol)
-3. Calls DeLive's **REST API** on `http://localhost:23456` to fetch data
+3. Calls DeLive's **REST API** at the URL configured by `DELIVE_API_URL` to fetch data
 4. Translates MCP tool calls into HTTP requests and formats responses
 
 ```
@@ -16,7 +16,7 @@ MCP Client (Claude Desktop)
     ↕ stdio
 DeLive MCP Server (node process)
     ↕ HTTP
-DeLive App (Electron, port 23456)
+DeLive App (Electron, preferred port 23456)
 ```
 
 ## Setup
@@ -35,6 +35,8 @@ DeLive App (Electron, port 23456)
 |----------|---------|-------------|
 | `DELIVE_API_URL` | `http://localhost:23456` | DeLive REST API base URL |
 | `DELIVE_API_TOKEN` | *(empty)* | Bearer token for authentication (set in DeLive Settings) |
+
+`23456` is the preferred Electron port. If DeLive falls back to `23457–23460`, copy the actual REST URL from **Settings > Open API** and update `DELIVE_API_URL`. External MCP processes do not auto-discover the fallback port.
 
 ## Client Configuration
 

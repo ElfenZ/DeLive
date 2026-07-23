@@ -1,8 +1,10 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Check, Clipboard, Eye, EyeOff, Key, Network, Shuffle } from 'lucide-react'
 import { Switch } from '../ui'
 import type { Translations } from '../../i18n'
 import type { OpenApiConfig } from '../../types'
+import { getProxyHttpUrl, getProxyPort, getProxyWebSocketUrl } from '../../utils/proxyUrl'
+import { PREFERRED_PROXY_PORT } from '../../../../shared/proxyPort'
 
 interface OpenApiPanelProps {
   t: Translations
@@ -26,6 +28,24 @@ export function OpenApiPanel({
 }: OpenApiPanelProps) {
   const [showApiToken, setShowApiToken] = useState(false)
   const [copiedField, setCopiedField] = useState<string | null>(null)
+  const [runtimePort, setRuntimePort] = useState(PREFERRED_PROXY_PORT)
+  const [restUrl, setRestUrl] = useState('')
+  const [webSocketUrl, setWebSocketUrl] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    void Promise.all([
+      getProxyPort(),
+      getProxyHttpUrl('/api/v1/'),
+      getProxyWebSocketUrl('/ws/live'),
+    ]).then(([port, rest, webSocket]) => {
+      if (cancelled) return
+      setRuntimePort(port)
+      setRestUrl(rest)
+      setWebSocketUrl(webSocket)
+    })
+    return () => { cancelled = true }
+  }, [])
 
   function copyToClipboard(text: string, field: string): void {
     void navigator.clipboard.writeText(text).then(() => {
@@ -108,11 +128,12 @@ export function OpenApiPanel({
                   {t.settings.openApiRestUrl}
                 </span>
                 <code className="text-xs font-mono flex-1 truncate">
-                  http://localhost:23456/api/v1/
+                  {restUrl || t.settings.openApiResolvingPort}
                 </code>
                 <button
                   type="button"
-                  onClick={() => copyToClipboard('http://localhost:23456/api/v1/', 'rest')}
+                  onClick={() => restUrl && copyToClipboard(restUrl, 'rest')}
+                  disabled={!restUrl}
                   className="p-1 text-muted-foreground hover:text-foreground transition-colors"
                 >
                   {copiedField === 'rest' ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Clipboard className="w-3.5 h-3.5" />}
@@ -123,17 +144,23 @@ export function OpenApiPanel({
                   {t.settings.openApiWsUrl}
                 </span>
                 <code className="text-xs font-mono flex-1 truncate">
-                  ws://localhost:23456/ws/live
+                  {webSocketUrl || t.settings.openApiResolvingPort}
                 </code>
                 <button
                   type="button"
-                  onClick={() => copyToClipboard('ws://localhost:23456/ws/live', 'ws')}
+                  onClick={() => webSocketUrl && copyToClipboard(webSocketUrl, 'ws')}
+                  disabled={!webSocketUrl}
                   className="p-1 text-muted-foreground hover:text-foreground transition-colors"
                 >
                   {copiedField === 'ws' ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Clipboard className="w-3.5 h-3.5" />}
                 </button>
               </div>
             </div>
+            {runtimePort !== PREFERRED_PROXY_PORT && (
+              <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-foreground">
+                {t.settings.openApiFallbackPortWarning(runtimePort)}
+              </p>
+            )}
           </div>
         </>
       )}

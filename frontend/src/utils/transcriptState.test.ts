@@ -201,6 +201,23 @@ describe('transcriptState', () => {
     ])
   })
 
+  it('clears retained source and translation interims on an explicit empty token snapshot', () => {
+    const withInterims = applyTranscriptEvent(createEmptyTranscriptRuntimeState(), {
+      type: 'tokens',
+      tokens: [
+        { text: 'source', isFinal: false },
+        { text: 'translation', isFinal: false, translationStatus: 'translation' },
+      ],
+    })
+    const cleared = applyTranscriptEvent(withInterims, { type: 'tokens', tokens: [] })
+
+    expect(cleared.nonFinalTokens).toEqual([])
+    expect(cleared.nonFinalTranscript).toBe('')
+    expect(cleared.nonFinalTranslatedTranscript).toBe('')
+    expect(cleared.currentTranscript).toBe('')
+    expect(cleared.currentTranslatedTranscript).toBe('')
+  })
+
   it('does not duplicate successful token finals and leaves a non-promoting boundary unchanged', () => {
     let state = applyTranscriptEvent(createEmptyTranscriptRuntimeState(), {
       type: 'tokens',

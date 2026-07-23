@@ -15,8 +15,7 @@ import {
   MISTRAL_REALTIME_MODEL,
   MISTRAL_SUPPORTED_LANGUAGES,
 } from '../../types/asr/vendors/mistral'
-
-const PROXY_WS_URL = 'ws://localhost:23456/ws/mistral'
+import { getProxyWebSocketUrl } from '../../utils/proxyUrl'
 
 export class MistralProvider extends BaseASRProvider {
   readonly id: ASRVendor = 'mistral' as ASRVendor
@@ -99,15 +98,15 @@ export class MistralProvider extends BaseASRProvider {
     this._config = config
     this.setState('connecting')
 
+    const params = new URLSearchParams({
+      apiKey,
+      model: MISTRAL_REALTIME_MODEL,
+      language: (config.language as string) || '',
+    })
+    const proxyUrl = await getProxyWebSocketUrl('/ws/mistral', params)
+
     return new Promise((resolve, reject) => {
       try {
-        const params = new URLSearchParams({
-          apiKey,
-          model: MISTRAL_REALTIME_MODEL,
-          language: (config.language as string) || '',
-        })
-
-        const proxyUrl = `${PROXY_WS_URL}?${params.toString()}`
         console.log('[MistralProvider] 连接到代理服务器...')
 
         this.ws = new WebSocket(proxyUrl)

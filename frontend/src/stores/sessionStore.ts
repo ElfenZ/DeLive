@@ -2,6 +2,8 @@ import { create } from 'zustand'
 import type {
   CorrectionIssue,
   CorrectionShardProgress,
+  MeetingContextSnapshot,
+  RecognitionConfigSnapshot,
   ResolvedCorrectionPatch,
   RecordingState,
   TranscriptAskTurn,
@@ -153,7 +155,12 @@ export interface SessionState {
   recoverySession: TranscriptSession | null
   currentCaptureMode: NonNullable<TranscriptSession['sourceMeta']>['captureMode']
   setCurrentCaptureMode: (captureMode: NonNullable<TranscriptSession['sourceMeta']>['captureMode']) => void
-  startNewSession: (options?: { captureMode?: NonNullable<TranscriptSession['sourceMeta']>['captureMode'] }) => string
+  startNewSession: (options?: {
+    captureMode?: NonNullable<TranscriptSession['sourceMeta']>['captureMode']
+    providerId?: string
+    meetingContext?: MeetingContextSnapshot
+    recognitionConfig?: RecognitionConfigSnapshot
+  }) => string
   endCurrentSession: (options?: {
     sourceMetaPatch?: Partial<NonNullable<TranscriptSession['sourceMeta']>>
     duration?: number
@@ -238,7 +245,10 @@ export const useSessionStore = create<SessionState>((set, get) => {
       selectTranscriptRuntimeState(get()),
       overrides,
     )
-    const providerId = useSettingsStore.getState().settings.currentVendor
+    const activeSession = get().sessions.find((session) => session.id === get().currentSessionId)
+    const providerId = activeSession?.recognitionConfig?.providerId
+      || activeSession?.providerId
+      || useSettingsStore.getState().settings.currentVendor
     const captionDisplayMode = useSettingsStore.getState().settings.captionStyle?.displayMode ?? 'source'
 
     const snapshot = buildSessionSnapshot({
@@ -254,6 +264,8 @@ export const useSessionStore = create<SessionState>((set, get) => {
       translationTargetLanguage: getTranslationTargetLanguage(),
       captionDisplayMode,
       duration: overrides?.duration,
+      meetingContext: activeSession?.meetingContext,
+      recognitionConfig: activeSession?.recognitionConfig,
     })
 
     return overrides?.sourceMetaPatch
@@ -291,6 +303,8 @@ export const useSessionStore = create<SessionState>((set, get) => {
       segments: snapshot.segments,
       sourceMeta: snapshot.sourceMeta,
       postProcess: snapshot.postProcess,
+      meetingContext: snapshot.meetingContext,
+      recognitionConfig: snapshot.recognitionConfig,
       status: 'recording',
     })
   }
@@ -702,7 +716,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
     correctionStartReservations.add(sessionId)
     try {
       const settings = useSettingsStore.getState().settings
-      const config = createCorrectionConfigSnapshot(settings)
+      const config = createCorrectionConfigSnapshot(settings, session.meetingContext)
       const baseTranscriptHash = await sha256Utf8(session.transcript)
       const now = Date.now()
       const draft = {
@@ -978,7 +992,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
       const now = Date.now()
       const { t } = useUIStore.getState()
       const { settings } = useSettingsStore.getState()
-      const providerId = settings.currentVendor
+      const providerId = options?.providerId || settings.currentVendor
 
       const session = createDraftSession({
         now,
@@ -990,6 +1004,8 @@ export const useSessionStore = create<SessionState>((set, get) => {
           platform: window.electronAPI?.platform ?? 'unknown',
           captureMode: options?.captureMode || 'system-audio',
         }),
+        meetingContext: options?.meetingContext,
+        recognitionConfig: options?.recognitionConfig,
       })
 
       const sessions = sessionRepository.createDraft(session)

@@ -167,6 +167,8 @@ export interface CorrectionConfigSnapshot {
   structuredOutput: CorrectionStructuredOutputMode
   temperature: number
   glossary: AiGlossaryEntry[]
+  background: string
+  correctionGuidance: string
   chunkSize: number
   contextSize: number
   concurrency: number
@@ -323,6 +325,48 @@ export interface TranscriptSourceMeta {
   captureAudioSource?: 'system' | 'microphone' | 'mixed'
 }
 
+export interface MeetingContextConfig {
+  background: string
+  correctionGuidance: string
+  useForAiCorrection: boolean
+  useForSoniox: boolean
+}
+
+export type MeetingContextOverrideMode = 'inherit' | 'override' | 'clear'
+
+export interface MeetingContextOverride {
+  mode: MeetingContextOverrideMode
+  config?: Partial<MeetingContextConfig>
+  glossary?: AiGlossaryEntry[]
+}
+
+export interface MeetingContextSnapshot extends MeetingContextConfig {
+  schemaVersion: 1
+  glossary: AiGlossaryEntry[]
+}
+
+export interface SonioxRecognitionSnapshot {
+  model: string
+  languageHints: string[]
+  languageHintsStrict: boolean
+  enableSpeakerDiarization: boolean
+  enableEndpointDetection: boolean
+  endpointSensitivity?: number
+  maxEndpointDelayMs?: number
+  endpointLatencyAdjustmentLevel?: number
+  context?: {
+    text?: string
+    terms?: string[]
+  }
+}
+
+export interface RecognitionConfigSnapshot {
+  schemaVersion: 1
+  providerId: string
+  model?: string
+  soniox?: SonioxRecognitionSnapshot
+}
+
 export type TranscriptSessionStatus = 'recording' | 'interrupted' | 'completed'
 export type CaptionDisplayMode = 'source' | 'translated' | 'dual'
 
@@ -361,6 +405,8 @@ export interface TranscriptSession {
   mindMap?: TranscriptMindMap
   correction?: TranscriptCorrection
   autoPostProcessWorkflow?: TranscriptAutoPostProcessWorkflow
+  meetingContext?: MeetingContextSnapshot
+  recognitionConfig?: RecognitionConfigSnapshot
   providerId?: string
   status?: TranscriptSessionStatus
   lastPersistedAt?: number
@@ -381,7 +427,7 @@ export type AiFeatureKey = 'briefing' | 'chat' | 'mindmap' | 'correction'
 
 export interface AiGlossaryEntry {
   id: string
-  source: string
+  source?: string
   target: string
   note?: string
   enabled?: boolean
@@ -476,6 +522,8 @@ export interface AppSettings {
   colorTheme?: string
   // AI 后处理
   aiPostProcess?: AiPostProcessConfig
+  // Meeting/domain context shared by ASR and AI correction.
+  meetingContext?: MeetingContextConfig
   // Open API
   openApi?: OpenApiConfig
   // Capture settings

@@ -3,12 +3,17 @@ import * as pako from 'pako'
 import { URL } from 'url'
 import { WebSocket as NodeWebSocket, type WebSocketServer } from 'ws'
 import { getWsProxyAgent } from './proxyAgent'
+import {
+  buildVolcAuthHeaders,
+  buildVolcFullClientRequest,
+  parseVolcProxyConfig,
+  resolveVolcResourceId,
+  summarizeVolcResponseForDiagnostics,
+  type VolcProxyConfig,
+} from './volcProxyConfig'
 
 const VOLC_WS_ENDPOINT_BIDI = 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async'
 const VOLC_WS_ENDPOINT_NOSTREAM = 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream'
-const VOLC_RESOURCE_V1 = 'volc.bigasr.sauc.duration'
-const VOLC_RESOURCE_V2 = 'volc.seedasr.sauc.duration'
-
 const PROTOCOL_VERSION = 0x1
 const HEADER_SIZE_UNITS = 0x1
 const MSG_TYPE_FULL_CLIENT_REQ = 0x1
@@ -20,17 +25,6 @@ const SERIALIZE_JSON = 0x1
 const COMPRESS_GZIP = 0x1
 const FLAG_AUDIO_LAST = 0x2
 const FLAG_SERVER_FINAL_MASK = 0x3
-
-interface VolcProxyConfig {
-  appKey: string
-  accessKey: string
-  language?: string
-  modelV2?: boolean
-  bidiStreaming?: boolean
-  enableDdc?: boolean
-  enableVad?: boolean
-  enableNonstream?: boolean
-}
 
 function formatVolcConnectionError(error: Error): string {
   const networkError = error as NodeJS.ErrnoException
@@ -97,51 +91,13 @@ function buildClientFrame(
 }
 
 function buildFullClientRequestJson(config: VolcProxyConfig): string {
-  const user = { uid: config.appKey }
-  const audio: Record<string, unknown> = {
-    format: 'pcm',
-    rate: 16000,
-    bits: 16,
-    channel: 1,
-  }
-
-  if (config.language) {
-    audio.language = config.language
-  }
-
-  const request: Record<string, unknown> = {
-    model_name: 'bigmodel',
-    enable_itn: true,
-    enable_punc: true,
-    enable_ddc: config.enableDdc !== false,
-  }
-
-  if (config.enableNonstream) {
-    request.enable_nonstream = true
-  }
-
-  if (config.enableVad) {
-    request.show_utterances = true
-    request.end_window_size = 800
-    request.force_to_speech_time = 1000
-  }
-
-  return JSON.stringify({ user, audio, request })
+  return JSON.stringify(buildVolcFullClientRequest(config))
 }
 
 function parseProxyConfig(req: IncomingMessage): VolcProxyConfig {
   const url = new URL(req.url || '', `http://${req.headers.host}`)
 
-  return {
-    appKey: url.searchParams.get('appKey') || '',
-    accessKey: url.searchParams.get('accessKey') || '',
-    language: url.searchParams.get('language') || '',
-    modelV2: url.searchParams.get('modelV2') === 'true',
-    bidiStreaming: url.searchParams.get('bidiStreaming') !== 'false',
-    enableDdc: url.searchParams.get('enableDdc') !== 'false',
-    enableVad: url.searchParams.get('enableVad') === 'true',
-    enableNonstream: url.searchParams.get('enableNonstream') === 'true',
-  }
+  return parseVolcProxyConfig(url.searchParams)
 }
 
 function sendLastAudioFrame(ws: NodeWebSocket): void {
@@ -167,7 +123,7 @@ function handleVolcConnection(clientWs: NodeWebSocket, req: IncomingMessage): vo
   }
 
   const connectId = generateUUID()
-  const resourceId = config.modelV2 ? VOLC_RESOURCE_V2 : VOLC_RESOURCE_V1
+  const resourceId = resolveVolcResourceId(config.modelV2)
   const wsUrl = config.bidiStreaming ? VOLC_WS_ENDPOINT_BIDI : VOLC_WS_ENDPOINT_NOSTREAM
 
   console.log(`[VolcProxy] 连接到火山引擎: ${wsUrl}`)
@@ -176,23 +132,29 @@ function handleVolcConnection(clientWs: NodeWebSocket, req: IncomingMessage): vo
 
   const agent = getWsProxyAgent()
   const volcWs = new NodeWebSocket(wsUrl, {
-    headers: {
-      'X-Api-App-Key': config.appKey,
-      'X-Api-Access-Key': config.accessKey,
-      'X-Api-Resource-Id': resourceId,
-      'X-Api-Connect-Id': connectId,
-    },
+    headers: buildVolcAuthHeaders(config, connectId),
     agent,
   })
 
   let volcReady = false
   let clientClosed = false
+  let lastDiarizationDiagnosticSignature = ''
 
   volcWs.on('open', () => {
     console.log('[VolcProxy] 火山引擎 WebSocket 已连接')
 
     const fullRequest = buildFullClientRequestJson(config)
-    console.log('[VolcProxy] 发送初始配置:', fullRequest)
+    console.log('[VolcProxy] 初始配置摘要:', JSON.stringify({
+      resourceId: resolveVolcResourceId(config.modelV2),
+      language: config.language || '',
+      bidiStreaming: config.bidiStreaming !== false,
+      enableDdc: config.enableDdc !== false,
+      enableVad: Boolean(config.enableVad),
+      enableNonstream: Boolean(config.enableNonstream),
+      enableSpeakerDiarization: Boolean(config.enableSpeakerDiarization),
+      showUtterances: Boolean(config.enableVad || config.enableSpeakerDiarization),
+      enableSpeakerInfo: Boolean(config.enableSpeakerDiarization),
+    }))
 
     const payload = gzip(new TextEncoder().encode(fullRequest))
     const frame = buildClientFrame(
@@ -239,7 +201,24 @@ function handleVolcConnection(clientWs: NodeWebSocket, req: IncomingMessage): vo
           const text = result?.result?.text || ''
           const isFinal = (flags & FLAG_SERVER_FINAL_MASK) === FLAG_SERVER_FINAL_MASK
 
-          console.log(`[VolcProxy] 收到结果 (final=${isFinal}): ${text.substring(0, 50)}...`)
+          console.log(`[VolcProxy] 收到结果 (final=${isFinal}, textLength=${text.length})`)
+          if (config.enableSpeakerDiarization) {
+            const diagnostic = summarizeVolcResponseForDiagnostics(result)
+            const signature = JSON.stringify({
+              hasResult: diagnostic.hasResult,
+              resultKeys: diagnostic.resultKeys,
+              utteranceKeys: diagnostic.utteranceKeys,
+              speakerFields: diagnostic.speakerFields,
+              speakerSamples: diagnostic.speakerSamples,
+            })
+            if (isFinal || signature !== lastDiarizationDiagnosticSignature) {
+              lastDiarizationDiagnosticSignature = signature
+              console.log('[VolcProxy] 分人响应摘要:', JSON.stringify({
+                final: isFinal,
+                ...diagnostic,
+              }))
+            }
+          }
 
           clientWs.send(JSON.stringify({
             type: isFinal ? 'final' : 'partial',

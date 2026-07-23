@@ -34,7 +34,7 @@ function configSnapshot(overrides: Partial<CorrectionConfigSnapshot> = {}): Corr
   const safetyLimits = { maxPatchTextLength: 1000, maxPatchesPerShard: 100, maxCumulativeEditRatio: 1, maxNetLengthChangeRatio: 1 }
   return {
     model: 'model', baseUrl: 'http://localhost/v1', promptLanguage: 'zh', promptVersion: 'patch-v1', schemaVersion: '1',
-    structuredOutput: 'prompt-json', temperature: 0.1, glossary: [], chunkSize: 4000, contextSize: 500, concurrency: 1,
+    structuredOutput: 'prompt-json', temperature: 0.1, glossary: [], background: '', correctionGuidance: '', chunkSize: 4000, contextSize: 500, concurrency: 1,
     safetyLimits: { ...safetyLimits, ...overrides.safetyLimits }, credentialRef: 'ai-post-process', ...overrides,
   }
 }

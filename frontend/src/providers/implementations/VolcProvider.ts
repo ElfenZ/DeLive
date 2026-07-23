@@ -12,9 +12,13 @@ import type {
   ProviderConfig,
   ASRVendor,
 } from '../../types/asr'
-
-// 本地代理服务器地址
-const PROXY_WS_URL = 'ws://localhost:23456/ws/volc'
+import { getProxyWebSocketUrl } from '../../utils/proxyUrl'
+import {
+  buildVolcProxySearchParams,
+  createVolcRealtimeState,
+  reduceVolcRealtimeMessage,
+  type VolcRealtimeState,
+} from '../volcRealtime'
 
 export class VolcProvider extends BaseASRProvider {
   readonly id: ASRVendor = 'volc' as ASRVendor
@@ -41,7 +45,9 @@ export class VolcProvider extends BaseASRProvider {
         supportsLanguageHints: true,
       },
       timestamps: {
-        tokenTimestampOrigin: 'none',
+        supportsTokenTimestamps: true,
+        supportsSegmentTimestamps: true,
+        tokenTimestampOrigin: 'connection-relative',
       },
       workloads: {
         liveCapture: {
@@ -58,6 +64,7 @@ export class VolcProvider extends BaseASRProvider {
         },
       },
       supportsConfigTest: true,
+      supportsSpeakerDiarization: true,
     },
     requiredConfigKeys: ['appKey', 'accessKey'],
     supportedLanguages: ['zh', 'en', 'ja', 'ko'],
@@ -88,11 +95,20 @@ export class VolcProvider extends BaseASRProvider {
         placeholder: 'zh, en',
         description: '用逗号分隔的语言代码',
       },
+      {
+        key: 'enableSpeakerDiarization',
+        label: '启用多发言人识别',
+        type: 'boolean',
+        required: false,
+        defaultValue: false,
+        description: '使用火山服务端说话人聚类。只有服务返回多个 speaker ID 时才会分人，效果取决于音频和服务返回。',
+      },
     ],
   }
 
   private ws: WebSocket | null = null
   private wsReady = false
+  private realtimeState: VolcRealtimeState = createVolcRealtimeState()
 
   async connect(config: ProviderConfig): Promise<void> {
     const appKey = config.appKey as string
@@ -105,29 +121,60 @@ export class VolcProvider extends BaseASRProvider {
 
     this._config = config
     this.setState('connecting')
+    this.wsReady = false
+    this.realtimeState = createVolcRealtimeState(Boolean(config.enableSpeakerDiarization))
+
+    const params = buildVolcProxySearchParams(config)
+    let proxyUrl: string
+    try {
+      proxyUrl = await getProxyWebSocketUrl('/ws/volc', params)
+    } catch (error) {
+      this.realtimeState = createVolcRealtimeState()
+      this.emitError(this.createError('CONNECTION_ERROR', '无法获取本地代理地址'))
+      throw error
+    }
 
     return new Promise((resolve, reject) => {
-      try {
-        // 构建代理 URL，通过 URL 参数传递配置
-        const params = new URLSearchParams({
-          appKey,
-          accessKey,
-          language: (config.language as string) || '',
-          modelV2: 'true', // 使用 V2 模型
-          bidiStreaming: 'true',
-          enableDdc: 'true', // 语义顺滑
-        })
+      let connectSettled = false
+      let failureEmitted = false
 
-        const proxyUrl = `${PROXY_WS_URL}?${params.toString()}`
+      const resolveConnect = () => {
+        if (connectSettled) return
+        connectSettled = true
+        resolve()
+      }
+
+      const rejectConnect = (error: Error) => {
+        if (connectSettled) return
+        connectSettled = true
+        reject(error)
+      }
+
+      try {
         console.log('[VolcProvider] 连接到代理服务器...')
         
-        this.ws = new WebSocket(proxyUrl)
+        const ws = new WebSocket(proxyUrl)
+        this.ws = ws
 
-        this.ws.onopen = () => {
+        const failConnection = (code: string, message: string, error = new Error(message)) => {
+          if (failureEmitted) return
+          failureEmitted = true
+          this.wsReady = false
+          this.realtimeState = createVolcRealtimeState()
+          this.emitError(this.createError(code, message))
+          rejectConnect(error)
+          try {
+            ws.close(1000, 'connection error')
+          } catch {
+            // The socket may already be closing after a transport error.
+          }
+        }
+
+        ws.onopen = () => {
           console.log('[VolcProvider] 代理连接已建立，等待火山引擎就绪...')
         }
 
-        this.ws.onmessage = (event) => {
+        ws.onmessage = (event) => {
           try {
             const msg = JSON.parse(event.data)
             
@@ -136,24 +183,17 @@ export class VolcProvider extends BaseASRProvider {
                 console.log('[VolcProvider] 火山引擎已就绪')
                 this.wsReady = true
                 this.setState('connected')
-                resolve()
+                resolveConnect()
                 break
                 
               case 'partial':
-                if (msg.text) {
-                  console.log('[VolcProvider] 中间结果:', msg.text.substring(0, 50))
-                  this.emitPartial(msg.text)
-                }
-                break
-                
               case 'final':
-                console.log('[VolcProvider] 最终结果:', msg.text)
-                this.emitFinal(msg.text || '')
+                this.handleTranscriptMessage(msg)
                 break
                 
               case 'error':
                 console.error('[VolcProvider] 服务器错误:', msg.code, msg.message)
-                this.emitError(this.createError('SERVER_ERROR', msg.message || '服务器错误'))
+                failConnection('SERVER_ERROR', msg.message || '服务器错误')
                 break
             }
           } catch (e) {
@@ -161,21 +201,33 @@ export class VolcProvider extends BaseASRProvider {
           }
         }
 
-        this.ws.onerror = (error) => {
+        ws.onerror = (error) => {
           console.error('[VolcProvider] WebSocket 错误:', error)
-          this.emitError(this.createError('WEBSOCKET_ERROR', 'WebSocket 连接错误，请确保服务器已启动'))
-          reject(new Error('WebSocket 连接错误'))
+          failConnection(
+            'WEBSOCKET_ERROR',
+            'WebSocket 连接错误，请确保服务器已启动',
+            new Error('WebSocket 连接错误'),
+          )
         }
 
-        this.ws.onclose = (event) => {
+        ws.onclose = (event) => {
           console.log('[VolcProvider] WebSocket 关闭:', event.code, event.reason)
+          if (!connectSettled && !failureEmitted) {
+            failureEmitted = true
+            const message = event.reason || '连接在火山引擎就绪前关闭'
+            this.emitError(this.createError('CONNECTION_CLOSED', message))
+            rejectConnect(new Error(message))
+          }
+          if (this.ws === ws) this.ws = null
           this.wsReady = false
+          this.realtimeState = createVolcRealtimeState()
           this.setState('idle')
         }
       } catch (error) {
         console.error('[VolcProvider] 连接失败:', error)
+        this.realtimeState = createVolcRealtimeState()
         this.emitError(this.createError('CONNECTION_ERROR', '连接失败'))
-        reject(error)
+        rejectConnect(error instanceof Error ? error : new Error('连接失败'))
       }
     })
   }
@@ -197,6 +249,7 @@ export class VolcProvider extends BaseASRProvider {
     }
 
     this.wsReady = false
+    this.realtimeState = createVolcRealtimeState()
     this.setState('idle')
   }
 
@@ -215,5 +268,24 @@ export class VolcProvider extends BaseASRProvider {
     } else {
       this.ws.send(data)
     }
+  }
+
+  private handleTranscriptMessage(message: unknown): void {
+    const reduction = reduceVolcRealtimeMessage(this.realtimeState, message)
+    this.realtimeState = reduction.state
+
+    switch (reduction.event?.type) {
+      case 'tokens':
+        this.emitTokens(reduction.event.tokens)
+        break
+      case 'partial-text':
+        this.emitPartial(reduction.event.text)
+        break
+      case 'final-text':
+        this.emitFinal(reduction.event.text)
+        break
+    }
+
+    if (reduction.terminal) this.emitFinished()
   }
 }

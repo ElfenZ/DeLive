@@ -1,4 +1,6 @@
 import type {
+  MeetingContextSnapshot,
+  RecognitionConfigSnapshot,
   TranscriptPostProcess,
   TranscriptSession,
   TranscriptSourceMeta,
@@ -18,6 +20,8 @@ export function createDraftSession(options: {
   providerId?: string
   topicId?: string
   sourceMeta?: TranscriptSourceMeta
+  meetingContext?: MeetingContextSnapshot
+  recognitionConfig?: RecognitionConfigSnapshot
 }): TranscriptSession {
   const now = options.now ?? Date.now()
 
@@ -33,6 +37,8 @@ export function createDraftSession(options: {
     tagIds: [],
     providerId: options.providerId,
     sourceMeta: options.sourceMeta,
+    meetingContext: options.meetingContext,
+    recognitionConfig: options.recognitionConfig,
     status: 'recording',
     lastPersistedAt: now,
   }

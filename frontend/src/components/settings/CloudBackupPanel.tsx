@@ -27,7 +27,11 @@ import {
 import { getSessions } from '../../utils/sessionStorage'
 import { getSettings, getTags, getTopics } from '../../utils/settingsStorage'
 import { normalizeTranscriptSessions } from '../../utils/sessionSchema'
-import { CURRENT_BACKUP_VERSION, CURRENT_BACKUP_SCHEMA_VERSION } from '../../utils/backupStorage'
+import {
+  CURRENT_BACKUP_VERSION,
+  CURRENT_BACKUP_SCHEMA_VERSION,
+  sanitizeSettingsForBackup,
+} from '../../utils/backupStorage'
 
 interface CloudBackupPanelProps {
   t: Translations
@@ -59,7 +63,7 @@ function buildIpcConfig(config: CloudBackupConfig): CloudBackupIpcConfig {
 async function buildBackupJson(): Promise<string> {
   const sessions = normalizeTranscriptSessions(await getSessions())
   const tags = getTags()
-  const settings = getSettings()
+  const settings = sanitizeSettingsForBackup(getSettings())
   const topics = getTopics()
   const data: BackupData = {
     version: CURRENT_BACKUP_VERSION,

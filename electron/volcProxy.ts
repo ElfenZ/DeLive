@@ -7,8 +7,37 @@ import { attachDeepgramProxyServer } from '../shared/deepgramProxyCore'
 import { attachAssemblyAIProxyServer } from '../shared/assemblyaiProxyCore'
 import { attachElevenLabsProxyServer } from '../shared/elevenlabsProxyCore'
 import { attachGladiaProxyServer } from '../shared/gladiaProxyCore'
+import { PROXY_PORT_CANDIDATES, selectProxyPort } from '../shared/proxyPort'
 
-export function startVolcProxyServer(port = 23456): Server {
+export interface ProxyServerRuntime {
+  server: Server
+  port: number
+  close: () => Promise<void>
+}
+
+function listen(server: Server, port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onListening = () => {
+      cleanup()
+      resolve()
+    }
+    const onError = (error: Error) => {
+      cleanup()
+      reject(error)
+    }
+    const cleanup = () => {
+      server.off('listening', onListening)
+      server.off('error', onError)
+    }
+    server.once('listening', onListening)
+    server.once('error', onError)
+    server.listen(port, '127.0.0.1')
+  })
+}
+
+export async function startVolcProxyServer(
+  ports: readonly number[] = PROXY_PORT_CANDIDATES,
+): Promise<ProxyServerRuntime> {
   const server = createServer()
 
   const volcWss = new WebSocketServer({ noServer: true })
@@ -56,28 +85,45 @@ export function startVolcProxyServer(port = 23456): Server {
       gladiaWss.handleUpgrade(request, socket, head, (ws) => {
         gladiaWss.emit('connection', ws, request)
       })
-    } else {
+    } else if (pathname !== '/ws/live') {
       socket.destroy()
     }
   })
 
-  server.listen(port, () => {
+  const webSocketServers = [volcWss, mistralWss, deepgramWss, assemblyaiWss, elevenlabsWss, gladiaWss]
+  try {
+    const port = await selectProxyPort(async (candidate) => {
+      try {
+        await listen(server, candidate)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') {
+          console.warn(`[Proxy] 端口 ${candidate} 已被占用，尝试下一个候选端口`)
+        }
+        throw error
+      }
+    }, ports)
+
     console.log(`[Proxy] 内置代理服务器已启动: http://localhost:${port}`)
-    console.log(`[Proxy] 火山引擎: ws://localhost:${port}/ws/volc`)
-    console.log(`[Proxy] Mistral: ws://localhost:${port}/ws/mistral`)
-    console.log(`[Proxy] Deepgram: ws://localhost:${port}/ws/deepgram`)
-    console.log(`[Proxy] AssemblyAI: ws://localhost:${port}/ws/assemblyai`)
-    console.log(`[Proxy] ElevenLabs: ws://localhost:${port}/ws/elevenlabs`)
-    console.log(`[Proxy] Gladia: ws://localhost:${port}/ws/gladia`)
-  })
+    console.log(`[Proxy] Provider WebSocket: ws://localhost:${port}/ws/{provider}`)
 
-  server.on('error', (error: NodeJS.ErrnoException) => {
-    if (error.code === 'EADDRINUSE') {
-      console.log(`[Proxy] 端口 ${port} 已被占用，代理服务器可能已在运行`)
-    } else {
-      console.error('[Proxy] 服务器错误:', error)
+    return {
+      server,
+      port,
+      close: async () => {
+        for (const wss of webSocketServers) {
+          for (const client of wss.clients) client.terminate()
+        }
+        await Promise.all(webSocketServers.map((wss) => new Promise<void>((resolve) => wss.close(() => resolve()))))
+        if (server.listening) {
+          await new Promise<void>((resolve, reject) => {
+            server.close((error) => error ? reject(error) : resolve())
+          })
+        }
+      },
     }
-  })
-
-  return server
+  } catch (error) {
+    for (const wss of webSocketServers) wss.close()
+    if (server.listening) server.close()
+    throw error
+  }
 }

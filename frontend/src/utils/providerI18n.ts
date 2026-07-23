@@ -18,6 +18,11 @@ const FIELD_LABEL_MAP: Record<string, Record<string, keyof ProviderStrings>> = {
   soniox: {
     apiKey: 'fieldApiKey',
     languageHints: 'fieldLanguageHints',
+    languageHintsStrict: 'fieldLanguageHintsStrict',
+    enableEndpointDetection: 'fieldEndpointDetection',
+    endpointSensitivity: 'fieldEndpointSensitivity',
+    maxEndpointDelayMs: 'fieldMaxEndpointDelay',
+    endpointLatencyAdjustmentLevel: 'fieldEndpointLatencyLevel',
     translationEnabled: 'fieldTranslationEnabled',
     translationTargetLanguage: 'fieldTranslationTarget',
     enableSpeakerDiarization: 'fieldSpeakerDiarization',
@@ -26,6 +31,7 @@ const FIELD_LABEL_MAP: Record<string, Record<string, keyof ProviderStrings>> = {
     appKey: 'fieldVolcAppId',
     accessKey: 'fieldVolcAccessToken',
     languageHints: 'fieldLanguageHints',
+    enableSpeakerDiarization: 'fieldSpeakerDiarization',
   },
   groq: {
     apiKey: 'fieldApiKey',
@@ -61,6 +67,11 @@ const FIELD_DESC_MAP: Record<string, Record<string, keyof ProviderStrings>> = {
   soniox: {
     apiKey: 'fieldSonioxApiKeyDesc',
     languageHints: 'fieldLanguageHintsDescSoniox',
+    languageHintsStrict: 'fieldLanguageHintsStrictDesc',
+    enableEndpointDetection: 'fieldEndpointDetectionDesc',
+    endpointSensitivity: 'fieldEndpointSensitivityDesc',
+    maxEndpointDelayMs: 'fieldMaxEndpointDelayDesc',
+    endpointLatencyAdjustmentLevel: 'fieldEndpointLatencyLevelDesc',
     translationEnabled: 'fieldTranslationEnabledDesc',
     translationTargetLanguage: 'fieldTranslationTargetDesc',
     enableSpeakerDiarization: 'fieldSpeakerDiarizationDesc',
@@ -69,6 +80,7 @@ const FIELD_DESC_MAP: Record<string, Record<string, keyof ProviderStrings>> = {
     appKey: 'fieldVolcAppIdDesc',
     accessKey: 'fieldVolcAccessTokenDesc',
     languageHints: 'fieldLanguageHintsDescVolc',
+    enableSpeakerDiarization: 'fieldVolcSpeakerDiarizationDesc',
   },
   groq: {
     apiKey: 'fieldGroqApiKeyDesc',
@@ -100,7 +112,11 @@ const FIELD_DESC_MAP: Record<string, Record<string, keyof ProviderStrings>> = {
 }
 
 const FIELD_PLACEHOLDER_MAP: Record<string, Record<string, keyof ProviderStrings>> = {
-  soniox: { apiKey: 'fieldSonioxApiKeyPlaceholder' },
+  soniox: {
+    apiKey: 'fieldSonioxApiKeyPlaceholder',
+    maxEndpointDelayMs: 'fieldMaxEndpointDelayPlaceholder',
+    endpointLatencyAdjustmentLevel: 'fieldEndpointLatencyLevelPlaceholder',
+  },
   volc: {
     appKey: 'fieldVolcAppIdPlaceholder',
     accessKey: 'fieldVolcAccessTokenPlaceholder',
@@ -129,6 +145,14 @@ const LANG_LABEL_MAP: Record<string, keyof ProviderStrings> = {
   vi: 'langVi',
 }
 
+const GROUP_LABEL_MAP: Record<string, Record<string, keyof ProviderStrings>> = {
+  soniox: { advanced: 'fieldSonioxAdvancedGroup' },
+}
+
+const FIELD_WARNING_MAP: Record<string, Record<string, keyof ProviderStrings>> = {
+  soniox: { enableSpeakerDiarization: 'fieldSpeakerEndpointWarning' },
+}
+
 function lookup(p: ProviderStrings, key: keyof ProviderStrings | undefined): string | undefined {
   if (!key) return undefined
   return (p as Record<string, unknown>)[key as string] as string | undefined
@@ -143,6 +167,8 @@ export function translateConfigField(
   const labelKey = FIELD_LABEL_MAP[providerId]?.[field.key]
   const descKey = FIELD_DESC_MAP[providerId]?.[field.key]
   const placeholderKey = FIELD_PLACEHOLDER_MAP[providerId]?.[field.key]
+  const groupLabelKey = field.group ? GROUP_LABEL_MAP[providerId]?.[field.group] : undefined
+  const warningKey = FIELD_WARNING_MAP[providerId]?.[field.key]
 
   const translatedOptions = field.options?.map(opt => {
     const langKey = LANG_LABEL_MAP[opt.value]
@@ -155,6 +181,8 @@ export function translateConfigField(
     label: lookup(p, labelKey) || field.label,
     description: lookup(p, descKey) || field.description,
     placeholder: lookup(p, placeholderKey) || field.placeholder,
+    groupLabel: lookup(p, groupLabelKey) || field.groupLabel,
+    warning: lookup(p, warningKey) || field.warning,
     ...(translatedOptions ? { options: translatedOptions } : {}),
   }
 }

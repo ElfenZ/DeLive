@@ -3,6 +3,7 @@ import type {
   AiPostProcessConfig,
   AppSettings,
   CloudBackupConfig,
+  MeetingContextConfig,
   OpenApiConfig,
   ProviderConfigData,
   CaptionStyle,
@@ -17,6 +18,11 @@ import {
 import { getDefaultSettings } from '../utils/storageShared'
 import { providerRegistry } from '../providers'
 import type { ASRProviderInfo, ASRVendor } from '../types/asr'
+import {
+  MeetingContextValidationError,
+  normalizeGlossaryEntries,
+  normalizeMeetingContextConfig,
+} from '../utils/meetingContext'
 
 const defaultCaptionStyle: CaptionStyle = {
   fontSize: 24,
@@ -40,6 +46,7 @@ export interface SettingsState {
   loadSettings: () => Promise<void>
   updateSettings: (settings: Partial<AppSettings>) => void
   updateAiPostProcessConfig: (config: Partial<AiPostProcessConfig>) => Promise<void>
+  updateMeetingContextConfig: (config: Partial<MeetingContextConfig>) => void
   updateOpenApiConfig: (config: Partial<OpenApiConfig>) => void
   updateCloudBackupConfig: (config: Partial<CloudBackupConfig>) => Promise<void>
 
@@ -58,6 +65,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     capture: getDefaultSettings().capture,
     captionStyle: defaultCaptionStyle,
     aiPostProcess: getDefaultSettings().aiPostProcess,
+    meetingContext: getDefaultSettings().meetingContext,
   },
   loadSettings: async () => {
     const settings = getSettings()
@@ -79,7 +87,16 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       settings.currentVendor = registeredVendors[0] || 'soniox'
     }
 
-    const merged = {
+    const normalizedMeetingContext = normalizeMeetingContextConfig(settings.meetingContext)
+    if (normalizedMeetingContext.errors.length > 0) {
+      console.warn('[Settings] Invalid meeting context fields were reset:', normalizedMeetingContext.errors)
+    }
+    const normalizedGlossary = normalizeGlossaryEntries(settings.aiPostProcess?.glossary, { includeDisabled: true })
+    if (normalizedGlossary.errors.length > 0) {
+      console.warn('[Settings] Invalid glossary entries were ignored:', normalizedGlossary.errors)
+    }
+
+    const merged: AppSettings = {
       ...settings,
       captionStyle: {
         ...defaultCaptionStyle,
@@ -88,7 +105,9 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       aiPostProcess: {
         ...defaultSettings.aiPostProcess,
         ...(settings.aiPostProcess || {}),
+        glossary: normalizedGlossary.value,
       },
+      meetingContext: normalizedMeetingContext.value,
       openApi: {
         ...defaultSettings.openApi,
         ...(settings.openApi || {}),
@@ -103,10 +122,11 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       },
     }
 
-    if (merged.aiPostProcess.model && !merged.aiPostProcess.defaultModel) {
-      merged.aiPostProcess.defaultModel = merged.aiPostProcess.model
+    const mergedAiPostProcess = merged.aiPostProcess || {}
+    if (mergedAiPostProcess.model && !mergedAiPostProcess.defaultModel) {
+      mergedAiPostProcess.defaultModel = mergedAiPostProcess.model
     }
-    merged.aiPostProcess = enforceAiAutomationExclusivity(merged.aiPostProcess)
+    merged.aiPostProcess = enforceAiAutomationExclusivity(mergedAiPostProcess)
 
     set({ settings: merged })
 
@@ -129,7 +149,17 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   updateAiPostProcessConfig: async (config) => {
     const { settings } = get()
     const currentConfig = settings.aiPostProcess || {}
-    const nextConfig = enforceAiAutomationExclusivity({ ...currentConfig, ...config })
+    const normalizedGlossary = config.glossary === undefined
+      ? undefined
+      : normalizeGlossaryEntries(config.glossary, { includeDisabled: true })
+    if (normalizedGlossary?.errors.length) {
+      throw new MeetingContextValidationError(normalizedGlossary.errors)
+    }
+    const nextConfig = enforceAiAutomationExclusivity({
+      ...currentConfig,
+      ...config,
+      ...(normalizedGlossary ? { glossary: normalizedGlossary.value } : {}),
+    })
     const inMemorySettings = {
       ...settings,
       aiPostProcess: nextConfig,
@@ -148,6 +178,19 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
         apiKey: encryptedApiKey,
       },
     })
+  },
+  updateMeetingContextConfig: (config) => {
+    const { settings } = get()
+    const normalized = normalizeMeetingContextConfig({
+      ...(settings.meetingContext || {}),
+      ...config,
+    })
+    if (normalized.errors.length > 0) {
+      throw new MeetingContextValidationError(normalized.errors)
+    }
+    const nextSettings = { ...settings, meetingContext: normalized.value }
+    saveSettings(nextSettings)
+    set({ settings: nextSettings })
   },
   updateOpenApiConfig: (config) => {
     const { settings } = get()

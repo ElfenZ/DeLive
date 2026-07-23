@@ -4,6 +4,7 @@ import {
   CURRENT_BACKUP_VERSION,
   getBackupValidationErrors,
   upgradeBackupData,
+  sanitizeSettingsForBackup,
   validateBackupData,
 } from './backupStorage'
 
@@ -75,7 +76,7 @@ describe('backupStorage', () => {
     expect(upgraded.sessions).toHaveLength(1)
     expect(upgraded.sessions[0]).toEqual(expect.objectContaining({
       id: 'legacy-session',
-      schemaVersion: 5,
+      schemaVersion: 6,
       transcript: 'hello world',
       tagIds: [],
       speakers: [],
@@ -135,5 +136,70 @@ describe('backupStorage', () => {
         },
       },
     }))
+  })
+
+  it('round-trips meeting context and target-only glossary entries', () => {
+    const upgraded = upgradeBackupData({
+      version: '4.0',
+      schemaVersion: 4,
+      exportedAt: '2026-07-19T00:00:00Z',
+      sessions: [],
+      tags: [],
+      settings: {
+        apiKey: '',
+        languageHints: [],
+        meetingContext: {
+          background: 'Developer meeting',
+          correctionGuidance: 'Keep DeLive case',
+          useForAiCorrection: true,
+          useForSoniox: true,
+        },
+        aiPostProcess: {
+          glossary: [{ id: 'term-1', target: 'TypeScript', enabled: true }],
+        },
+      },
+    })
+    expect(upgraded.settings.meetingContext).toEqual({
+      background: 'Developer meeting',
+      correctionGuidance: 'Keep DeLive case',
+      useForAiCorrection: true,
+      useForSoniox: true,
+    })
+    expect(upgraded.settings.aiPostProcess?.glossary).toEqual([
+      { id: 'term-1', target: 'TypeScript', enabled: true },
+    ])
+  })
+
+  it('removes credentials from exported settings without dropping non-secret context', () => {
+    const sanitized = sanitizeSettingsForBackup({
+      apiKey: 'legacy-secret',
+      languageHints: ['zh'],
+      meetingContext: {
+        background: 'Project facts',
+        correctionGuidance: '',
+        useForAiCorrection: true,
+        useForSoniox: false,
+      },
+      providerConfigs: {
+        soniox: { apiKey: 'soniox-secret', endpointSensitivity: 0 },
+        volc: { appKey: 'app-secret', accessKey: 'access-secret' },
+      },
+      aiPostProcess: { apiKey: 'ai-secret', glossary: [] },
+      openApi: { enabled: true, token: 'api-token' },
+      cloudBackup: {
+        s3: {
+          endpoint: 'https://s3.example.com', region: 'x', bucket: 'b', prefix: '',
+          accessKeyId: 'id', secretAccessKey: 'secret',
+        },
+      },
+    })
+    expect(sanitized.apiKey).toBe('')
+    expect(sanitized.providerConfigs?.soniox.apiKey).toBe('')
+    expect(sanitized.providerConfigs?.soniox.endpointSensitivity).toBe(0)
+    expect(sanitized.providerConfigs?.volc).toEqual({ appKey: '', accessKey: '' })
+    expect(sanitized.aiPostProcess?.apiKey).toBe('')
+    expect(sanitized.openApi?.token).toBe('')
+    expect(sanitized.cloudBackup?.s3?.secretAccessKey).toBe('')
+    expect(sanitized.meetingContext?.background).toBe('Project facts')
   })
 })

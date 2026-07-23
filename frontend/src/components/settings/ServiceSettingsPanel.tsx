@@ -64,7 +64,35 @@ export function ServiceSettingsPanel({
   testStatus,
   testMessage,
   onBundledRuntimePatch,
-}: ServiceSettingsPanelProps) {
+  }: ServiceSettingsPanelProps) {
+  const conditionMatches = (condition: ProviderConfigField['visibleWhen']): boolean => {
+    if (!condition) return true
+    const value = condition.fieldKey === 'languageHints'
+      ? languageHints
+      : (typeof condition.equals === 'boolean'
+          ? getBooleanFieldValue(condition.fieldKey)
+          : getStringFieldValue(condition.fieldKey))
+    if (condition.nonEmpty) {
+      return Array.isArray(value) ? value.length > 0 : String(value).trim().length > 0
+    }
+    if (condition.equals !== undefined) {
+      if (typeof condition.equals === 'boolean') return Boolean(value) === condition.equals
+      return String(value) === String(condition.equals)
+    }
+    return true
+  }
+
+  const renderFieldWarning = (field: ProviderConfigField) => {
+    if (!field.warning || !conditionMatches(field.warningWhen)) return null
+    if (field.type === 'boolean' && !getBooleanFieldValue(field.key)) return null
+    return (
+      <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-foreground">
+        <AlertCircle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0 text-amber-600 dark:text-amber-400" />
+        <span>{field.warning}</span>
+      </div>
+    )
+  }
+
   const renderFieldDescription = (field: ProviderConfigField) => {
     const description = field.description?.trim()
     const docsUrl = getProviderConsoleUrl(currentProvider)
@@ -93,6 +121,7 @@ export function ServiceSettingsPanel({
   }
 
   const renderProviderField = (field: ProviderConfigField) => {
+    const disabled = !conditionMatches(field.enabledWhen)
     const commonInputClassName = `flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 ${isMonospaceField(field) ? 'font-mono' : ''}`
 
     if (field.type === 'boolean') {
@@ -111,9 +140,11 @@ export function ServiceSettingsPanel({
             <Switch
               checked={getBooleanFieldValue(field.key)}
               onChange={(val) => updateFormField(field.key, val)}
+              disabled={disabled}
               aria-label={field.label}
             />
           </div>
+          {renderFieldWarning(field)}
         </div>
       )
     }
@@ -128,6 +159,7 @@ export function ServiceSettingsPanel({
           <select
             value={getStringFieldValue(field.key)}
             onChange={(e) => updateFormField(field.key, e.target.value)}
+            disabled={disabled}
             className={commonInputClassName}
           >
             <option value="">{field.placeholder || field.label}</option>
@@ -138,6 +170,7 @@ export function ServiceSettingsPanel({
             ))}
           </select>
           {renderFieldDescription(field)}
+          {renderFieldWarning(field)}
         </div>
       )
     }
@@ -164,6 +197,10 @@ export function ServiceSettingsPanel({
             value={value}
             onChange={(e) => updateFormField(field.key, e.target.value)}
             placeholder={placeholder}
+            min={field.type === 'number' ? field.min : undefined}
+            max={field.type === 'number' ? field.max : undefined}
+            step={field.type === 'number' ? field.step : undefined}
+            disabled={disabled}
             className={`${commonInputClassName} ${isPasswordField ? 'pr-10' : ''}`}
           />
           {isPasswordField && (
@@ -177,6 +214,7 @@ export function ServiceSettingsPanel({
           )}
         </div>
         {renderFieldDescription(field)}
+        {renderFieldWarning(field)}
       </div>
     )
   }
@@ -267,6 +305,17 @@ export function ServiceSettingsPanel({
   const providerFields = (currentProvider?.configFields || [])
     .filter(field => field.key !== 'languageHints' && !guideManagedFieldKeys.has(field.key))
     .map(field => translateConfigField(providerId, field, t))
+    .filter(field => conditionMatches(field.visibleWhen))
+  const ungroupedProviderFields = providerFields.filter(field => !field.group)
+  const groupedProviderFields = Array.from(
+    providerFields.reduce((groups, field) => {
+      if (!field.group) return groups
+      const group = groups.get(field.group) || []
+      group.push(field)
+      groups.set(field.group, group)
+      return groups
+    }, new Map<string, ProviderConfigField[]>()),
+  )
 
   const hasRightColumn = shouldShowLocalSetupGuide || shouldShowBundledRuntimeGuide
 
@@ -286,13 +335,38 @@ export function ServiceSettingsPanel({
           </div>
         </section>
 
-        {providerFields.length > 0 && (
+        {ungroupedProviderFields.length > 0 && (
           <section className="workspace-panel-muted p-4">
             <div className="grid gap-4 md:grid-cols-2">
-              {providerFields.map(renderProviderField)}
+              {ungroupedProviderFields.map(renderProviderField)}
             </div>
           </section>
         )}
+
+        {groupedProviderFields.map(([groupId, fields]) => {
+          const first = fields[0]
+          const content = <div className="grid gap-4 pt-4 md:grid-cols-2">{fields.map(renderProviderField)}</div>
+          if (first.groupCollapsible !== false) {
+            return (
+              <details
+                key={groupId}
+                open={first.groupDefaultOpen}
+                className="workspace-panel-muted p-4"
+              >
+                <summary className="cursor-pointer text-sm font-semibold text-foreground">
+                  {first.groupLabel || groupId}
+                </summary>
+                {content}
+              </details>
+            )
+          }
+          return (
+            <section key={groupId} className="workspace-panel-muted p-4">
+              <h3 className="text-sm font-semibold text-foreground">{first.groupLabel || groupId}</h3>
+              {content}
+            </section>
+          )
+        })}
 
         {renderTestButton() && (
           <section className="workspace-panel-muted p-4">

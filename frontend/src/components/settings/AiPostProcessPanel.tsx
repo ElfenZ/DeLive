@@ -15,7 +15,7 @@ import {
 } from 'lucide-react'
 import { Switch } from '../ui'
 import type { Translations } from '../../i18n'
-import type { AiFeatureKey, AiGlossaryEntry, AiPostProcessConfig } from '../../types'
+import type { AiFeatureKey, AiGlossaryEntry, AiPostProcessConfig, MeetingContextConfig } from '../../types'
 import { fetchAvailableModels } from '../../services/aiPostProcess'
 import { generateId } from '../../utils/storage'
 
@@ -24,6 +24,8 @@ interface AiPostProcessPanelProps {
   language: string
   aiPostProcessConfig: AiPostProcessConfig
   updateAiPostProcessConfig: (config: Partial<AiPostProcessConfig>) => void
+  meetingContextConfig: MeetingContextConfig
+  updateMeetingContextConfig: (config: Partial<MeetingContextConfig>) => void
 }
 
 const AI_FEATURES: { key: AiFeatureKey; labelZh: string; labelEn: string }[] = [
@@ -38,6 +40,8 @@ export function AiPostProcessPanel({
   language,
   aiPostProcessConfig,
   updateAiPostProcessConfig,
+  meetingContextConfig,
+  updateMeetingContextConfig,
 }: AiPostProcessPanelProps) {
   const cfg = aiPostProcessConfig
   const isZh = language === 'zh'
@@ -111,25 +115,7 @@ export function AiPostProcessPanel({
 
   const updateGlossary = useCallback(
     (entries: AiGlossaryEntry[]) => {
-      const seen = new Set<string>()
-      const next = entries
-        .map((entry) => ({
-          ...entry,
-          source: entry.source,
-          target: entry.target,
-          note: entry.note,
-        }))
-        .filter((entry) => {
-          const source = entry.source.trim()
-          const target = entry.target.trim()
-          if (!source && !target) return true
-          if (!source || !target) return true
-          const key = `${source.toLowerCase()}\u0000${target.toLowerCase()}`
-          if (seen.has(key)) return false
-          seen.add(key)
-          return true
-        })
-      updateAiPostProcessConfig({ glossary: next })
+      updateAiPostProcessConfig({ glossary: entries })
     },
     [updateAiPostProcessConfig],
   )
@@ -490,6 +476,68 @@ export function AiPostProcessPanel({
         </div>
       </section>
 
+      <section className="workspace-panel-muted p-4 space-y-4">
+        <div>
+          <label className="text-sm font-medium leading-none flex items-center gap-2">
+            <Sparkles className="w-3.5 h-3.5 text-muted-foreground" />
+            {t.settings.meetingContextTitle}
+          </label>
+          <p className="mt-2 text-xs text-muted-foreground">{t.settings.meetingContextDesc}</p>
+        </div>
+
+        <div className="space-y-2">
+          <label className="text-xs font-medium text-muted-foreground">{t.settings.meetingBackground}</label>
+          <textarea
+            value={meetingContextConfig.background}
+            onChange={(event) => updateMeetingContextConfig({ background: event.target.value })}
+            placeholder={t.settings.meetingBackgroundPlaceholder}
+            rows={5}
+            className="w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+          />
+          <p className="text-xs text-muted-foreground">{t.settings.meetingBackgroundDesc}</p>
+        </div>
+
+        <div className="space-y-2">
+          <label className="text-xs font-medium text-muted-foreground">{t.settings.correctionGuidance}</label>
+          <textarea
+            value={meetingContextConfig.correctionGuidance}
+            onChange={(event) => updateMeetingContextConfig({ correctionGuidance: event.target.value })}
+            placeholder={t.settings.correctionGuidancePlaceholder}
+            rows={3}
+            className="w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+          />
+          <p className="text-xs text-muted-foreground">{t.settings.correctionGuidanceDesc}</p>
+        </div>
+
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-border/70 bg-muted/20 p-3">
+            <div>
+              <p className="text-sm font-medium">{t.settings.contextUseForAi}</p>
+              <p className="mt-1 text-xs text-muted-foreground">{t.settings.contextUseForAiDesc}</p>
+            </div>
+            <Switch
+              checked={meetingContextConfig.useForAiCorrection}
+              onChange={(value) => updateMeetingContextConfig({ useForAiCorrection: value })}
+              aria-label={t.settings.contextUseForAi}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-border/70 bg-muted/20 p-3">
+            <div>
+              <p className="text-sm font-medium">{t.settings.contextUseForSoniox}</p>
+              <p className="mt-1 text-xs text-muted-foreground">{t.settings.contextUseForSonioxDesc}</p>
+            </div>
+            <Switch
+              checked={meetingContextConfig.useForSoniox}
+              onChange={(value) => updateMeetingContextConfig({ useForSoniox: value })}
+              aria-label={t.settings.contextUseForSoniox}
+            />
+          </div>
+        </div>
+        <p className="rounded-md border border-border/70 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+          {t.settings.contextDestinationNote}
+        </p>
+      </section>
+
       <section className="workspace-panel-muted p-4 space-y-3">
         <label className="text-sm font-medium leading-none flex items-center gap-2">
           <Sparkles className="w-3.5 h-3.5 text-muted-foreground" />
@@ -571,12 +619,10 @@ export function AiPostProcessPanel({
           <div>
             <label className="text-sm font-medium leading-none flex items-center gap-2">
               <Sparkles className="w-3.5 h-3.5 text-muted-foreground" />
-              {isZh ? 'AI 纠错词汇表' : 'AI Correction Glossary'}
+               {t.settings.correctionGlossaryTitle}
             </label>
             <p className="text-xs text-muted-foreground mt-2">
-              {isZh
-                ? '为高频误识别词提供提示，例如 difine -> dify。保存设置后生效。'
-                : 'Guide frequent ASR fixes, for example difine -> dify. Changes apply after saving settings.'}
+              {t.settings.correctionGlossaryDesc}
             </p>
           </div>
           <button
@@ -585,18 +631,31 @@ export function AiPostProcessPanel({
             className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-input bg-background px-3 text-xs font-medium transition-colors hover:bg-accent"
           >
             <Plus className="w-3.5 h-3.5" />
-            {isZh ? '添加' : 'Add'}
+            {t.settings.correctionGlossaryAdd}
           </button>
         </div>
 
         {glossary.length === 0 ? (
           <p className="rounded-lg border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground">
-            {isZh ? '暂无词汇表条目' : 'No glossary entries yet'}
+            {t.settings.correctionGlossaryEmpty}
           </p>
         ) : (
           <div className="space-y-2">
             {glossary.map((entry) => (
-              <div key={entry.id} className="grid grid-cols-[auto_1fr_1fr_auto] gap-2 rounded-lg bg-muted/50 p-2 sm:grid-cols-[auto_1fr_1fr_1fr_auto]">
+              <div key={entry.id} className="space-y-2 rounded-lg bg-muted/50 p-2">
+                <div className="flex items-center justify-between gap-3 px-1">
+                  <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                    {entry.source?.trim()
+                      ? t.settings.correctionGlossaryMappingMode
+                      : t.settings.correctionGlossaryCandidateMode}
+                  </span>
+                  <span className="text-[11px] text-muted-foreground">
+                    {entry.source?.trim()
+                      ? t.settings.correctionGlossaryMappingHint
+                      : t.settings.correctionGlossaryCandidateHint}
+                  </span>
+                </div>
+                <div className="grid grid-cols-[auto_1fr_1fr_auto] gap-2 sm:grid-cols-[auto_1fr_1fr_1fr_auto]">
                 <Switch
                   checked={entry.enabled !== false}
                   onChange={(val) => patchGlossaryEntry(entry.id, { enabled: val })}
@@ -604,23 +663,23 @@ export function AiPostProcessPanel({
                 />
                 <input
                   type="text"
-                  value={entry.source}
+                  value={entry.source || ''}
                   onChange={(e) => patchGlossaryEntry(entry.id, { source: e.target.value })}
-                  placeholder={isZh ? '误识别词' : 'Wrong term'}
+                  placeholder={t.settings.correctionGlossarySourcePlaceholder}
                   className="h-8 min-w-0 rounded-md border border-input bg-background px-2 text-xs"
                 />
                 <input
                   type="text"
                   value={entry.target}
                   onChange={(e) => patchGlossaryEntry(entry.id, { target: e.target.value })}
-                  placeholder={isZh ? '正确词' : 'Correct term'}
+                  placeholder={t.settings.correctionGlossaryTargetPlaceholder}
                   className="h-8 min-w-0 rounded-md border border-input bg-background px-2 text-xs"
                 />
                 <input
                   type="text"
                   value={entry.note || ''}
                   onChange={(e) => patchGlossaryEntry(entry.id, { note: e.target.value })}
-                  placeholder={isZh ? '备注' : 'Note'}
+                  placeholder={t.settings.correctionGlossaryNotePlaceholder}
                   className="col-span-3 h-8 min-w-0 rounded-md border border-input bg-background px-2 text-xs sm:col-span-1"
                 />
                 <button
@@ -631,6 +690,7 @@ export function AiPostProcessPanel({
                 >
                   <Trash2 className="w-3.5 h-3.5" />
                 </button>
+                </div>
               </div>
             ))}
           </div>

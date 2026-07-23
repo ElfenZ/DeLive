@@ -11,6 +11,7 @@ import type {
 
 const electronAPI: ElectronAPI = {
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
+  getProxyPort: () => ipcRenderer.invoke('get-proxy-port') as Promise<number>,
   minimizeToTray: () => ipcRenderer.invoke('minimize-to-tray'),
   windowMinimize: (source?: string) => ipcRenderer.invoke('window-minimize', source),
   windowMaximize: () => ipcRenderer.invoke('window-maximize'),

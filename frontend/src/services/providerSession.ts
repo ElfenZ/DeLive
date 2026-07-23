@@ -22,7 +22,14 @@ import type {
   ASRTimestampOrigin,
   CaptureRestartStrategy,
 } from '../types/asr'
-import type { AppSettings, ProviderConfigData } from '../types'
+import type {
+  AppSettings,
+  MeetingContextSnapshot,
+  ProviderConfigData,
+  RecognitionConfigSnapshot,
+} from '../types'
+import { resolveMeetingContextSnapshot } from '../utils/meetingContext'
+import { createSonioxRecognitionSnapshot, parseSonioxConfig } from '../utils/sonioxConfig'
 
 export const PROVIDER_DRAIN_TIMEOUT_MS = 2_000
 
@@ -38,6 +45,8 @@ export interface ProviderSetup {
   providerInfo: ASRProviderInfo
   connectConfig: ProviderConfig
   captureRestartStrategy: CaptureRestartStrategy
+  meetingContext: MeetingContextSnapshot
+  recognitionConfig: RecognitionConfigSnapshot
 }
 
 export type ProviderSessionDrainStatus = 'no-provider' | 'finished' | 'timeout'
@@ -98,14 +107,25 @@ export class ProviderSessionManager {
    * 解析 vendor 配置、校验必填字段。
    * 抛出 Error 表示配置不完整。
    */
-  resolveSetup(vendorId: ASRVendor, settings: AppSettings): ProviderSetup {
+  resolveSetup(
+    vendorId: ASRVendor,
+    settings: AppSettings,
+    meetingContext?: MeetingContextSnapshot,
+  ): ProviderSetup {
     const providerInfo = providerRegistry.getInfo(vendorId)
     if (!providerInfo) {
       throw new Error(`未找到提供商: ${vendorId}`)
     }
 
     const providerConfig = settings.providerConfigs?.[vendorId]
-    const connectConfig = buildProviderConnectConfig(providerInfo, providerConfig, settings)
+    const effectiveMeetingContext = meetingContext ?? resolveMeetingContextSnapshot(
+      settings.meetingContext,
+      settings.aiPostProcess?.glossary,
+    )
+    const baseConnectConfig = buildProviderConnectConfig(providerInfo, providerConfig, settings)
+    const connectConfig: ProviderConfig = vendorId === 'soniox'
+      ? { ...baseConnectConfig, meetingContext: effectiveMeetingContext }
+      : baseConnectConfig
 
     const missingLabels = getMissingRequiredConfigLabels(
       providerInfo,
@@ -115,10 +135,31 @@ export class ProviderSessionManager {
       throw new Error(`Please configure: ${missingLabels.join(', ')}`)
     }
 
+    const model = typeof connectConfig.model === 'string' && connectConfig.model.trim()
+      ? connectConfig.model.trim()
+      : undefined
+    const effectiveSonioxConfig = vendorId === 'soniox'
+      ? parseSonioxConfig(connectConfig as ProviderConfigData, { meetingContext: effectiveMeetingContext }).value
+      : undefined
+    const recognitionConfig: RecognitionConfigSnapshot = effectiveSonioxConfig
+      ? {
+          schemaVersion: 1,
+          providerId: vendorId,
+          model: effectiveSonioxConfig.realtimeModel,
+          soniox: createSonioxRecognitionSnapshot(effectiveSonioxConfig),
+        }
+      : {
+          schemaVersion: 1,
+          providerId: vendorId,
+          ...(model ? { model } : {}),
+        }
+
     return {
       providerInfo,
       connectConfig,
       captureRestartStrategy: getCaptureRestartStrategy(providerInfo.capabilities),
+      meetingContext: effectiveMeetingContext,
+      recognitionConfig,
     }
   }
 

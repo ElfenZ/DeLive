@@ -57,7 +57,7 @@ import {
   type VolcWord,
   type VolcUtterance,
 } from '../utils/volcFileApi'
-import { SONIOX_DEFAULT_ASYNC_MODEL } from '../types/asr/vendors/soniox'
+import { parseSonioxConfig } from '../utils/sonioxConfig'
 
 /* ─── Soniox result conversion ──────────────────────────────── */
 
@@ -182,49 +182,54 @@ async function executeSoniox(
   updateJob: (id: string, u: Record<string, unknown>) => void,
   signal: AbortSignal,
 ): Promise<TranscriptionResult> {
-  updateJob(jobId, { status: 'uploading', progress: 10 })
-  const fileInfo = await sonioxUploadFile(apiKey, file)
-  const sonioxFileId = fileInfo.id
-  updateJob(jobId, { sonioxFileId, status: 'uploading', progress: 30 })
-
-  updateJob(jobId, { status: 'transcribing', progress: 40 })
-  const transcription = await sonioxCreateTranscription(apiKey, {
-    fileId: fileInfo.id,
-    model: config.model || SONIOX_DEFAULT_ASYNC_MODEL,
-    languageHints: config.languageHints,
-    enableSpeakerDiarization: config.enableSpeakerDiarization,
-    translation: config.translationEnabled && config.translationTargetLanguage
-      ? { type: 'one_way', target_language: config.translationTargetLanguage }
-      : undefined,
-  })
-  const sonioxTranscriptionId = transcription.id
-  updateJob(jobId, { sonioxTranscriptionId, progress: 50 })
-
-  const result = await sonioxWaitForCompletion(
-    apiKey,
-    transcription.id,
-    (status, audioDurationMs) => {
-      const progressMap: Record<string, number> = { queued: 50, processing: 70, completed: 100 }
-      updateJob(jobId, { progress: progressMap[status] ?? 60, audioDurationMs })
-    },
-    signal,
-  )
-
-  const storedTokens = result.tokens.map(sonioxTokenToStoredToken)
-  const transcript = storedTokens.map((t) => t.text).join('')
-  const segments = buildSegmentsFromTokens(storedTokens)
-  const speakers = extractSpeakers(storedTokens)
-  const durationMs = storedTokens.length > 0 ? (storedTokens[storedTokens.length - 1].endMs ?? 0) : 0
-
-  // Cleanup remote resources
+  let sonioxFileId: string | undefined
+  let sonioxTranscriptionId: string | undefined
   try {
-    if (sonioxTranscriptionId) await sonioxDeleteTranscription(apiKey, sonioxTranscriptionId)
-    if (sonioxFileId) await sonioxDeleteFile(apiKey, sonioxFileId)
-  } catch (cleanupErr) {
-    console.warn('[FileTranscription] Soniox cleanup failed:', cleanupErr)
-  }
+    updateJob(jobId, { status: 'uploading', progress: 10 })
+    const fileInfo = await sonioxUploadFile(apiKey, file)
+    sonioxFileId = fileInfo.id
+    updateJob(jobId, { sonioxFileId, status: 'uploading', progress: 30 })
 
-  return { transcript, tokens: storedTokens, segments, speakers, durationMs }
+    updateJob(jobId, { status: 'transcribing', progress: 40 })
+    const effectiveConfig = parseSonioxConfig({
+      asyncModel: config.model,
+      languageHints: config.languageHints,
+      languageHintsStrict: config.languageHintsStrict,
+      enableSpeakerDiarization: config.enableSpeakerDiarization,
+      translationEnabled: config.translationEnabled,
+      translationTargetLanguage: config.translationTargetLanguage,
+    }, { meetingContext: config.meetingContext }).value
+    const transcription = await sonioxCreateTranscription(apiKey, {
+      fileId: fileInfo.id,
+      config: effectiveConfig,
+    })
+    sonioxTranscriptionId = transcription.id
+    updateJob(jobId, { sonioxTranscriptionId, progress: 50 })
+
+    const result = await sonioxWaitForCompletion(
+      apiKey,
+      transcription.id,
+      (status, audioDurationMs) => {
+        const progressMap: Record<string, number> = { queued: 50, processing: 70, completed: 100 }
+        updateJob(jobId, { progress: progressMap[status] ?? 60, audioDurationMs })
+      },
+      signal,
+    )
+
+    const storedTokens = result.tokens.map(sonioxTokenToStoredToken)
+    const transcript = storedTokens.map((t) => t.text).join('')
+    const segments = buildSegmentsFromTokens(storedTokens)
+    const speakers = extractSpeakers(storedTokens)
+    const durationMs = storedTokens.length > 0 ? (storedTokens[storedTokens.length - 1].endMs ?? 0) : 0
+    return { transcript, tokens: storedTokens, segments, speakers, durationMs }
+  } finally {
+    try {
+      if (sonioxTranscriptionId) await sonioxDeleteTranscription(apiKey, sonioxTranscriptionId)
+      if (sonioxFileId) await sonioxDeleteFile(apiKey, sonioxFileId)
+    } catch (cleanupErr) {
+      console.warn('[FileTranscription] Soniox cleanup failed:', cleanupErr)
+    }
+  }
 }
 
 async function executeMistral(
@@ -1065,7 +1070,13 @@ export function useFileTranscription() {
             captureMode: 'file',
             providerMode: 'unknown',
             platform: (window.electronAPI?.platform as 'win32' | 'darwin' | 'linux') || 'unknown',
+            sourceKind: 'uploaded-audio',
+            audioFileName: file.name,
+            audioMimeType: file.type || 'audio/mpeg',
+            audioSize: file.size,
           },
+          meetingContext: config.meetingContext,
+          recognitionConfig: config.recognitionConfig,
         })
 
         const completedSession = {

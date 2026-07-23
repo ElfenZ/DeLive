@@ -15,6 +15,10 @@ interface ApiServerOptions {
   server: Server
 }
 
+export interface ApiServerAttachment {
+  close: () => Promise<void>
+}
+
 interface OpenApiRuntimeConfig {
   enabled: boolean
   token: string
@@ -65,7 +69,7 @@ function checkAuth(req: IncomingMessage, res: ServerResponse): boolean {
   return true
 }
 
-export function attachApiServer({ server }: ApiServerOptions): void {
+export function attachApiServer({ server }: ApiServerOptions): ApiServerAttachment {
   ipcMain.on('api-update-open-api-config', (_event, config: { enabled: boolean; token: string }) => {
     updateOpenApiConfig(config)
   })
@@ -242,4 +246,10 @@ export function attachApiServer({ server }: ApiServerOptions): void {
 
   console.log('🌐 REST API endpoints mounted at /api/v1/')
   console.log('📡 Live transcript WebSocket available at /ws/live')
+  return {
+    close: async () => {
+      for (const client of liveWss.clients) client.terminate()
+      await new Promise<void>((resolve) => liveWss.close(() => resolve()))
+    },
+  }
 }

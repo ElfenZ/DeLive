@@ -9,7 +9,7 @@ DeLive 通过统一的 Provider 注册机制支持十二种 ASR 后端。每个 
 | Provider | 类型 | 传输方式 | 音频格式 | 流式 | 翻译 | 说话人分离 | 文件 |
 |----------|------|---------|---------|------|------|-----------|------|
 | Soniox V5 | 云端 | WebSocket | MediaRecorder (WebM/Opus) | 是 | 是 | 是 | 是 |
-| 火山引擎 | 云端 | WebSocket（经代理） | AudioWorklet (PCM16) | 是 | 否 | 否 | 是 |
+| 火山引擎 | 云端 | WebSocket（经代理） | AudioWorklet (PCM16) | 是 | 否 | 尽力而为 | 是 |
 | ElevenLabs | 云端 | WebSocket（经代理） | AudioWorklet (PCM16) | 是 | 否 | 否 | 是 |
 | Mistral AI | 云端 | WebSocket（经代理） | AudioWorklet (PCM16) | 是 | 否 | 否 | 是 |
 | Gladia | 云端 | WebSocket（经代理） | AudioWorklet (PCM16) | 是 | 否 | 否 | 是 |
@@ -28,7 +28,7 @@ DeLive 通过统一的 Provider 注册机制支持十二种 ASR 后端。每个 
 **Soniox**、**火山引擎**、**ElevenLabs**、**Mistral AI**、**Gladia**、**Deepgram** 和 **AssemblyAI** 使用。音频块通过 WebSocket 连接持续发送，转录更新实时到达。
 
 - Soniox 发出 **Token 级事件**（`prefersTokenEvents: true`），实现细粒度文本更新
-- 火山引擎、ElevenLabs、Mistral AI、Gladia、Deepgram 和 AssemblyAI 使用本地代理（端口 23456）注入所需的认证 Header
+- 火山引擎、ElevenLabs、Mistral AI、Gladia、Deepgram 和 AssemblyAI 共用 Electron 本地代理服务器。服务器优先使用端口 23456，必要时回退到 23457–23460；Renderer 通过 IPC 获取实际端口。
 
 ### 窗口批处理
 
@@ -53,7 +53,12 @@ DeLive 通过统一的 Provider 注册机制支持十二种 ASR 后端。每个 
 
 **必填：** `apiKey`
 
-**可选：** `model`、`languageHints`、`translationEnabled`、`translationTargetLanguage`、`enableSpeakerDiarization`
+**可选：** `model`、`languageHints`、严格语言提示、翻译、说话人识别、端点检测、端点灵敏度、最大端点延迟和端点延迟调整等级。
+
+**功能：**
+- 面向会议的端点灵敏度默认值为 `-0.5`；显式 `0` 及 `-1` 到 `1` 范围内的值都会保留
+- 端点调优仅用于实时请求；文件转写可使用严格语言提示、说话人识别和上下文，但不会发送实时端点字段
+- 只有显式开启独立的 Soniox 发送开关后，会议背景和已启用术语的目标词才会作为 Soniox context 发送
 
 ## 火山引擎
 
@@ -61,9 +66,11 @@ DeLive 通过统一的 Provider 注册机制支持十二种 ASR 后端。每个 
 
 **必填：** `appKey`、`accessKey`
 
-**可选：** `languageHints`
+**可选：** `languageHints`、说话人识别
 
 浏览器无法设置自定义 WebSocket Header，因此 DeLive 在 Electron 主进程中运行内置 HTTP 代理，将 PCM16 音频转发到字节跳动的 `openspeech.bytedance.com` 端点并附加所需的认证 Header。
+
+火山的说话人选项启用服务端说话人聚类（`enable_speaker_info`），不是声道分离。效果取决于音频和服务返回；只有火山返回多个 speaker ID 时，DeLive 才会按说话人分段。如果所有 utterance 都返回同一个 ID，转录会保持为单一说话人。
 
 ## Groq
 
@@ -89,7 +96,7 @@ DeLive 通过统一的 Provider 注册机制支持十二种 ASR 后端。每个 
 
 **可选：** `model`、`languageHints`
 
-使用本地 WebSocket 代理（端口 23456 的 `/ws/mistral`）注入 `Authorization` Header。
+使用共享本地 WebSocket 代理的 `/ws/mistral` 注入 `Authorization` Header；Renderer 通过 IPC 获取运行时端口（首选 23456）。
 
 ## Deepgram
 
@@ -99,7 +106,7 @@ DeLive 通过统一的 Provider 注册机制支持十二种 ASR 后端。每个 
 
 **可选：** `model`、`languageHints`
 
-使用本地 WebSocket 代理（端口 23456 的 `/ws/deepgram`）注入 `Authorization: Token` Header。最适合英语和多语言内容。
+使用共享本地 WebSocket 代理的 `/ws/deepgram` 注入 `Authorization: Token` Header。最适合英语和多语言内容。
 
 ## AssemblyAI
 
@@ -109,7 +116,7 @@ DeLive 通过统一的 Provider 注册机制支持十二种 ASR 后端。每个 
 
 **可选：** `model`
 
-使用本地 WebSocket 代理（端口 23456 的 `/ws/assemblyai`）注入 `Authorization` Header。支持 6 种流式语言，最适合英语内容。
+使用共享本地 WebSocket 代理的 `/ws/assemblyai` 注入 `Authorization` Header。支持 6 种流式语言，最适合英语内容。
 
 ## ElevenLabs
 
@@ -119,7 +126,7 @@ DeLive 通过统一的 Provider 注册机制支持十二种 ASR 后端。每个 
 
 **可选：** `model`、`languageHints`
 
-使用本地 WebSocket 代理（端口 23456 的 `/ws/elevenlabs`）注入 `xi-api-key` Header。支持 90+ 种语言含普通话。音频以 base64 编码 JSON 格式发送。
+使用共享本地 WebSocket 代理的 `/ws/elevenlabs` 注入 `xi-api-key` Header。支持 90+ 种语言含普通话。音频以 base64 编码 JSON 格式发送。
 
 ## 本地 OpenAI 兼容
 

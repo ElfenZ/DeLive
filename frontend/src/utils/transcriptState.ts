@@ -221,18 +221,28 @@ export function applyTranscriptEvent(
       const incomingTranslationNonFinalTokens = incomingNonFinalTokens.filter(
         (token) => token.translationStatus === 'translation',
       )
-      const sourceWasUpdated = incomingSourceNonFinalTokens.length > 0 || hasSourceFinal
-      const translationWasUpdated = incomingTranslationNonFinalTokens.length > 0 || hasTranslationFinal
-      const nonFinalSourceTokens = incomingSourceNonFinalTokens.length > 0
-        ? incomingSourceNonFinalTokens
-        : hasSourceFinal
-          ? []
-          : previousSourceNonFinalTokens
-      const nonFinalTranslationTokens = incomingTranslationNonFinalTokens.length > 0
-        ? incomingTranslationNonFinalTokens
-        : hasTranslationFinal
-          ? []
-          : previousTranslationNonFinalTokens
+      // An empty token batch is an explicit snapshot with no remaining interim
+      // content. Providers normally suppress empty batches unless they need to
+      // retract a previously emitted hypothesis.
+      const explicitSnapshotClear = event.tokens.length === 0
+      const sourceWasUpdated = incomingSourceNonFinalTokens.length > 0 || hasSourceFinal || explicitSnapshotClear
+      const translationWasUpdated = incomingTranslationNonFinalTokens.length > 0
+        || hasTranslationFinal
+        || explicitSnapshotClear
+      const nonFinalSourceTokens = explicitSnapshotClear
+        ? []
+        : incomingSourceNonFinalTokens.length > 0
+          ? incomingSourceNonFinalTokens
+          : hasSourceFinal
+            ? []
+            : previousSourceNonFinalTokens
+      const nonFinalTranslationTokens = explicitSnapshotClear
+        ? []
+        : incomingTranslationNonFinalTokens.length > 0
+          ? incomingTranslationNonFinalTokens
+          : hasTranslationFinal
+            ? []
+            : previousTranslationNonFinalTokens
       const nonFinalTokens = [...nonFinalSourceTokens, ...nonFinalTranslationTokens]
       const nonFinalText = sourceWasUpdated
         ? nonFinalSourceTokens.map((token) => token.text).join('')

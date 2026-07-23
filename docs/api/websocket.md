@@ -2,6 +2,8 @@
 
 DeLive provides a real-time WebSocket stream at `/ws/live` that broadcasts transcript updates and session lifecycle events.
 
+Electron prefers port `23456` and falls back through `23457–23460` on conflicts. Use the WebSocket URL shown in **Settings > Open API**; the examples below show the preferred port.
+
 ## Connection
 
 ```

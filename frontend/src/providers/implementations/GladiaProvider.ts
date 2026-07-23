@@ -15,8 +15,7 @@ import {
   GLADIA_DEFAULT_MODEL,
   GLADIA_SUPPORTED_LANGUAGES,
 } from '../../types/asr/vendors/gladia'
-
-const PROXY_WS_URL = 'ws://localhost:23456/ws/gladia'
+import { getProxyWebSocketUrl } from '../../utils/proxyUrl'
 
 export class GladiaProvider extends BaseASRProvider {
   readonly id: ASRVendor = 'gladia' as ASRVendor
@@ -99,15 +98,15 @@ export class GladiaProvider extends BaseASRProvider {
     this._config = config
     this.setState('connecting')
 
+    const params = new URLSearchParams({
+      apiKey,
+      model: GLADIA_DEFAULT_MODEL,
+      language: (config.language as string) || '',
+    })
+    const proxyUrl = await getProxyWebSocketUrl('/ws/gladia', params)
+
     return new Promise((resolve, reject) => {
       try {
-        const params = new URLSearchParams({
-          apiKey,
-          model: GLADIA_DEFAULT_MODEL,
-          language: (config.language as string) || '',
-        })
-
-        const proxyUrl = `${PROXY_WS_URL}?${params.toString()}`
         console.log('[GladiaProvider] 连接到代理服务器...')
 
         this.ws = new WebSocket(proxyUrl)

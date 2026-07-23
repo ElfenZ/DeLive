@@ -1,6 +1,8 @@
 # REST API
 
-在设置中启用 Open API 后，DeLive 在端口 **23456** 上暴露本地 REST API。
+在设置中启用 Open API 后，DeLive 会暴露本地 REST API。Electron 优先使用端口 **23456**；若端口被占用，会依次回退到 **23457–23460**。
+
+**设置 > Open API** 显示的地址是运行时事实来源。下方示例使用常规的 `23456`；如果设置页显示了回退端口，请替换示例地址。
 
 ## Base URL
 
@@ -158,7 +160,7 @@ curl http://localhost:23456/api/v1/status
   "isRecording": false,
   "recordingState": "paused",
   "currentSessionId": "abc123",
-  "version": "2.5.4",
+  "version": "2.5.5",
   "liveClients": 0
 }
 ```

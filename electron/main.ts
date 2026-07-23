@@ -13,9 +13,9 @@ import { registerUpdaterIpc } from './updaterIpc'
 import { installLogInterceptor, registerDiagnosticsIpc } from './diagnosticsIpc'
 import { registerTrustedWindow } from './ipcSecurity'
 import { registerSafeStorageIpc } from './safeStorageIpc'
-import { startVolcProxyServer } from './volcProxy'
+import { startVolcProxyServer, type ProxyServerRuntime } from './volcProxy'
 import { registerApiIpc } from './apiIpc'
-import { attachApiServer } from './apiServer'
+import { attachApiServer, type ApiServerAttachment } from './apiServer'
 import { registerCloudBackupIpc } from './cloudBackup/cloudBackupIpc'
 import { refreshElectronLang, getElectronStrings } from './i18n'
 import { isAutoUpdateSupported } from './updaterSupport'
@@ -33,6 +33,8 @@ if (process.platform === 'linux') {
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let isQuitting = false
+let proxyServerRuntime: ProxyServerRuntime | null = null
+let apiServerAttachment: ApiServerAttachment | null = null
 
 const isDev = process.env.NODE_ENV === 'development'
 
@@ -128,8 +130,8 @@ if (!gotTheLock) {
       }
     }
 
-    const httpServer = startVolcProxyServer()
-    attachApiServer({ server: httpServer })
+    proxyServerRuntime = await startVolcProxyServer()
+    apiServerAttachment = attachApiServer({ server: proxyServerRuntime.server })
 
     createWindow()
     tray = createAppTray({
@@ -162,6 +164,9 @@ if (!gotTheLock) {
         createWindow()
       }
     })
+  }).catch((error) => {
+    console.error('[Main] 本地代理/API 服务器启动失败，应用将退出:', error)
+    app.quit()
   })
 }
 
@@ -178,6 +183,17 @@ app.on('before-quit', () => {
   captionController.dispose()
   globalShortcut.unregisterAll()
   void localRuntimeController.stopAll()
+  const apiAttachment = apiServerAttachment
+  apiServerAttachment = null
+  if (apiAttachment) void apiAttachment.close().catch((error) => console.warn('[Main] 关闭 API WebSocket 失败:', error))
+  const runtime = proxyServerRuntime
+  proxyServerRuntime = null
+  if (runtime) void runtime.close().catch((error) => console.warn('[Main] 关闭代理服务器失败:', error))
+})
+
+ipcMain.handle('get-proxy-port', () => {
+  if (!proxyServerRuntime) throw new Error('Local proxy server is not ready')
+  return proxyServerRuntime.port
 })
 
 registerLocalRuntimeIpc({

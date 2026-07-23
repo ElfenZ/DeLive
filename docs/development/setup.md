@@ -31,7 +31,7 @@ npm run dev
 
 This starts:
 1. **Vite dev server** on port 5173 (hot reload for the React frontend)
-2. **Electron** main process (with the Volcengine proxy on port 23456)
+2. **Electron** main process (shared proxy/API server prefers port 23456 and may fall back through 23460)
 
 The `dev` script uses `concurrently` + `wait-on` to ensure Vite is ready before launching Electron.
 
@@ -68,4 +68,6 @@ npm run build            # Full build only
 |----------|-------|---------|
 | `NODE_ENV` | Main process | `development` enables DevTools and relaxed CSP |
 | Port 5173 | Vite dev server | Frontend hot reload |
-| Port 23456 | Electron main | HTTP server (Volc proxy + API) |
+| Ports 23456–23460 | Electron main | Shared provider proxy + API server; 23456 is preferred |
+
+The standalone server and Vite proxy remain explicitly configured and do not discover Electron's runtime fallback port. Use **Settings > Open API** for the actual Electron URL.

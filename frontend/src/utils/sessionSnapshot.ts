@@ -1,5 +1,7 @@
 import type {
   CaptionDisplayMode,
+  MeetingContextSnapshot,
+  RecognitionConfigSnapshot,
   TranscriptPostProcess,
   TranscriptSourceMeta,
   TranscriptSpeaker,
@@ -20,6 +22,8 @@ export interface TranscriptPersistenceSnapshot {
   sourceMeta?: TranscriptSourceMeta
   translatedTranscript?: TranscriptTranslationData
   postProcess?: TranscriptPostProcess
+  meetingContext?: MeetingContextSnapshot
+  recognitionConfig?: RecognitionConfigSnapshot
 }
 
 export function hasPersistenceSnapshotContent(snapshot: TranscriptPersistenceSnapshot): boolean {
@@ -127,6 +131,8 @@ export function buildSessionSnapshot(options: {
   captureMode?: TranscriptSourceMeta['captureMode']
   translationTargetLanguage?: string
   captionDisplayMode?: CaptionDisplayMode
+  meetingContext?: MeetingContextSnapshot
+  recognitionConfig?: RecognitionConfigSnapshot
 }): TranscriptPersistenceSnapshot {
   const {
     runtimeState,
@@ -137,6 +143,8 @@ export function buildSessionSnapshot(options: {
     captureMode,
     translationTargetLanguage,
     captionDisplayMode = 'source',
+    meetingContext,
+    recognitionConfig,
   } = options
 
   const transcript = buildTranscriptFromState(
@@ -170,5 +178,7 @@ export function buildSessionSnapshot(options: {
       captureMode,
     }),
     postProcess: runtimeState.currentPostProcess,
+    meetingContext,
+    recognitionConfig,
   }
 }

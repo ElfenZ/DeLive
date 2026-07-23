@@ -128,6 +128,23 @@ export interface ProviderConfigField {
   description?: string
   options?: { value: string; label: string }[]
   defaultValue?: string | number | boolean | string[]
+  min?: number
+  max?: number
+  step?: number
+  group?: string
+  groupLabel?: string
+  groupCollapsible?: boolean
+  groupDefaultOpen?: boolean
+  visibleWhen?: ProviderFieldCondition
+  enabledWhen?: ProviderFieldCondition
+  warning?: string
+  warningWhen?: ProviderFieldCondition
+}
+
+export interface ProviderFieldCondition {
+  fieldKey: string
+  equals?: string | boolean | number
+  nonEmpty?: boolean
 }
 
 export interface TranscriptToken {

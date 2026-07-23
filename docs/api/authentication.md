@@ -2,6 +2,8 @@
 
 DeLive's Open API supports optional Bearer token authentication to prevent unauthorized local access.
 
+Electron prefers port `23456` but may use `23457–23460` when a port is occupied. Use the endpoint shown in **Settings > Open API** in the examples below.
+
 ## Setup
 
 1. Go to **Settings > General > Open API**

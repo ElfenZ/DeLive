@@ -7,6 +7,38 @@ export interface WhatsNewEntry {
 
 const entries: WhatsNewEntry[] = [
   {
+    version: '2.5.5',
+    date: '2026-07-23',
+    features: [
+      {
+        zh: '录制暂停与恢复：在同一会话内暂停音频保存、上传和转写，恢复后继续且暂停时间不计入时长',
+        en: 'Recording pause and resume: pause audio storage, upload, and transcription within the same session, then resume without counting paused time',
+      },
+      {
+        zh: '会议上下文可全局配置或单次覆盖，并锁定到会话供 Soniox context 和 AI 纠错使用',
+        en: 'Meeting context can be configured globally or overridden per task, then locked to the session for Soniox context and AI correction',
+      },
+      {
+        zh: 'Provider 配置按功能分组和条件显示，补充校验、Soniox 高级端点设置与运行时代理地址',
+        en: 'Provider settings now use grouped, conditional fields with validation, advanced Soniox endpoint controls, and runtime proxy URLs',
+      },
+      {
+        zh: '火山实时转写支持服务端多人聚类、Token 时间戳和嵌套 speaker ID；仅在服务返回多个 ID 时分人',
+        en: 'Volcengine realtime transcription supports server-side speaker clustering, token timestamps, and nested speaker IDs; speakers split only when the service returns multiple IDs',
+      },
+    ],
+    fixes: [
+      {
+        zh: '本地代理端口被占用时会依次回退，并让 Electron Open API 与 Renderer 使用实际运行端口',
+        en: 'The local proxy now falls back across reserved ports and exposes the actual runtime port to Electron Open API and renderer clients',
+      },
+      {
+        zh: '加强配置、备份和会话 schema 的规范化与凭据隔离，并将火山诊断限制为安全摘要',
+        en: 'Improved config, backup, and session schema normalization with credential isolation, while limiting Volcengine diagnostics to safe summaries',
+      },
+    ],
+  },
+  {
     version: '2.5.4',
     date: '2026-07-18',
     features: [

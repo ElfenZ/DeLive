@@ -33,6 +33,7 @@ import {
 } from '../utils/providerConfigForm'
 import { testProviderConfig } from '../utils/providerConfigTest'
 import { getDefaultSettings } from '../utils/storageShared'
+import { assertValidMeetingContext, resolveMeetingContextSnapshot } from '../utils/meetingContext'
 
 type SettingsGroup = 'provider' | 'capture' | 'appearance' | 'caption' | 'aiPostProcess' | 'openApi' | 'cloudBackup' | 'dataManagement' | 'about'
 
@@ -62,6 +63,7 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
     settings,
     updateSettings,
     updateAiPostProcessConfig,
+    updateMeetingContextConfig,
     updateOpenApiConfig,
     updateCloudBackupConfig,
     availableProviders,
@@ -86,6 +88,9 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
   const [aiPostProcessConfig, setAiPostProcessConfig] = useState(
     settings.aiPostProcess || getDefaultSettings().aiPostProcess || {},
   )
+  const [meetingContextConfig, setMeetingContextConfig] = useState(
+    settings.meetingContext || getDefaultSettings().meetingContext!,
+  )
 
   const [importMessage, setImportMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const [pendingImportData, setPendingImportData] = useState<{ data: BackupData } | null>(null)
@@ -98,19 +103,21 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
   const supportsAutoLaunch = !!window.electronAPI?.supportsAutoLaunch
   const supportsAutoUpdate = !!window.electronAPI?.supportsAutoUpdate
 
-  const snapshotRef = useRef({ formState, languageHints, aiPostProcessConfig, currentVendor: settings.currentVendor })
+  const snapshotRef = useRef({ formState, languageHints, aiPostProcessConfig, meetingContextConfig, currentVendor: settings.currentVendor })
 
   useEffect(() => {
     const newFormState = buildProviderFormState(currentProvider, currentStoredConfig, settings)
     const newLanguageHints = formatStringArrayValue(currentStoredConfig?.languageHints, settings.languageHints || ['zh', 'en'])
     const newAiConfig = settings.aiPostProcess || getDefaultSettings().aiPostProcess || {}
+    const newMeetingContext = settings.meetingContext || getDefaultSettings().meetingContext!
     setFormState(newFormState)
     setLanguageHints(newLanguageHints)
     setAiPostProcessConfig(newAiConfig)
+    setMeetingContextConfig(newMeetingContext)
     setRevealedFields({})
     setTestStatus('idle')
     setTestMessage('')
-    snapshotRef.current = { formState: newFormState, languageHints: newLanguageHints, aiPostProcessConfig: newAiConfig, currentVendor: settings.currentVendor || 'soniox' }
+    snapshotRef.current = { formState: newFormState, languageHints: newLanguageHints, aiPostProcessConfig: newAiConfig, meetingContextConfig: newMeetingContext, currentVendor: settings.currentVendor || 'soniox' }
   }, [currentProvider, currentStoredConfig, settings])
 
   const isDirty = useMemo(() => {
@@ -119,9 +126,10 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
       JSON.stringify(formState) !== JSON.stringify(snap.formState) ||
       languageHints !== snap.languageHints ||
       JSON.stringify(aiPostProcessConfig) !== JSON.stringify(snap.aiPostProcessConfig) ||
+      JSON.stringify(meetingContextConfig) !== JSON.stringify(snap.meetingContextConfig) ||
       (settings.currentVendor || 'soniox') !== snap.currentVendor
     )
-  }, [formState, languageHints, aiPostProcessConfig, settings.currentVendor])
+  }, [formState, languageHints, aiPostProcessConfig, meetingContextConfig, settings.currentVendor])
 
   useEffect(() => {
     if (isOpen && window.electronAPI) {
@@ -207,7 +215,16 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
       if (missingLabels.length > 0) {
         throw new Error(`Please fill: ${missingLabels.join(', ')}`)
       }
-      await testProviderConfig(currentProvider, providerConfig)
+      const testConfig = currentVendor === 'soniox'
+        ? {
+            ...providerConfig,
+            meetingContext: resolveMeetingContextSnapshot(
+              meetingContextConfig,
+              aiPostProcessConfig.glossary,
+            ),
+          }
+        : providerConfig
+      await testProviderConfig(currentProvider, testConfig)
       setTestStatus('success')
       setTestMessage(t.settings?.testSuccess || 'Configuration verified!')
       setTimeout(() => { setTestStatus('idle'); setTestMessage('') }, 3000)
@@ -218,29 +235,34 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
   }
 
   const handleSave = async () => {
-    const providerConfig = buildEditableProviderConfig()
-    const normalizedHints = Array.isArray(providerConfig.languageHints) && providerConfig.languageHints.length > 0
-      ? providerConfig.languageHints.map((item) => String(item).trim()).filter(Boolean)
-      : ['zh', 'en']
-    const missingLabels = getMissingRequiredConfigLabels(currentProvider, providerConfig)
-    if (missingLabels.length > 0) {
+    try {
+      const providerConfig = buildEditableProviderConfig()
+      const normalizedHints = Array.isArray(providerConfig.languageHints)
+        ? providerConfig.languageHints.map((item) => String(item).trim()).filter(Boolean)
+        : []
+      const missingLabels = getMissingRequiredConfigLabels(currentProvider, providerConfig)
+      if (missingLabels.length > 0) {
+        throw new Error(`Please fill: ${missingLabels.join(', ')}`)
+      }
+      updateProviderConfig(currentVendor, providerConfig)
+      const shouldSyncLegacyApiKey = currentProvider?.requiredConfigKeys.includes('apiKey')
+      updateSettings({
+        apiKey: shouldSyncLegacyApiKey && typeof providerConfig.apiKey === 'string'
+          ? providerConfig.apiKey.trim()
+          : settings.apiKey,
+        languageHints: normalizedHints,
+      })
+      const normalizedAiConfig = aiPostProcessConfig.autoAiPostProcess
+        ? { ...aiPostProcessConfig, autoCorrectionDetection: false }
+        : aiPostProcessConfig
+      assertValidMeetingContext(meetingContextConfig, normalizedAiConfig.glossary, { includeDisabled: true })
+      updateMeetingContextConfig(meetingContextConfig)
+      await updateAiPostProcessConfig(normalizedAiConfig)
+      onClose()
+    } catch (error) {
       setTestStatus('error')
-      setTestMessage(`Please fill: ${missingLabels.join(', ')}`)
-      return
+      setTestMessage(error instanceof Error ? error.message : 'Invalid settings')
     }
-    updateProviderConfig(currentVendor, providerConfig)
-    const shouldSyncLegacyApiKey = currentProvider?.requiredConfigKeys.includes('apiKey')
-    updateSettings({
-      apiKey: shouldSyncLegacyApiKey && typeof providerConfig.apiKey === 'string'
-        ? providerConfig.apiKey.trim()
-        : settings.apiKey,
-      languageHints: normalizedHints,
-    })
-    const normalizedAiConfig = aiPostProcessConfig.autoAiPostProcess
-      ? { ...aiPostProcessConfig, autoCorrectionDetection: false }
-      : aiPostProcessConfig
-    await updateAiPostProcessConfig(normalizedAiConfig)
-    onClose()
   }
 
   const handleExport = async () => {
@@ -420,6 +442,10 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
                 aiPostProcessConfig={aiPostProcessConfig}
                 updateAiPostProcessConfig={(patch) => {
                   setAiPostProcessConfig((prev) => ({ ...prev, ...patch }))
+                }}
+                meetingContextConfig={meetingContextConfig}
+                updateMeetingContextConfig={(patch) => {
+                  setMeetingContextConfig((prev) => ({ ...prev, ...patch }))
                 }}
               />
             )}

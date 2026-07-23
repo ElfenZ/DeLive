@@ -318,6 +318,7 @@ export interface RecordingArchiveRecoverResult {
 
 export interface ElectronAPI {
   getAppVersion: () => Promise<string>
+  getProxyPort: () => Promise<number>
   minimizeToTray: () => Promise<void>
   windowMinimize: (source?: string) => Promise<void>
   windowMaximize: () => Promise<void>

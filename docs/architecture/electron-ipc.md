@@ -11,8 +11,9 @@ The Electron main process (`electron/main.ts`) initializes in this order:
 5. Create desktop source and local runtime controllers
 6. Request single-instance lock (quit if another instance is running)
 7. On `app.whenReady()`:
-   - Start HTTP server on port 23456 (Volcengine proxy)
+   - Bind the shared proxy/API HTTP server to the first available port in `23456–23460` (`23456` preferred)
    - Attach API server to the HTTP server
+   - Register runtime port discovery through preload IPC
    - Create main window
    - Create system tray
    - Register global shortcuts

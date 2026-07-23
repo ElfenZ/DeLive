@@ -1,4 +1,5 @@
 import type { ASRVendor } from './asr/common'
+import type { MeetingContextSnapshot, RecognitionConfigSnapshot } from './index'
 
 export type FileTranscriptionJobStatus =
   | 'queued'
@@ -38,6 +39,9 @@ export interface FileTranscriptionConfig {
   translationTargetLanguage?: string
   enableSpeakerDiarization?: boolean
   model?: string
+  languageHintsStrict?: boolean
+  meetingContext: MeetingContextSnapshot
+  recognitionConfig?: RecognitionConfigSnapshot
 }
 
 export const ACCEPTED_AUDIO_EXTENSIONS = [

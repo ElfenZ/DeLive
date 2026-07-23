@@ -49,6 +49,20 @@ Configure the OpenAI-compatible endpoint for AI features:
 | API Key | Optional authentication | — |
 | Prompt Language | `zh` or `en` | `zh` |
 
+### Meeting Context
+
+Meeting context is a reusable, credential-free input for transcription and AI correction:
+
+| Field | Behavior |
+|-------|----------|
+| **Meeting background** | Topic, domain, product, and technical facts; limited to 4,000 Unicode code points |
+| **Correction guidance** | AI-only correction preferences; limited to 2,000 Unicode code points |
+| **Use for AI correction** | Enabled by default; adds bounded JSON reference data without changing the fixed Patch protocol |
+| **Send to Soniox** | Disabled by default; sends background and enabled glossary targets as Soniox context |
+| **Glossary** | Supports known `source -> target` mappings and target-only candidate terms |
+
+Recording and file-transcription screens provide a one-shot context editor. Each task can inherit the global context, override it, or clear it. The effective context is frozen when the task starts, so later settings changes do not alter reconnects or automatic correction.
+
 ### Open API
 
 Control external access to DeLive data (Electron only):
@@ -59,6 +73,8 @@ Control external access to DeLive data (Electron only):
 | **Access Token** | Optional Bearer token for authentication |
 | **Generate Random Token** | Creates a cryptographically random token |
 | **Endpoint URLs** | Shows REST and WebSocket URLs with copy buttons |
+
+Electron prefers port `23456` and automatically tries `23457–23460` when the port is occupied. The URLs displayed here are the runtime source of truth. A fallback warning identifies when external MCP servers or scripts must update `DELIVE_API_URL` manually.
 
 ::: warning
 When Open API is enabled with an empty token, any local process can access your transcription data. Set a token for production use.

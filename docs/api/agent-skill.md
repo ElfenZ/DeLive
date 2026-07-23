@@ -39,6 +39,8 @@ The skill defines five recommended workflow patterns:
 
 Connect to the WebSocket for live transcript access:
 
+The example uses the preferred port `23456`. If DeLive reports a fallback port in **Settings > Open API**, replace the URL before connecting.
+
 ```python
 import asyncio, websockets, json
 

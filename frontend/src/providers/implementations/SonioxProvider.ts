@@ -12,11 +12,10 @@ import type {
 } from '../../types/asr'
 import {
   SONIOX_WEBSOCKET_URL,
-  SONIOX_DEFAULT_MODEL,
-  type SonioxConfig,
   type SonioxResponse,
   type SonioxToken,
 } from '../../types/asr/vendors/soniox'
+import { buildSonioxRealtimeRequest, parseSonioxConfig } from '../../utils/sonioxConfig'
 
 export class SonioxProvider extends BaseASRProvider {
   readonly id: ASRVendor = 'soniox' as ASRVendor
@@ -95,6 +94,82 @@ export class SonioxProvider extends BaseASRProvider {
         description: '提示可能使用的语言，提高识别准确率',
       },
       {
+        key: 'languageHintsStrict',
+        label: '严格限制语言提示',
+        type: 'boolean',
+        required: false,
+        defaultValue: false,
+        description: '仅识别语言提示中列出的语言；未填写语言提示时不可启用。',
+        group: 'advanced',
+        groupLabel: 'Soniox 高级设置',
+        groupCollapsible: true,
+        groupDefaultOpen: false,
+        enabledWhen: { fieldKey: 'languageHints', nonEmpty: true },
+      },
+      {
+        key: 'enableEndpointDetection',
+        label: '启用端点检测',
+        type: 'boolean',
+        required: false,
+        defaultValue: true,
+        description: '检测自然停顿并形成最终字幕断句。',
+        group: 'advanced',
+        groupLabel: 'Soniox 高级设置',
+        groupCollapsible: true,
+        groupDefaultOpen: false,
+      },
+      {
+        key: 'endpointSensitivity',
+        label: '端点检测灵敏度',
+        type: 'number',
+        required: false,
+        defaultValue: -0.5,
+        min: -1,
+        max: 1,
+        step: 0.1,
+        description: '-0.5 是会议/长对话默认值；负值会增加等待以减少碎片化断句。',
+        group: 'advanced',
+        groupLabel: 'Soniox 高级设置',
+        groupCollapsible: true,
+        groupDefaultOpen: false,
+        visibleWhen: { fieldKey: 'enableEndpointDetection', equals: true },
+      },
+      {
+        key: 'maxEndpointDelayMs',
+        label: '最大端点延迟（毫秒）',
+        type: 'number',
+        required: false,
+        min: 500,
+        max: 3000,
+        step: 100,
+        placeholder: '使用 Soniox 默认值（2000）',
+        description: '留空使用 Soniox 默认值；允许范围 500–3000 毫秒。',
+        group: 'advanced',
+        groupLabel: 'Soniox 高级设置',
+        groupCollapsible: true,
+        groupDefaultOpen: false,
+        visibleWhen: { fieldKey: 'enableEndpointDetection', equals: true },
+      },
+      {
+        key: 'endpointLatencyAdjustmentLevel',
+        label: '端点延迟调整等级',
+        type: 'select',
+        required: false,
+        options: [
+          { value: '0', label: '0（默认）' },
+          { value: '1', label: '1' },
+          { value: '2', label: '2' },
+          { value: '3', label: '3' },
+        ],
+        placeholder: '使用 Soniox 默认等级',
+        description: 'V5 端点延迟调整等级，允许 0–3；留空使用服务默认值。',
+        group: 'advanced',
+        groupLabel: 'Soniox 高级设置',
+        groupCollapsible: true,
+        groupDefaultOpen: false,
+        visibleWhen: { fieldKey: 'enableEndpointDetection', equals: true },
+      },
+      {
         key: 'translationEnabled',
         label: '启用实时翻译',
         type: 'boolean',
@@ -122,6 +197,7 @@ export class SonioxProvider extends BaseASRProvider {
           { value: 'vi', label: 'Tiếng Việt' },
         ],
         description: '仅在启用实时翻译时生效。',
+        visibleWhen: { fieldKey: 'translationEnabled', equals: true },
       },
       {
         key: 'enableSpeakerDiarization',
@@ -130,6 +206,8 @@ export class SonioxProvider extends BaseASRProvider {
         required: false,
         defaultValue: false,
         description: '开启后，Soniox 会返回按说话人区分的转录结果。',
+        warning: '同时启用端点检测与说话人识别可能影响说话人区分准确率。',
+        warningWhen: { fieldKey: 'enableEndpointDetection', equals: true },
       },
     ],
   }
@@ -139,12 +217,11 @@ export class SonioxProvider extends BaseASRProvider {
   private resolveDrain: (() => void) | null = null
 
   async connect(config: ProviderConfig): Promise<void> {
-    if (!config.apiKey) {
+    const effectiveConfig = parseSonioxConfig(config).value
+    if (!effectiveConfig.apiKey) {
       this.emitError(this.createError('MISSING_API_KEY', '请提供 Soniox API Key'))
       return
     }
-    const apiKey = config.apiKey
-
     this._config = config
     this.setState('connecting')
     this.finalTokens = []
@@ -159,22 +236,7 @@ export class SonioxProvider extends BaseASRProvider {
           console.log('[SonioxProvider] WebSocket 已连接')
           
           // 发送配置
-          const sonioxConfig: SonioxConfig = {
-            api_key: apiKey,
-            model: (config.model as string) || SONIOX_DEFAULT_MODEL,
-            audio_format: 'auto',
-            language_hints: (config.languageHints as string[]) || ['zh', 'en'],
-            enable_language_identification: true,
-            enable_speaker_diarization: Boolean(config.enableSpeakerDiarization),
-            enable_endpoint_detection: true,
-          }
-
-          if (config.translationEnabled && typeof config.translationTargetLanguage === 'string') {
-            sonioxConfig.translation = {
-              type: 'one_way',
-              target_language: config.translationTargetLanguage,
-            }
-          }
+          const sonioxConfig = buildSonioxRealtimeRequest(effectiveConfig)
           
           console.log('[SonioxProvider] 发送配置:', { ...sonioxConfig, api_key: '***' })
           this.ws!.send(JSON.stringify(sonioxConfig))

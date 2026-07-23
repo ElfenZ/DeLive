@@ -6,8 +6,11 @@ import { useSessionStore } from '../stores/sessionStore'
 import { buildProviderConnectConfig, isProviderConfigured } from '../utils/providerConfig'
 import { getProviderName } from '../utils/providerI18n'
 import { StatusIndicator, Switch } from './ui'
-import type { ProviderConfigData } from '../types'
+import type { MeetingContextOverride, ProviderConfigData } from '../types'
 import type { ASRVendor } from '../types/asr'
+import { MeetingContextEditor } from './MeetingContextEditor'
+import { getDefaultSettings } from '../utils/storageShared'
+import { supportsLiveSpeakerDiarizationQuickToggle } from '../utils/providerMetadata'
 
 const TRANSLATION_OPTIONS = [
   { value: 'en', label: 'English' },
@@ -22,7 +25,7 @@ const TRANSLATION_OPTIONS = [
 
 interface RecordingControlsProps {
   onError: (message: string) => void
-  startRecording: () => void
+  startRecording: (meetingContextOverride?: MeetingContextOverride) => Promise<void>
   pauseRecording: () => Promise<void>
   resumeRecording: () => Promise<void>
   stopRecording: () => Promise<string | null>
@@ -43,6 +46,7 @@ export function RecordingControls({
   const { settings, availableProviders } = useSettingsStore()
   const { recordingState, currentTranscript } = useSessionStore()
   const [showQuickSettings, setShowQuickSettings] = useState(false)
+  const [meetingContextOverride, setMeetingContextOverride] = useState<MeetingContextOverride>({ mode: 'inherit' })
 
   const currentVendor = settings.currentVendor || 'soniox'
   const currentProvider = availableProviders.find(p => p.id === currentVendor)
@@ -61,7 +65,7 @@ export function RecordingControls({
   const isTransitioning = isStarting || isPausing || isResuming || isStopping || isSwitching
 
   const supportsTranslation = currentProvider?.capabilities.supportsTranslation ?? false
-  const supportsDiarization = currentProvider?.capabilities.supportsSpeakerDiarization ?? false
+  const supportsDiarizationQuickToggle = supportsLiveSpeakerDiarizationQuickToggle(currentProvider)
 
   const configuredProviders = availableProviders.filter(p => {
     const cfg = settings.providerConfigs?.[p.id]
@@ -69,7 +73,7 @@ export function RecordingControls({
   })
   const canSwitchProvider = configuredProviders.length > 1
 
-  const hasLiveFeatures = supportsTranslation || supportsDiarization || canSwitchProvider
+  const hasLiveFeatures = supportsTranslation || supportsDiarizationQuickToggle || canSwitchProvider
 
   const translationEnabled = Boolean(currentConfig?.translationEnabled)
   const translationTarget = (currentConfig?.translationTargetLanguage as string) || 'en'
@@ -87,7 +91,8 @@ export function RecordingControls({
         onError(t.recording.configureApiFirst)
         return
       }
-      startRecording()
+      void startRecording(meetingContextOverride)
+      setMeetingContextOverride({ mode: 'inherit' })
     }
   }
 
@@ -234,8 +239,24 @@ export function RecordingControls({
         </div>
       )}
 
+      {isIdle && hasApiKey && (
+        <details className="rounded-xl border border-border/70 bg-muted/20 p-4">
+          <summary className="cursor-pointer text-sm font-semibold text-foreground">
+            {t.settings.oneShotContextTitle}
+          </summary>
+          <div className="pt-4">
+            <MeetingContextEditor
+              t={t}
+              globalConfig={settings.meetingContext || getDefaultSettings().meetingContext!}
+              value={meetingContextOverride}
+              onChange={setMeetingContextOverride}
+            />
+          </div>
+        </details>
+      )}
+
       {/* Quick settings panel (recording state) */}
-      {showQuickSettings && isRecording && (
+      {showQuickSettings && isRecording && hasLiveFeatures && (
         <div className="rounded-xl border border-border/70 bg-muted/20 p-4 space-y-4 animate-in slide-in-from-top-2 duration-200">
           <div className="flex items-center justify-between">
             <h4 className="text-sm font-semibold text-foreground">
@@ -294,7 +315,7 @@ export function RecordingControls({
             </div>
           )}
 
-          {supportsDiarization && (
+          {supportsDiarizationQuickToggle && (
             <div className="flex items-center justify-between">
               <label className="text-sm text-foreground">
                 {t.recording.speakerDiarization}

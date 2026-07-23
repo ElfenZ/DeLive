@@ -11,9 +11,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [2.5.5] - 2026-07-23
+
 ### Added / 新增
 - **Recording pause and resume** - active recordings can pause and resume within the same session, freezing elapsed time and stopping audio storage, upload, and transcription while paused
 - **录制暂停与恢复** - 实时录制可在同一会话内暂停和恢复；暂停期间计时冻结，且不会保存、上传或转写音频
+- **Task-scoped meeting context** - global context and glossary settings can be inherited, overridden, or cleared per recording or file task, then persisted without credentials for Soniox context and AI correction
+- **任务级会议上下文** - 录制或文件任务可继承、覆盖或清空全局背景与术语设置，并以无凭据快照持久化供 Soniox context 和 AI 纠错使用
+- **Provider configuration controls** - configuration fields now support grouping, conditional visibility, validation, and advanced Soniox endpoint settings
+- **Provider 配置能力** - 配置字段支持分组、条件显示和校验，并新增 Soniox 高级端点设置
+- **Volcengine realtime speaker clustering** - realtime requests can enable server-side speaker clustering, preserve token timestamps, and parse speaker IDs from top-level or nested response fields
+- **火山实时多人聚类** - 实时请求可启用服务端说话人聚类，保留 Token 时间戳，并兼容顶层或嵌套响应中的 speaker ID
+
+### Changed / 变更
+- **Runtime local proxy discovery** - Electron now tries ports 23456 through 23460, shares the selected server with Open API routes, and exposes the runtime URL to renderer settings
+- **运行时本地代理发现** - Electron 会依次尝试 23456 至 23460，共用实际端口承载 Open API，并向 Renderer 设置页暴露运行时 URL
+- **Provider form behavior** - provider-specific options are shown only when relevant, with clearer field grouping and Soniox realtime/file request isolation
+- **Provider 表单行为** - 仅在适用时显示 Provider 专属选项，优化字段分组，并隔离 Soniox 实时与文件请求参数
+- **Volcengine diarization semantics** - speaker separation is best-effort clustering performed by Volcengine, not channel splitting; DeLive separates speakers only when the service returns multiple speaker IDs
+- **火山多人识别语义** - 说话人分离由火山服务端尽力聚类，并非声道拆分；只有服务返回多个 speaker ID 时 DeLive 才会分人
+
+### Fixed / 修复
+- **Configuration and persistence reliability** - strengthened config normalization, credential-free meeting snapshots, backup import/export, Session schema validation, and legacy data handling
+- **配置与持久化可靠性** - 加强配置规范化、无凭据会议快照、备份导入导出、Session schema 校验和旧数据兼容
+- **Safe Volcengine diagnostics** - request logs no longer expose App Key or Access Token, and response diagnostics record structural and speaker summaries without transcript text
+- **安全的火山诊断** - 请求日志不再暴露 App Key 或 Access Token，响应诊断仅记录结构和 speaker 摘要，不记录转录正文
 
 ---
 

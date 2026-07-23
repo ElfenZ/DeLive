@@ -11,7 +11,7 @@ flowchart TB
     entry["main.ts → mainWindow · captionWindow · tray · shortcuts"]
     subgraph services["核心服务"]
       direction LR
-      volc["🌐 多 Provider 代理\n/ws/volc · /ws/mistral · /ws/deepgram\n/ws/assemblyai · /ws/elevenlabs\n端口 23456"]
+      volc["🌐 多 Provider 代理\n/ws/volc · /ws/mistral · /ws/deepgram\n/ws/assemblyai · /ws/elevenlabs · /ws/gladia\n首选 23456 · 最多回退到 23460"]
       api["⚡ API 服务器\n/api/v1/* · /ws/live"]
       runtime["🔧 本地 Runtime\nwhisper.cpp 生命周期"]
     end
@@ -142,7 +142,7 @@ flowchart TB
 
 ### 单一 HTTP 服务器
 
-端口 23456 在一个 `http.createServer()` 上托管多个 WebSocket 代理（`/ws/volc`、`/ws/mistral`、`/ws/deepgram`、`/ws/assemblyai`、`/ws/elevenlabs`）、REST API（`/api/v1/*`）和实时转录 WebSocket（`/ws/live`）。每个代理使用 `noServer: true` 模式并手动路由 `upgrade` 事件。
+一个 `http.createServer()` 同时托管全部 Provider WebSocket 代理（`/ws/volc`、`/ws/mistral`、`/ws/deepgram`、`/ws/assemblyai`、`/ws/elevenlabs`、`/ws/gladia`）、REST API（`/api/v1/*`）和实时转录 WebSocket（`/ws/live`）。Electron 优先绑定 `23456`，仅在 `EADDRINUSE` 时依次尝试 `23457–23460`，绑定成功前不会创建主窗口；实际端口通过强类型 IPC 提供给 Renderer。
 
 ### MCP 作为独立进程
 

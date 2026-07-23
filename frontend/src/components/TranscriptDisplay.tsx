@@ -5,6 +5,7 @@ import { useSettingsStore } from '../stores/settingsStore'
 import { useSessionStore } from '../stores/sessionStore'
 import { getProviderName } from '../utils/providerI18n'
 import { StatusIndicator } from './ui'
+import { shouldShowLiveSpeakerDiarization } from '../utils/providerMetadata'
 
 interface TranscriptDisplayProps {
   className?: string
@@ -100,10 +101,11 @@ export function TranscriptDisplay({
   const translatedText = finalTranslatedTranscript + nonFinalTranslatedTranscript
   const showSource = captionDisplayMode !== 'translated' || translatedText.length === 0
   const showTranslated = captionDisplayMode !== 'source' && translatedText.length > 0
-  const speakerDiarizationEnabled = currentVendor === 'soniox'
-    && Boolean(settings.providerConfigs?.soniox?.enableSpeakerDiarization)
-    && Boolean(currentProvider?.capabilities.supportsSpeakerDiarization)
-    && currentSegments.some((segment) => segment.speakerId)
+  const speakerDiarizationEnabled = shouldShowLiveSpeakerDiarization(
+    currentProvider,
+    settings.providerConfigs?.[currentVendor],
+    currentSegments,
+  )
   const isEmpty = !finalTranscript && !nonFinalTranscript && !translatedText
   const isRecording = recordingState === 'recording'
   const isStarting = recordingState === 'starting'

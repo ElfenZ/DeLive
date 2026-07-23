@@ -9,8 +9,10 @@ import { ASSEMBLYAI_DEFAULT_MODEL } from '../types/asr/vendors/assemblyai'
 import { ELEVENLABS_DEFAULT_MODEL } from '../types/asr/vendors/elevenlabs'
 import { GLADIA_DEFAULT_MODEL } from '../types/asr/vendors/gladia'
 import { CLOUDFLARE_DEFAULT_MODEL } from '../types/asr/vendors/cloudflare'
-import { SONIOX_DEFAULT_MODEL } from '../types/asr/vendors/soniox'
+import { SONIOX_WEBSOCKET_URL } from '../types/asr/vendors/soniox'
 import { transcribeSiliconFlowAudio } from './siliconflow'
+import { buildSonioxRealtimeRequest, parseSonioxConfig } from './sonioxConfig'
+import { getProxyWebSocketUrl } from './proxyUrl'
 
 type ProviderConfigTester = (config: ProviderConfigData) => Promise<void>
 
@@ -49,23 +51,17 @@ const providerConfigTesters: Partial<Record<ASRVendor, ProviderConfigTester>> = 
     if (!apiKey) {
       throw new Error('请输入 API Key')
     }
+    const request = buildSonioxRealtimeRequest(parseSonioxConfig(config).value)
 
     await new Promise<void>((resolve, reject) => {
-      const ws = new WebSocket('wss://stt-rt.soniox.com/transcribe-websocket')
+      const ws = new WebSocket(SONIOX_WEBSOCKET_URL)
       const timeout = setTimeout(() => {
         ws.close()
         reject(new Error('连接超时，请检查网络'))
       }, 10000)
 
       ws.onopen = () => {
-        ws.send(JSON.stringify({
-          api_key: apiKey,
-          model: typeof config.model === 'string' && config.model.trim() ? config.model.trim() : SONIOX_DEFAULT_MODEL,
-          audio_format: 'auto',
-          language_hints: Array.isArray(config.languageHints) && config.languageHints.length > 0
-            ? config.languageHints
-            : ['zh', 'en'],
-        }))
+        ws.send(JSON.stringify(request))
       }
 
       ws.onmessage = (event) => {
@@ -114,15 +110,15 @@ const providerConfigTesters: Partial<Record<ASRVendor, ProviderConfigTester>> = 
       throw new Error('请输入 Access Token')
     }
 
+    const params = new URLSearchParams({
+      appKey,
+      accessKey,
+      modelV2: 'true',
+      bidiStreaming: 'true',
+      enableDdc: 'true',
+    })
+    const proxyUrl = await getProxyWebSocketUrl('/ws/volc', params)
     await new Promise<void>((resolve, reject) => {
-      const params = new URLSearchParams({
-        appKey,
-        accessKey,
-        modelV2: 'true',
-        bidiStreaming: 'true',
-        enableDdc: 'true',
-      })
-      const proxyUrl = `ws://localhost:23456/ws/volc?${params.toString()}`
       let ws: WebSocket | null = null
       let lastProxyErrorMessage = ''
 
@@ -189,13 +185,13 @@ const providerConfigTesters: Partial<Record<ASRVendor, ProviderConfigTester>> = 
       throw new Error('请输入 Mistral API Key')
     }
 
+    const params = new URLSearchParams({
+      apiKey,
+      model: MISTRAL_REALTIME_MODEL,
+      language: '',
+    })
+    const proxyUrl = await getProxyWebSocketUrl('/ws/mistral', params)
     await new Promise<void>((resolve, reject) => {
-      const params = new URLSearchParams({
-        apiKey,
-        model: MISTRAL_REALTIME_MODEL,
-        language: '',
-      })
-      const proxyUrl = `ws://localhost:23456/ws/mistral?${params.toString()}`
       let ws: WebSocket | null = null
 
       const timeout = setTimeout(() => {
@@ -260,13 +256,13 @@ const providerConfigTesters: Partial<Record<ASRVendor, ProviderConfigTester>> = 
       throw new Error('请输入 Deepgram API Key')
     }
 
+    const params = new URLSearchParams({
+      apiKey,
+      model: DEEPGRAM_DEFAULT_MODEL,
+      language: '',
+    })
+    const proxyUrl = await getProxyWebSocketUrl('/ws/deepgram', params)
     await new Promise<void>((resolve, reject) => {
-      const params = new URLSearchParams({
-        apiKey,
-        model: DEEPGRAM_DEFAULT_MODEL,
-        language: '',
-      })
-      const proxyUrl = `ws://localhost:23456/ws/deepgram?${params.toString()}`
       let ws: WebSocket | null = null
 
       const timeout = setTimeout(() => {
@@ -331,12 +327,12 @@ const providerConfigTesters: Partial<Record<ASRVendor, ProviderConfigTester>> = 
       throw new Error('请输入 AssemblyAI API Key')
     }
 
+    const params = new URLSearchParams({
+      apiKey,
+      model: ASSEMBLYAI_DEFAULT_MODEL,
+    })
+    const proxyUrl = await getProxyWebSocketUrl('/ws/assemblyai', params)
     await new Promise<void>((resolve, reject) => {
-      const params = new URLSearchParams({
-        apiKey,
-        model: ASSEMBLYAI_DEFAULT_MODEL,
-      })
-      const proxyUrl = `ws://localhost:23456/ws/assemblyai?${params.toString()}`
       let ws: WebSocket | null = null
 
       const timeout = setTimeout(() => {
@@ -401,13 +397,13 @@ const providerConfigTesters: Partial<Record<ASRVendor, ProviderConfigTester>> = 
       throw new Error('请输入 ElevenLabs API Key')
     }
 
+    const params = new URLSearchParams({
+      apiKey,
+      model: ELEVENLABS_DEFAULT_MODEL,
+      language: '',
+    })
+    const proxyUrl = await getProxyWebSocketUrl('/ws/elevenlabs', params)
     await new Promise<void>((resolve, reject) => {
-      const params = new URLSearchParams({
-        apiKey,
-        model: ELEVENLABS_DEFAULT_MODEL,
-        language: '',
-      })
-      const proxyUrl = `ws://localhost:23456/ws/elevenlabs?${params.toString()}`
       let ws: WebSocket | null = null
 
       const timeout = setTimeout(() => {
@@ -472,13 +468,13 @@ const providerConfigTesters: Partial<Record<ASRVendor, ProviderConfigTester>> = 
       throw new Error('请输入 Gladia API Key')
     }
 
+    const params = new URLSearchParams({
+      apiKey,
+      model: GLADIA_DEFAULT_MODEL,
+      language: '',
+    })
+    const proxyUrl = await getProxyWebSocketUrl('/ws/gladia', params)
     await new Promise<void>((resolve, reject) => {
-      const params = new URLSearchParams({
-        apiKey,
-        model: GLADIA_DEFAULT_MODEL,
-        language: '',
-      })
-      const proxyUrl = `ws://localhost:23456/ws/gladia?${params.toString()}`
       let ws: WebSocket | null = null
 
       const timeout = setTimeout(() => {

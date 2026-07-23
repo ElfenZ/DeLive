@@ -1,4 +1,4 @@
-import { useState, type ChangeEvent, type Ref } from 'react'
+import { useEffect, useState, type ChangeEvent, type Ref } from 'react'
 import {
   AlertCircle,
   Check,
@@ -21,6 +21,7 @@ import { Switch } from '../ui'
 import type { Language, Translations } from '../../i18n'
 import type { AiPostProcessConfig, AppSettings, OpenApiConfig } from '../../types'
 import { colorThemes, type ColorThemeId } from '../../themes'
+import { getProxyHttpUrl, getProxyWebSocketUrl } from '../../utils/proxyUrl'
 
 interface ImportMessage {
   type: 'success' | 'error'
@@ -86,6 +87,21 @@ export function GeneralSettingsPanel({
   const [showAiApiKey, setShowAiApiKey] = useState(false)
   const [showApiToken, setShowApiToken] = useState(false)
   const [copiedField, setCopiedField] = useState<string | null>(null)
+  const [openApiRestUrl, setOpenApiRestUrl] = useState('')
+  const [openApiWebSocketUrl, setOpenApiWebSocketUrl] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    void Promise.all([
+      getProxyHttpUrl('/api/v1/'),
+      getProxyWebSocketUrl('/ws/live'),
+    ]).then(([rest, webSocket]) => {
+      if (cancelled) return
+      setOpenApiRestUrl(rest)
+      setOpenApiWebSocketUrl(webSocket)
+    })
+    return () => { cancelled = true }
+  }, [])
 
   function generateRandomToken(): string {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
@@ -347,11 +363,11 @@ export function GeneralSettingsPanel({
                       {t.settings.openApiRestUrl}
                     </span>
                     <code className="text-xs font-mono flex-1 truncate">
-                      http://localhost:23456/api/v1/
+                      {openApiRestUrl || t.settings.openApiResolvingPort}
                     </code>
                     <button
                       type="button"
-                      onClick={() => copyToClipboard('http://localhost:23456/api/v1/', 'rest')}
+                      onClick={() => openApiRestUrl && copyToClipboard(openApiRestUrl, 'rest')}
                       className="p-1 text-muted-foreground hover:text-foreground transition-colors"
                     >
                       {copiedField === 'rest' ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Clipboard className="w-3.5 h-3.5" />}
@@ -362,11 +378,11 @@ export function GeneralSettingsPanel({
                       {t.settings.openApiWsUrl}
                     </span>
                     <code className="text-xs font-mono flex-1 truncate">
-                      ws://localhost:23456/ws/live
+                      {openApiWebSocketUrl || t.settings.openApiResolvingPort}
                     </code>
                     <button
                       type="button"
-                      onClick={() => copyToClipboard('ws://localhost:23456/ws/live', 'ws')}
+                      onClick={() => openApiWebSocketUrl && copyToClipboard(openApiWebSocketUrl, 'ws')}
                       className="p-1 text-muted-foreground hover:text-foreground transition-colors"
                     >
                       {copiedField === 'ws' ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Clipboard className="w-3.5 h-3.5" />}

@@ -108,7 +108,16 @@ export function buildProviderConfigFromFormState(
         }
 
         const numericValue = Number(textValue)
-        config[field.key] = Number.isFinite(numericValue) ? numericValue : textValue
+        if (!Number.isFinite(numericValue)) {
+          throw new Error(`${field.label} must be a valid number`)
+        }
+        if (field.min !== undefined && numericValue < field.min) {
+          throw new Error(`${field.label} must be at least ${field.min}`)
+        }
+        if (field.max !== undefined && numericValue > field.max) {
+          throw new Error(`${field.label} must be at most ${field.max}`)
+        }
+        config[field.key] = numericValue
         break
       }
       case 'multiselect': {
@@ -133,8 +142,14 @@ export function buildProviderConfigFromFormState(
     }
   }
 
-  if ((config.languageHints as string[]).length === 0) {
-    config.languageHints = [...DEFAULT_LANGUAGE_HINTS]
+  for (const field of provider.configFields) {
+    const condition = field.enabledWhen
+    if (!condition || field.type !== 'boolean') continue
+    const dependency = config[condition.fieldKey]
+    const matches = condition.nonEmpty
+      ? (Array.isArray(dependency) ? dependency.length > 0 : String(dependency ?? '').trim().length > 0)
+      : condition.equals === undefined || String(dependency) === String(condition.equals)
+    if (!matches) config[field.key] = false
   }
 
   return config

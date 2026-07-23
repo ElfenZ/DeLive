@@ -39,6 +39,8 @@ Skill 定义了五种推荐工作流模式：
 
 连接 WebSocket 进行实时转录访问：
 
+示例使用首选端口 `23456`。如果 DeLive 在 **设置 > Open API** 中显示了回退端口，请先替换连接地址。
+
 ```python
 import asyncio, websockets, json
 
