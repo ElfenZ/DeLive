@@ -71,7 +71,11 @@ import {
 } from '../utils/transcriptState'
 import { useSettingsStore } from './settingsStore'
 import { useUIStore } from './uiStore'
-import { generateId } from '../utils/storageUtils'
+import {
+  buildCorrectedTranscriptMarkdown,
+  buildSessionExportFilename,
+  generateId,
+} from '../utils/storageUtils'
 import {
   createRecordingTimeline,
   finalizeRecordingTimeline,
@@ -198,6 +202,7 @@ export interface SessionState {
   updateSessionCorrection: (sessionId: string, patch: Partial<TranscriptCorrection>) => void
   recoverStaleSessionCorrection: (sessionId: string) => void
   maybeStartAutoAiPostProcess: (sessionId: string) => Promise<void>
+  retrySessionAutoExport: (sessionId: string) => Promise<void>
   maybeAutoDetectSessionCorrection: (sessionId: string) => Promise<void>
   detectSessionCorrectionIssues: (sessionId: string) => Promise<CorrectionIssue[]>
   startSessionQuickCorrection: (
@@ -812,10 +817,50 @@ export const useSessionStore = create<SessionState>((set, get) => {
     if (session.title === workflow.titleAtStart) {
       get().updateSessionTitle(sessionId, titleSuggestion)
     }
+    const autoExportEnabled = Boolean(
+      useSettingsStore.getState().settings.aiPostProcess?.autoExportCorrectedMarkdown,
+    )
+    updateAutoPostProcessWorkflow(sessionId, autoExportEnabled
+      ? { status: 'queued', step: 'export', error: undefined }
+      : { status: 'completed', step: 'title', completedAt: Date.now(), error: undefined })
+  }
+
+  const exportCorrectedTranscriptMarkdown = async (sessionId: string): Promise<void> => {
+    const session = get().sessions.find((item) => item.id === sessionId)
+    const workflow = session?.autoPostProcessWorkflow
+    if (!session || !workflow || workflow.step !== 'export') return
+    if (workflow.exportPath) {
+      updateAutoPostProcessWorkflow(sessionId, {
+        status: 'completed',
+        completedAt: workflow.completedAt || Date.now(),
+        error: undefined,
+      })
+      return
+    }
+
+    const electronApi = window.electronAPI
+    const directory = useSettingsStore.getState().settings.aiPostProcess?.autoExportDirectory?.trim()
+    if (!electronApi?.writeAutoExportFile) throw new Error('当前环境不支持自动导出')
+    if (!directory) throw new Error('请先选择纠错稿自动导出目录')
+
+    const language = useUIStore.getState().language
+    const correctedLabel = useUIStore.getState().t.preview.correctionCorrected
+    const content = buildCorrectedTranscriptMarkdown(session, correctedLabel, language)
+    if (!content) throw new Error('当前会话没有可导出的纠错稿')
+    const result = await electronApi.writeAutoExportFile({
+      directory,
+      fileName: buildSessionExportFilename(session, 'md', 'corrected'),
+      content,
+    })
+    if (!result.ok || !result.path) throw new Error(result.error || '自动导出纠错稿失败')
+
+    const now = Date.now()
     updateAutoPostProcessWorkflow(sessionId, {
       status: 'completed',
-      step: 'title',
-      completedAt: Date.now(),
+      step: 'export',
+      exportPath: result.path,
+      exportedAt: now,
+      completedAt: now,
       error: undefined,
     })
   }
@@ -906,11 +951,17 @@ export const useSessionStore = create<SessionState>((set, get) => {
           }
           updateAutoPostProcessWorkflow(sessionId, { status: 'running', step: 'title', error: undefined })
           await finishAutoPostProcessTitle(sessionId)
-          return
+          continue
+        }
+
+        if (workflow.step === 'title') {
+          updateAutoPostProcessWorkflow(sessionId, { status: 'running', error: undefined })
+          await finishAutoPostProcessTitle(sessionId)
+          continue
         }
 
         updateAutoPostProcessWorkflow(sessionId, { status: 'running', error: undefined })
-        await finishAutoPostProcessTitle(sessionId)
+        await exportCorrectedTranscriptMarkdown(sessionId)
         return
       }
     } catch (error) {
@@ -1561,12 +1612,25 @@ export const useSessionStore = create<SessionState>((set, get) => {
           ? '请先配置 AI 纠错模型'
           : !resolveModelForFeature(aiConfig, 'briefing')
             ? '请先配置 AI 摘要模型'
+            : aiConfig.autoExportCorrectedMarkdown && !window.electronAPI?.writeAutoExportFile
+              ? '当前环境不支持自动导出纠错稿'
+              : aiConfig.autoExportCorrectedMarkdown && !aiConfig.autoExportDirectory?.trim()
+                ? '请先选择纠错稿自动导出目录'
             : ''
       if (configurationError) {
         failAutoPostProcessWorkflow(sessionId, configurationError)
         return
       }
 
+      await runAutoAiPostProcessWorkflow(sessionId)
+    },
+
+    retrySessionAutoExport: async (sessionId) => {
+      const workflow = get().sessions.find((item) => item.id === sessionId)?.autoPostProcessWorkflow
+      if (!workflow || workflow.status !== 'error' || workflow.step !== 'export') {
+        throw new Error('当前自动后处理任务不在可重试的导出步骤')
+      }
+      updateAutoPostProcessWorkflow(sessionId, { status: 'queued', error: undefined })
       await runAutoAiPostProcessWorkflow(sessionId)
     },
 

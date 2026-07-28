@@ -1,6 +1,10 @@
 import type { Tag, TranscriptSession } from '../types'
 import { hasPostProcessContent } from './transcriptState'
-import { formatCorrectionProjection, projectCorrectionOntoSegments } from './correctedSegmentProjection'
+import {
+  formatCorrectionProjection,
+  projectCorrectionOntoSegments,
+  projectSessionCorrection,
+} from './correctedSegmentProjection'
 
 const MAX_SESSION_EXPORT_FILENAME_LENGTH = 240
 
@@ -142,6 +146,41 @@ export function buildTranscriptExportBody(
   return projection.status === 'projected'
     ? formatCorrectionProjection(projection, session.speakers, format)
     : session.transcript
+}
+
+export function buildCorrectedTranscriptExportBody(
+  session: TranscriptSession,
+  format: 'txt' | 'markdown',
+  language?: 'zh' | 'en',
+): string {
+  const correctedText = session.correction?.published?.correctedText
+    || session.correction?.legacy?.correctedText
+    || (session.correction?.status === 'done' ? session.correction.correctedText : undefined)
+  if (!correctedText) return ''
+
+  const projection = projectSessionCorrection(session.transcript, session.segments, session.correction)
+  return projection
+    ? formatCorrectionProjection(projection, session.speakers, format, language)
+    : correctedText
+}
+
+export function buildCorrectedTranscriptMarkdown(
+  session: TranscriptSession,
+  correctedLabel: string,
+  language?: 'zh' | 'en',
+): string {
+  const body = buildCorrectedTranscriptExportBody(session, 'markdown', language)
+  if (!body) return ''
+  return [
+    `# ${session.title} (${correctedLabel})`,
+    '',
+    `> ${session.date} ${session.time}`,
+    '',
+    '---',
+    '',
+    body,
+    '',
+  ].join('\n')
 }
 
 function formatTimestamp(timestamp: number | undefined): string {

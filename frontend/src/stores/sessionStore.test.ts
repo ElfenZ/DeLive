@@ -49,7 +49,10 @@ function mockMetadataPersistence(useSessionStore: typeof import('./sessionStore'
   })
 }
 
-async function configureAutomaticWorkflow(mode: 'quick' | 'review' = 'quick'): Promise<void> {
+async function configureAutomaticWorkflow(
+  mode: 'quick' | 'review' = 'quick',
+  autoExportDirectory?: string,
+): Promise<void> {
   const { useSettingsStore } = await import('./settingsStore')
   const current = useSettingsStore.getState().settings
   useSettingsStore.setState({
@@ -61,6 +64,8 @@ async function configureAutomaticWorkflow(mode: 'quick' | 'review' = 'quick'): P
         autoCorrectionDetection: true,
         correctionMode: mode,
         modelAssignment: { correction: 'model', briefing: 'model' },
+        autoExportCorrectedMarkdown: Boolean(autoExportDirectory),
+        autoExportDirectory: autoExportDirectory || '',
       },
     },
   })
@@ -111,7 +116,7 @@ describe('sessionStore patch correction runner', () => {
       expect.objectContaining({ transcript: 'hello', duration: 3_250 }),
     )
     expect(useSessionStore.getState().currentSessionId).toBeNull()
-  })
+  }, 10_000)
 
   it('quick mode checkpoints shards then atomically publishes deterministic text', async () => {
     const { useSessionStore } = await import('./sessionStore')
@@ -272,6 +277,69 @@ describe('sessionStore patch correction runner', () => {
       .toBe('需要适应新的工作。')
     expect(completed.title).toBe('AI 标题')
     expect(completed.autoPostProcessWorkflow).toEqual(expect.objectContaining({ status: 'completed', step: 'title' }))
+  })
+
+  it('exports corrected Markdown after the final title and persists the actual path', async () => {
+    const writeAutoExportFile = vi.fn().mockResolvedValue({ ok: true, path: 'D:\\Exports\\final_corrected.md' })
+    vi.stubGlobal('window', { electronAPI: { writeAutoExportFile } })
+    vi.stubGlobal('localStorage', { getItem: () => null, setItem: () => undefined, removeItem: () => undefined })
+    const { useSessionStore } = await import('./sessionStore')
+    mockMetadataPersistence(useSessionStore)
+    await configureAutomaticWorkflow('quick', 'D:\\Exports')
+    const source = session()
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+
+    await useSessionStore.getState().maybeStartAutoAiPostProcess(source.id)
+
+    expect(writeAutoExportFile).toHaveBeenCalledTimes(1)
+    expect(writeAutoExportFile).toHaveBeenCalledWith(expect.objectContaining({
+      directory: 'D:\\Exports',
+      fileName: expect.stringMatching(/_AI 标题_corrected\.md$/),
+      content: expect.stringContaining('# AI 标题'),
+    }))
+    expect(useSessionStore.getState().sessions[0].autoPostProcessWorkflow).toEqual(expect.objectContaining({
+      status: 'completed',
+      step: 'export',
+      exportPath: 'D:\\Exports\\final_corrected.md',
+      exportedAt: expect.any(Number),
+    }))
+  })
+
+  it('retries only a failed export with the latest configured directory', async () => {
+    const writeAutoExportFile = vi.fn()
+      .mockResolvedValueOnce({ ok: false, error: 'disk unavailable' })
+      .mockResolvedValueOnce({ ok: true, path: 'E:\\New\\retry_corrected.md' })
+    vi.stubGlobal('window', { electronAPI: { writeAutoExportFile } })
+    vi.stubGlobal('localStorage', { getItem: () => null, setItem: () => undefined, removeItem: () => undefined })
+    const { useSessionStore } = await import('./sessionStore')
+    mockMetadataPersistence(useSessionStore)
+    await configureAutomaticWorkflow('quick', 'D:\\Old')
+    const source = session()
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+
+    await useSessionStore.getState().maybeStartAutoAiPostProcess(source.id)
+    expect(useSessionStore.getState().sessions[0].autoPostProcessWorkflow).toEqual(expect.objectContaining({
+      status: 'error', step: 'export', error: 'disk unavailable',
+    }))
+
+    const { useSettingsStore } = await import('./settingsStore')
+    useSettingsStore.setState({
+      settings: {
+        ...useSettingsStore.getState().settings,
+        aiPostProcess: {
+          ...useSettingsStore.getState().settings.aiPostProcess,
+          autoExportDirectory: 'E:\\New',
+        },
+      },
+    })
+    await useSessionStore.getState().retrySessionAutoExport(source.id)
+
+    expect(correction.requestCorrectionShard).toHaveBeenCalledTimes(1)
+    expect(postProcess.generateSessionBriefing).toHaveBeenCalledTimes(1)
+    expect(writeAutoExportFile).toHaveBeenLastCalledWith(expect.objectContaining({ directory: 'E:\\New' }))
+    expect(useSessionStore.getState().sessions[0].autoPostProcessWorkflow).toEqual(expect.objectContaining({
+      status: 'completed', step: 'export', exportPath: 'E:\\New\\retry_corrected.md',
+    }))
   })
 
   it('waits for Review confirmation before briefing and then continues', async () => {

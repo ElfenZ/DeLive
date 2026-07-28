@@ -32,7 +32,7 @@ import {
   normalizeMeetingContextSnapshot,
 } from './meetingContext'
 
-export const CURRENT_SESSION_SCHEMA_VERSION = 6
+export const CURRENT_SESSION_SCHEMA_VERSION = 7
 const DEFAULT_SESSION_STATUS: TranscriptSessionStatus = 'completed'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -443,7 +443,7 @@ function normalizeAutoPostProcessWorkflow(value: unknown): TranscriptAutoPostPro
     || value.status === 'error' || value.status === 'completed'
     ? value.status
     : undefined
-  const step = value.step === 'correction' || value.step === 'briefing' || value.step === 'title'
+  const step = value.step === 'correction' || value.step === 'briefing' || value.step === 'title' || value.step === 'export'
     ? value.step
     : undefined
   const correctionMode = value.correctionMode === 'quick' || value.correctionMode === 'review'
@@ -456,7 +456,7 @@ function normalizeAutoPostProcessWorkflow(value: unknown): TranscriptAutoPostPro
     return undefined
   }
   if ((status === 'waiting-review' && (step !== 'correction' || correctionMode !== 'review'))
-    || (status === 'completed' && step !== 'title')) {
+    || (status === 'completed' && step !== 'title' && step !== 'export')) {
     return undefined
   }
   return {
@@ -468,6 +468,8 @@ function normalizeAutoPostProcessWorkflow(value: unknown): TranscriptAutoPostPro
     startedAt,
     updatedAt,
     completedAt: getNumber(value.completedAt),
+    exportPath: getString(value.exportPath)?.trim() || undefined,
+    exportedAt: getNumber(value.exportedAt),
     error: getString(value.error)?.trim() || undefined,
   }
 }

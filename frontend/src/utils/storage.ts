@@ -38,6 +38,8 @@ export {
 
 export {
   buildSessionExportFilename,
+  buildCorrectedTranscriptExportBody,
+  buildCorrectedTranscriptMarkdown,
   exportToTxt,
   exportToMarkdown,
   exportAiAnalysisToTxt,

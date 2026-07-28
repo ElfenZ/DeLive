@@ -240,6 +240,12 @@ function normalizeAiPostProcessConfig(value: unknown): AiPostProcessConfig | und
     glossary,
     autoCorrectionDetection: typeof value.autoCorrectionDetection === 'boolean' ? value.autoCorrectionDetection : undefined,
     autoAiPostProcess: typeof value.autoAiPostProcess === 'boolean' ? value.autoAiPostProcess : undefined,
+    autoExportCorrectedMarkdown: typeof value.autoExportCorrectedMarkdown === 'boolean'
+      ? value.autoExportCorrectedMarkdown
+      : undefined,
+    autoExportDirectory: typeof value.autoExportDirectory === 'string' && value.autoExportDirectory.trim()
+      ? value.autoExportDirectory.trim()
+      : undefined,
     correctionStructuredOutput,
     correctionAdvanced: normalizedCorrectionAdvanced,
   }

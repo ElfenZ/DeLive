@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import {
   Sparkles,
   Loader2,
@@ -5,6 +6,8 @@ import {
   ListTodo,
   Tags,
   BookOpenText,
+  FolderOpen,
+  RefreshCw,
 } from 'lucide-react'
 import type { TranscriptSession } from '../../types'
 import { useUIStore } from '../../stores/uiStore'
@@ -20,16 +23,23 @@ interface AiTabProps {
 
 export function AiTab({ session }: AiTabProps) {
   const { t } = useUIStore()
+  const language = useUIStore((state) => state.language)
   const settings = useSettingsStore((state) => state.settings)
   const generateSessionPostProcess = useSessionStore((state) => state.generateSessionPostProcess)
   const updateSessionTitle = useSessionStore((state) => state.updateSessionTitle)
   const updateSessionTags = useSessionStore((state) => state.updateSessionTags)
+  const retrySessionAutoExport = useSessionStore((state) => state.retrySessionAutoExport)
   const tags = useTagStore((state) => state.tags)
   const addTag = useTagStore((state) => state.addTag)
+  const [exportRetrying, setExportRetrying] = useState(false)
 
   const postProcess = session.postProcess
-  const workflowError = session.autoPostProcessWorkflow?.status === 'error'
-    ? session.autoPostProcessWorkflow.error
+  const workflow = session.autoPostProcessWorkflow
+  const exportError = workflow?.status === 'error' && workflow.step === 'export'
+    ? workflow.error
+    : undefined
+  const workflowError = workflow?.status === 'error' && workflow.step !== 'export'
+    ? workflow.error
     : undefined
   const aiConfigured = isAiPostProcessConfigured(settings)
   const aiGenerating = postProcess?.status === 'pending'
@@ -68,6 +78,24 @@ export function AiTab({ session }: AiTabProps) {
       nextTagIds.add(tagId)
     }
     updateSessionTags(session.id, Array.from(nextTagIds))
+  }
+
+  const handleRetryAutoExport = async () => {
+    if (exportRetrying) return
+    setExportRetrying(true)
+    try {
+      await retrySessionAutoExport(session.id)
+    } catch (error) {
+      console.error('[AiTab] Auto export retry failed:', error)
+    } finally {
+      setExportRetrying(false)
+    }
+  }
+
+  const handleRevealExport = async () => {
+    if (!workflow?.exportPath) return
+    const result = await window.electronAPI?.revealExportedFile?.(workflow.exportPath)
+    if (result && !result.ok) console.error('[AiTab] Reveal export failed:', result.error)
   }
 
   return (
@@ -114,6 +142,45 @@ export function AiTab({ session }: AiTabProps) {
             )}
           </button>
         </div>
+
+        {workflow?.exportPath && (
+          <div className="flex flex-col gap-3 rounded-lg border border-success/30 bg-success/10 px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0">
+              <p className="text-xs font-medium text-success">
+                {language === 'zh' ? '纠错稿已自动导出' : 'Corrected Markdown exported'}
+              </p>
+              <p className="mt-1 break-all text-xs text-muted-foreground">{workflow.exportPath}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => void handleRevealExport()}
+              className="inline-flex shrink-0 items-center justify-center gap-2 rounded-md border border-success/30 bg-background px-3 py-1.5 text-xs font-medium text-success transition-colors hover:bg-success/10"
+            >
+              <FolderOpen className="w-3.5 h-3.5" />
+              {language === 'zh' ? '在文件夹中显示' : 'Show in Folder'}
+            </button>
+          </div>
+        )}
+
+        {exportError && (
+          <div className="flex flex-col gap-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-xs font-medium text-destructive">
+                {language === 'zh' ? '纠错稿自动导出失败' : 'Corrected Markdown export failed'}
+              </p>
+              <p className="mt-1 text-xs text-destructive">{exportError}</p>
+            </div>
+            <button
+              type="button"
+              disabled={exportRetrying}
+              onClick={() => void handleRetryAutoExport()}
+              className="inline-flex shrink-0 items-center justify-center gap-2 rounded-md border border-destructive/30 bg-background px-3 py-1.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {exportRetrying ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+              {language === 'zh' ? '重试导出' : 'Retry Export'}
+            </button>
+          </div>
+        )}
 
         {hasAiContent && (
           <div className="grid gap-4">

@@ -24,12 +24,14 @@ The persistent state belongs to `TranscriptSession` and is normalized in `sessio
 interface TranscriptAutoPostProcessWorkflow {
   version: 1
   status: 'queued' | 'running' | 'waiting-review' | 'error' | 'completed'
-  step: 'correction' | 'briefing' | 'title'
+  step: 'correction' | 'briefing' | 'title' | 'export'
   correctionMode: 'quick' | 'review'
   titleAtStart: string
   startedAt: number
   updatedAt: number
   completedAt?: number
+  exportPath?: string
+  exportedAt?: number
   error?: string
 }
 ```
@@ -49,6 +51,10 @@ maybeStartAutoAiPostProcess(sessionId: string): Promise<void>
 - A Review workflow stops at `waiting-review` until local publication. An empty patch list is published locally and continues without a meaningless confirmation.
 - A briefing recovered at the `briefing` step is reusable only when it was generated after `startedAt` and its source provenance still matches `resolveTranscriptText`.
 - Do not increment the IndexedDB version for fields stored inside existing Session records.
+- Corrected Markdown auto-export runs only as the final step of the full workflow. Manual export and automatic export must share `buildCorrectedTranscriptMarkdown`; components and workflow branches must not rebuild the document independently.
+- Arbitrary user-selected folders are accessed only through `pickDirectoryPath`, `writeAutoExportFile`, and `revealExportedFile`. Do not expand the general `isPathAllowed` whitelist for this feature.
+- `writeAutoExportFile` accepts an absolute existing directory, a safe basename, and UTF-8 content. It creates files exclusively and appends ` (n)` on collisions.
+- An export retry reads the latest saved directory and latest Session, then reruns only `step: 'export'`. A persisted `exportPath` makes recovery idempotent and must never create another file.
 
 ### 4. Validation & Error Matrix
 
@@ -60,14 +66,18 @@ maybeStartAutoAiPostProcess(sessionId: string): Promise<void>
 | Briefing fails | Keep published correction, persist workflow `error` at `briefing`, keep title |
 | Briefing has no non-empty title suggestion | Keep briefing, persist workflow `error` at `title`, keep title |
 | Current title differs from `titleAtStart` | Preserve manual title and complete normally |
-| Persisted `completed` workflow is not at `title` | Reject the workflow during schema normalization |
+| Auto-export enabled without Electron support or a selected directory | Fail configuration before correction starts |
+| Export directory becomes invalid or writing fails | Keep correction, briefing, and title; persist `error` at `export` |
+| Persisted export workflow already has `exportPath` | Complete without writing another file |
+| Persisted `completed` workflow is not at `title` or `export` | Reject the workflow during schema normalization |
 | Persisted `waiting-review` is not Review correction | Reject the workflow during schema normalization |
 
 ### 5. Good / Base / Bad Cases
 
 - Good: correction publication is checkpointed, workflow advances to briefing, and recovery reuses a current persisted briefing without another model request.
+- Good: title application advances to export, the main process returns the actual collision-safe path, and the workflow persists it before completion.
 - Base: old sessions have no workflow field and load normally without creating new work.
-- Bad: a component chains correction and briefing in an effect, or launch recovery resumes both the generic queued draft runner and the workflow runner for the same Session.
+- Bad: a component writes a Blob for automatic export, a renderer writes arbitrary paths directly, or retry restarts correction/briefing.
 
 ### 6. Tests Required
 
@@ -77,6 +87,8 @@ maybeStartAutoAiPostProcess(sessionId: string): Promise<void>
 - Launch: resume `queued`/interrupted `running`; skip `waiting-review`, `error`, and `completed`.
 - Crash window: a persisted current briefing at the `briefing` step is not requested again.
 - Failure boundaries: configuration, correction, abandon, briefing, and empty-title cases stop at the correct step.
+- Export: disabled path makes no IPC call; success persists the returned path; collision-safe writing never overwrites; failure and changed-directory retry call no AI service again.
+- IPC: reject traversal/absolute filenames, missing/non-directory targets, empty content, write failures, and invalid reveal targets.
 - Schema round-trip: old Sessions gain schema version only, valid workflows survive, malformed combinations are dropped.
 
 ### 7. Wrong vs Correct
@@ -97,6 +109,8 @@ This uses stale Session data, has no restart cursor, and overwrites manual title
 await checkpointPublishedCorrection(sessionId)
 persistWorkflow(sessionId, { status: 'queued', step: 'briefing' })
 await runPersistedWorkflow(sessionId)
+persistWorkflow(sessionId, { status: 'queued', step: 'export' })
+await writeAutoExportFile({ directory, fileName, content })
 ```
 
 The workflow runner reloads the latest Session at every boundary, validates provenance before reusing results, and applies a suggested title only when the title still matches the start snapshot.

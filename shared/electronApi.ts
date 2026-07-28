@@ -219,6 +219,18 @@ export interface SessionDetail {
   }
 }
 
+export interface AutoExportFileRequest {
+  directory: string
+  fileName: string
+  content: string
+}
+
+export interface AutoExportFileResult {
+  ok: boolean
+  path?: string
+  error?: string
+}
+
 export interface ApiRecordingStatus {
   isRecording: boolean
   currentSessionId: string | null
@@ -327,7 +339,10 @@ export interface ElectronAPI {
   getAutoLaunch: () => Promise<boolean>
   setAutoLaunch: (enable: boolean) => Promise<boolean>
   pickFilePath: (options?: FilePickerOptions) => Promise<string | null>
+  pickDirectoryPath: () => Promise<string | null>
   pathExists: (targetPath: string) => Promise<boolean>
+  writeAutoExportFile: (request: AutoExportFileRequest) => Promise<AutoExportFileResult>
+  revealExportedFile: (targetPath: string) => Promise<{ ok: boolean; error?: string }>
   saveRecordingArchive: (request: RecordingArchiveSaveRequest) => Promise<RecordingArchiveSaveResult>
   beginRecordingArchive: (request: RecordingArchiveBeginRequest) => Promise<RecordingArchiveSaveResult>
   appendRecordingArchive: (request: RecordingArchiveAppendRequest) => Promise<RecordingArchiveSaveResult>

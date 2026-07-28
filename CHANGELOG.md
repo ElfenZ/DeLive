@@ -13,6 +13,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.5.6] - 2026-07-28
+
+### Added / 新增
+- **Automatic corrected Markdown export** - the full automatic AI workflow can write the final corrected transcript to a user-selected folder after applying the safe title
+- **自动导出纠错稿 Markdown** - 完整自动 AI 后处理可在安全应用标题后，将最终纠错全文写入用户选择的目录
+- **Persistent export feedback** - sessions retain the actual exported path, support showing the file in its folder, and retry only failed export steps
+- **持久化导出反馈** - 会话会保留实际导出路径，可在文件夹中显示文件，并仅重试失败的导出步骤
+
+### Fixed / 修复
+- **Collision-safe export files** - automatic exports use exclusive creation and append numeric suffixes instead of overwriting files with the same name
+- **同名导出安全** - 自动导出使用独占创建，同名时追加数字序号，不覆盖已有文件
+
+---
+
 ## [2.5.5] - 2026-07-23
 
 ### Added / 新增

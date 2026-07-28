@@ -297,7 +297,7 @@ export interface TranscriptPostProcess extends TranscriptTextSourceMetadata {
 }
 
 export type TranscriptAutoPostProcessWorkflowStatus = 'queued' | 'running' | 'waiting-review' | 'error' | 'completed'
-export type TranscriptAutoPostProcessWorkflowStep = 'correction' | 'briefing' | 'title'
+export type TranscriptAutoPostProcessWorkflowStep = 'correction' | 'briefing' | 'title' | 'export'
 
 export interface TranscriptAutoPostProcessWorkflow {
   version: 1
@@ -308,6 +308,8 @@ export interface TranscriptAutoPostProcessWorkflow {
   startedAt: number
   updatedAt: number
   completedAt?: number
+  exportPath?: string
+  exportedAt?: number
   error?: string
 }
 
@@ -453,6 +455,8 @@ export interface AiPostProcessConfig {
   glossary?: AiGlossaryEntry[]
   autoCorrectionDetection?: boolean
   autoAiPostProcess?: boolean
+  autoExportCorrectedMarkdown?: boolean
+  autoExportDirectory?: string
   correctionStructuredOutput?: CorrectionStructuredOutputMode
   correctionAdvanced?: Partial<{
     chunkSize: number

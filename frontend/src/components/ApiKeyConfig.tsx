@@ -255,6 +255,14 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
       const normalizedAiConfig = aiPostProcessConfig.autoAiPostProcess
         ? { ...aiPostProcessConfig, autoCorrectionDetection: false }
         : aiPostProcessConfig
+      if (normalizedAiConfig.autoExportCorrectedMarkdown) {
+        if (!window.electronAPI?.writeAutoExportFile) {
+          throw new Error(language === 'zh' ? '自动导出仅在桌面应用中可用' : 'Automatic export is available only in the desktop app')
+        }
+        if (!normalizedAiConfig.autoExportDirectory?.trim()) {
+          throw new Error(language === 'zh' ? '请先选择纠错稿自动导出目录' : 'Choose a corrected Markdown export folder first')
+        }
+      }
       assertValidMeetingContext(meetingContextConfig, normalizedAiConfig.glossary, { includeDisabled: true })
       updateMeetingContextConfig(meetingContextConfig)
       await updateAiPostProcessConfig(normalizedAiConfig)

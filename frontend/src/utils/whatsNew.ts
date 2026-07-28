@@ -7,6 +7,26 @@ export interface WhatsNewEntry {
 
 const entries: WhatsNewEntry[] = [
   {
+    version: '2.5.6',
+    date: '2026-07-28',
+    features: [
+      {
+        zh: '完整自动 AI 后处理可在标题完成后，将纠错稿 Markdown 自动写入用户选择的目录',
+        en: 'The full automatic AI workflow can write corrected Markdown to a user-selected folder after the title step',
+      },
+      {
+        zh: '会话 AI 页持久显示实际导出路径，支持在文件夹中显示和仅重试失败的导出步骤',
+        en: 'The session AI page persists the actual export path, reveals the file, and retries only failed exports',
+      },
+    ],
+    fixes: [
+      {
+        zh: '同名自动导出文件会追加数字序号，不再覆盖已有文件',
+        en: 'Automatic exports append a numeric suffix on name collisions instead of overwriting existing files',
+      },
+    ],
+  },
+  {
     version: '2.5.5',
     date: '2026-07-23',
     features: [

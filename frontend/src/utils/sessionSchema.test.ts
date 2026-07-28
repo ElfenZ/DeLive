@@ -232,7 +232,7 @@ describe('sessionSchema', () => {
         updatedAt: 20,
       },
     })
-    expect(normalized.schemaVersion).toBe(6)
+    expect(normalized.schemaVersion).toBe(7)
     expect(normalized.autoPostProcessWorkflow).toEqual({
       version: 1,
       status: 'waiting-review',
@@ -242,12 +242,30 @@ describe('sessionSchema', () => {
       startedAt: 10,
       updatedAt: 20,
       completedAt: undefined,
+      exportPath: undefined,
+      exportedAt: undefined,
       error: undefined,
     })
     expect(normalizeTranscriptSession({
       id: 'old-session', title: 'Old', date: '2026-07-18', time: '10:00',
       schemaVersion: 4, createdAt: 1, updatedAt: 2, transcript: 'content',
     }).autoPostProcessWorkflow).toBeUndefined()
+  })
+
+  it('round-trips completed export workflow metadata', () => {
+    const normalized = normalizeTranscriptSession({
+      id: 'export-workflow', title: 'Export', date: '2026-07-28', time: '16:00',
+      schemaVersion: 6, createdAt: 1, updatedAt: 2, transcript: 'content',
+      autoPostProcessWorkflow: {
+        version: 1, status: 'completed', step: 'export', correctionMode: 'quick',
+        titleAtStart: 'Export', startedAt: 10, updatedAt: 20, completedAt: 30,
+        exportPath: 'D:\\Exports\\export.md', exportedAt: 29,
+      },
+    })
+    expect(normalized.schemaVersion).toBe(CURRENT_SESSION_SCHEMA_VERSION)
+    expect(normalized.autoPostProcessWorkflow).toEqual(expect.objectContaining({
+      status: 'completed', step: 'export', exportPath: 'D:\\Exports\\export.md', exportedAt: 29,
+    }))
   })
 
   it('drops malformed automatic workflow state', () => {

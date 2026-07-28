@@ -3,12 +3,14 @@ import fs from 'fs'
 import path from 'path'
 import { assertTrustedSender, isPathAllowed } from './ipcSecurity'
 import type {
+  AutoExportFileRequest,
   RecordingArchiveAppendRequest,
   RecordingArchiveBeginRequest,
   RecordingArchiveFinalizeRequest,
   RecordingArchiveSaveRequest,
   RecordingArchiveSaveResult,
 } from '../shared/electronApi'
+import { validateRevealExportPath, writeAutoExportFile } from './autoExportFile'
 
 interface RegisterAppIpcOptions {
   ipcMain: IpcMain
@@ -367,6 +369,34 @@ export function registerAppIpc(options: RegisterAppIpcOptions): void {
     }
 
     return result.filePaths[0]
+  })
+
+  options.ipcMain.handle('pick-directory-path', async (event) => {
+    assertTrustedSender(event, 'pick-directory-path')
+    const openDialogOptions: Electron.OpenDialogOptions = {
+      properties: ['openDirectory', 'createDirectory'],
+    }
+    const mainWindow = options.getMainWindow()
+    const result = mainWindow
+      ? await dialog.showOpenDialog(mainWindow, openDialogOptions)
+      : await dialog.showOpenDialog(openDialogOptions)
+    return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0]
+  })
+
+  options.ipcMain.handle('write-auto-export-file', async (event, request: AutoExportFileRequest) => {
+    assertTrustedSender(event, 'write-auto-export-file')
+    return writeAutoExportFile(request)
+  })
+
+  options.ipcMain.handle('reveal-exported-file', async (event, targetPath: string) => {
+    assertTrustedSender(event, 'reveal-exported-file')
+    try {
+      await validateRevealExportPath(targetPath)
+      shell.showItemInFolder(targetPath)
+      return { ok: true }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
   })
 
   options.ipcMain.handle('path-exists', (event, targetPath: string) => {

@@ -166,6 +166,8 @@ export function getDefaultSettings(): AppSettings {
       glossary: [],
       autoCorrectionDetection: false,
       autoAiPostProcess: false,
+      autoExportCorrectedMarkdown: false,
+      autoExportDirectory: '',
     },
     meetingContext: { ...DEFAULT_MEETING_CONTEXT },
     openApi: {

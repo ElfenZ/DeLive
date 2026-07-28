@@ -4,6 +4,7 @@ import {
   ChevronDown,
   Eye,
   EyeOff,
+  FolderOpen,
   Key,
   Loader2,
   Plus,
@@ -53,6 +54,12 @@ export function AiPostProcessPanel({
   const effectiveDefault = cfg.defaultModel?.trim() || cfg.model?.trim() || ''
   const selected = useMemo(() => cfg.selectedModels ?? [], [cfg.selectedModels])
   const glossary = useMemo(() => cfg.glossary ?? [], [cfg.glossary])
+  const supportsAutoExport = Boolean(window.electronAPI?.pickDirectoryPath && window.electronAPI?.writeAutoExportFile)
+
+  const handlePickAutoExportDirectory = useCallback(async () => {
+    const directory = await window.electronAPI?.pickDirectoryPath?.()
+    if (directory) updateAiPostProcessConfig({ autoExportDirectory: directory })
+  }, [updateAiPostProcessConfig])
 
   const filteredModels = useMemo(() => {
     const all = cfg.availableModels ?? []
@@ -586,6 +593,66 @@ export function AiPostProcessPanel({
             })}
             aria-label={isZh ? '自动 AI 后处理' : 'Automatic AI post-processing'}
           />
+        </div>
+
+        <div className="border-t border-border/70" />
+
+        <div className="space-y-3">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <label className="text-sm font-medium leading-none flex items-center gap-2">
+                <FolderOpen className="w-3.5 h-3.5 text-muted-foreground" />
+                {isZh ? '自动导出纠错稿 Markdown' : 'Auto-export Corrected Markdown'}
+              </label>
+              <p className="text-xs text-muted-foreground mt-2">
+                {isZh
+                  ? '完整自动后处理完成标题步骤后，将纠错后的全文写入指定目录。'
+                  : 'Write the corrected transcript to the selected folder after the full automatic workflow finishes its title step.'}
+              </p>
+            </div>
+            <Switch
+              checked={!!cfg.autoExportCorrectedMarkdown && supportsAutoExport}
+              disabled={!supportsAutoExport}
+              onChange={(val) => updateAiPostProcessConfig({ autoExportCorrectedMarkdown: val })}
+              aria-label={isZh ? '自动导出纠错稿 Markdown' : 'Auto-export corrected Markdown'}
+            />
+          </div>
+
+          {supportsAutoExport ? (
+            <div className="space-y-2 rounded-lg border border-border/70 bg-muted/20 p-3">
+              <div className="break-all rounded-md bg-background px-3 py-2 text-xs text-muted-foreground">
+                {cfg.autoExportDirectory?.trim() || (isZh ? '尚未选择导出目录' : 'No export folder selected')}
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => void handlePickAutoExportDirectory()}
+                  className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-input bg-background px-3 text-xs font-medium transition-colors hover:bg-accent"
+                >
+                  <FolderOpen className="w-3.5 h-3.5" />
+                  {isZh ? '选择文件夹' : 'Choose Folder'}
+                </button>
+                {cfg.autoExportDirectory?.trim() && (
+                  <button
+                    type="button"
+                    onClick={() => updateAiPostProcessConfig({ autoExportDirectory: '' })}
+                    className="inline-flex h-8 items-center justify-center rounded-md border border-input bg-background px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent"
+                  >
+                    {isZh ? '清除路径' : 'Clear Path'}
+                  </button>
+                )}
+              </div>
+              {cfg.autoExportCorrectedMarkdown && !cfg.autoExportDirectory?.trim() && (
+                <p className="text-xs text-destructive">
+                  {isZh ? '开启自动导出前必须选择目录。' : 'Choose a folder before enabling automatic export.'}
+                </p>
+              )}
+            </div>
+          ) : (
+            <p className="rounded-md border border-border/70 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+              {isZh ? '自动导出仅在 DeLive 桌面应用中可用。' : 'Automatic export is available only in the DeLive desktop app.'}
+            </p>
+          )}
         </div>
 
         <div className="border-t border-border/70" />
