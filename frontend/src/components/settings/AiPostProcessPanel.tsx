@@ -17,7 +17,13 @@ import {
 import { Switch } from '../ui'
 import type { Translations } from '../../i18n'
 import type { AiFeatureKey, AiGlossaryEntry, AiPostProcessConfig, MeetingContextConfig } from '../../types'
-import { fetchAvailableModels } from '../../services/aiPostProcess'
+import {
+  fetchAvailableModels,
+  invalidateAiEndpointModels,
+  reconcileAiEndpointModels,
+  resolveModelForFeature,
+} from '../../services/aiPostProcess'
+import { testCorrectionConnection } from '../../services/aiCorrection'
 import { generateId } from '../../utils/storage'
 
 interface AiPostProcessPanelProps {
@@ -49,6 +55,9 @@ export function AiPostProcessPanel({
   const [showApiKey, setShowApiKey] = useState(false)
   const [fetchStatus, setFetchStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle')
   const [fetchError, setFetchError] = useState('')
+  const [testStatus, setTestStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle')
+  const [testMessage, setTestMessage] = useState('')
+  const [testDetails, setTestDetails] = useState<{ endpoint: string; model: string; transport: 'json' | 'sse' }>()
   const [modelSearch, setModelSearch] = useState('')
 
   const effectiveDefault = cfg.defaultModel?.trim() || cfg.model?.trim() || ''
@@ -75,13 +84,49 @@ export function AiPostProcessPanel({
     setFetchError('')
     try {
       const models = await fetchAvailableModels(baseUrl, cfg.apiKey)
-      updateAiPostProcessConfig({ availableModels: models })
+      updateAiPostProcessConfig(reconcileAiEndpointModels(cfg, models))
       setFetchStatus('success')
     } catch (err) {
       setFetchError(err instanceof Error ? err.message : String(err))
       setFetchStatus('error')
     }
-  }, [cfg.baseUrl, cfg.apiKey, updateAiPostProcessConfig])
+  }, [cfg, updateAiPostProcessConfig])
+
+  const correctionTestIdentity = JSON.stringify({
+    baseUrl: cfg.baseUrl?.trim() || '',
+    apiKey: cfg.apiKey || '',
+    model: resolveModelForFeature(cfg, 'correction'),
+    structuredOutput: cfg.correctionStructuredOutput || 'prompt-json',
+    streaming: cfg.enableStreaming !== false,
+  })
+  useEffect(() => {
+    setTestStatus('idle')
+    setTestMessage('')
+    setTestDetails(undefined)
+  }, [correctionTestIdentity])
+
+  const handleTestCorrection = useCallback(async () => {
+    setTestStatus('loading')
+    setTestMessage('')
+    try {
+      const details = await testCorrectionConnection(cfg, meetingContextConfig)
+      setTestDetails(details)
+      setTestStatus('success')
+    } catch (error) {
+      setTestMessage(error instanceof Error ? error.message : String(error))
+      setTestStatus('error')
+    }
+  }, [cfg, meetingContextConfig])
+
+  const handleBaseUrlChange = useCallback((baseUrl: string) => {
+    if (baseUrl === (cfg.baseUrl || '')) return
+    updateAiPostProcessConfig({
+      baseUrl,
+      ...invalidateAiEndpointModels(),
+    })
+    setFetchStatus('idle')
+    setFetchError('')
+  }, [cfg.baseUrl, updateAiPostProcessConfig])
 
   const toggleModelSelected = useCallback(
     (modelId: string) => {
@@ -183,7 +228,7 @@ export function AiPostProcessPanel({
           <input
             type="text"
             value={cfg.baseUrl || ''}
-            onChange={(e) => updateAiPostProcessConfig({ baseUrl: e.target.value })}
+            onChange={(e) => handleBaseUrlChange(e.target.value)}
             placeholder="http://127.0.0.1:11434/v1"
             className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
           />
@@ -233,12 +278,43 @@ export function AiPostProcessPanel({
           ) : (
             <RefreshCw className="w-4 h-4" />
           )}
-          {isZh ? '获取模型列表' : 'Fetch Model List'}
+          {fetchStatus === 'loading'
+            ? (isZh ? '正在获取模型列表…' : 'Fetching model list…')
+            : fetchStatus === 'success'
+              ? (isZh ? '模型列表获取成功' : 'Model list fetched')
+              : fetchStatus === 'error'
+                ? (isZh ? '模型列表获取失败' : 'Model list failed')
+                : (isZh ? '获取模型列表' : 'Fetch Model List')}
         </button>
 
         {fetchStatus === 'error' && fetchError && (
           <p className="text-xs text-destructive">{fetchError}</p>
         )}
+
+        <button
+          type="button"
+          onClick={() => void handleTestCorrection()}
+          disabled={!cfg.baseUrl?.trim() || !resolveModelForFeature(cfg, 'correction') || testStatus === 'loading'}
+          className={`inline-flex h-9 w-full items-center justify-center gap-2 rounded-md border px-4 text-sm font-medium transition-colors ${testStatus === 'success'
+            ? 'border-success/50 bg-success/10 text-success'
+            : testStatus === 'error'
+              ? 'border-destructive/50 bg-destructive/10 text-destructive'
+              : 'border-input bg-background hover:bg-accent'}`}
+        >
+          {testStatus === 'loading' ? <Loader2 className="h-4 w-4 animate-spin" /> : testStatus === 'success' ? <Check className="h-4 w-4" /> : <Sparkles className="h-4 w-4" />}
+          {testStatus === 'loading'
+            ? (isZh ? '正在验证纠错连接…' : 'Verifying correction connection…')
+            : (isZh ? '验证纠错连接' : 'Verify Correction Connection')}
+        </button>
+
+        {testStatus === 'success' && testDetails && (
+          <div className="rounded-md border border-success/40 bg-success/5 p-3 text-xs text-success">
+            <p className="font-medium">{isZh ? '纠错连接验证成功' : 'Correction connection verified'}</p>
+            <p className="mt-1 break-all text-muted-foreground">{testDetails.endpoint} · {testDetails.model} · {testDetails.transport.toUpperCase()}</p>
+            <p className="mt-1">{isZh ? '当前测试使用的是未保存草稿；点击底部“保存”后，才会成为全局纠错配置。' : 'This test used the unsaved draft. Save the settings below before it becomes the global correction configuration.'}</p>
+          </div>
+        )}
+        {testStatus === 'error' && testMessage && <p className="text-xs text-destructive">{testMessage}</p>}
       </section>
 
       {/* Model list */}

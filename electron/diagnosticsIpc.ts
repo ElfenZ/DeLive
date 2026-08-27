@@ -30,6 +30,12 @@ interface DiagnosticData {
     userDataPath: string
     localStorageKeySummary: string[]
   }
+  runtimeDiagnostics: Array<{
+    timestamp: string
+    scope: string
+    event: string
+    details?: Record<string, unknown>
+  }>
   logs: string[]
 }
 
@@ -83,7 +89,11 @@ function redactSecrets(obj: unknown): unknown {
   return result
 }
 
-function collectDiagnostics(rendererPayload: { settings: Record<string, unknown>; localStorageKeys: string[] }): DiagnosticData {
+function collectDiagnostics(rendererPayload: {
+  settings: Record<string, unknown>
+  localStorageKeys: string[]
+  runtimeDiagnostics?: DiagnosticData['runtimeDiagnostics']
+}): DiagnosticData {
   const cpus = os.cpus()
   return {
     generatedAt: new Date().toISOString(),
@@ -111,6 +121,7 @@ function collectDiagnostics(rendererPayload: { settings: Record<string, unknown>
       userDataPath: app.getPath('userData'),
       localStorageKeySummary: rendererPayload.localStorageKeys,
     },
+    runtimeDiagnostics: rendererPayload.runtimeDiagnostics ?? [],
     logs: [...logRingBuffer],
   }
 }
@@ -123,7 +134,11 @@ interface RegisterDiagnosticsIpcOptions {
 export function registerDiagnosticsIpc(options: RegisterDiagnosticsIpcOptions): void {
   options.ipcMain.handle('export-diagnostics', async (
     event,
-    rendererPayload: { settings: Record<string, unknown>; localStorageKeys: string[] }
+    rendererPayload: {
+      settings: Record<string, unknown>
+      localStorageKeys: string[]
+      runtimeDiagnostics?: DiagnosticData['runtimeDiagnostics']
+    }
   ) => {
     assertTrustedSender(event, 'export-diagnostics')
     const mainWindow = options.getMainWindow()

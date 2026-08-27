@@ -13,6 +13,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.5.10] - 2026-08-27
+
+### Fixed / 修复
+- **Realtime transcription pipeline recovery** - Provider reconnects now recreate the capture pipeline so new Soniox WebSocket sessions receive a valid WebM initialization header instead of remaining connected but unable to decode audio
+- **实时转录管线恢复** - Provider 重连时会重新创建采集管线，确保新的 Soniox WebSocket 收到有效 WebM 初始化头，不再出现连接成功但无法解码后续音频的问题
+- **Realtime health watchdog** - stalled capture chunks and audible-input Provider result stalls trigger bounded automatic recovery while the independent source-audio archive continues recording
+- **实时链路看门狗** - 音频块停滞或有声音但识别结果长期不更新时会触发受控自动恢复，独立源录音归档继续完整保存
+- **AI correction import and streaming safety** - backup imports invalidate mismatched credential identities, non-JSON SSE heartbeat frames remain compatible, and correction responses are bounded and parsed incrementally
+- **AI 纠错导入与流式安全** - 备份导入会使不匹配的凭据身份失效，兼容非 JSON SSE 心跳帧，并对纠错响应设置上限和增量解析
+- **Runtime diagnostics** - exported diagnostics now include capture, Provider audio-send, result-progress, and reconnect lifecycle events for long-running transcription incidents
+- **运行时诊断** - 导出诊断现包含采集、Provider 音频发送、结果进度与重连生命周期事件，便于定位长时间转录中断
+
+---
+
+## [2.5.9] - 2026-08-27
+
+### Fixed / 修复
+- **AI correction network recovery** - first-response timeout retries now use an isolated Electron network session, bypassing a stalled renderer connection pool without interrupting realtime transcription or unrelated network traffic
+- **AI 纠错网络恢复** - 首次响应超时后会通过隔离的 Electron 网络会话重试，绕过卡死的 Renderer 连接池，同时不会中断实时转录或其他网络请求
+- **Correction waiting diagnostics** - requests now distinguish dispatch, server waiting, reasoning, content, and retry states; safe logs include only endpoint host, model, shard, and attempt
+- **纠错等待诊断** - 请求现可区分发起、等待服务端、模型推理、正文接收和重试状态；安全日志仅包含端点主机、模型、分片与尝试次数
+
+---
+
+## [2.5.8] - 2026-08-27
+
+### Fixed / 修复
+- **AI correction credential binding** - correction runs now keep endpoint, model, and API key bound to one execution lease; retries rebuild the whole draft when saved configuration changes instead of mixing old endpoint settings with new credentials
+- **AI 纠错凭据绑定** - 纠错运行会将端点、模型与 API Key 锁定在同一执行租约中；已保存配置变化时，重试会完整重建任务，不再混用旧端点配置与新凭据
+- **Reasoning-model correction transport** - correction now supports JSON and OpenAI-compatible SSE responses, treats reasoning activity as keep-alive progress, and reports 200-level authentication envelopes immediately
+- **推理模型纠错传输** - 纠错现已支持 JSON 与 OpenAI-compatible SSE 响应，将推理活动作为保活进度，并立即识别 HTTP 200 内的认证错误
+- **Actionable correction progress** - connection, reasoning, content, retry, authentication, and timeout states now provide shard and attempt details instead of an indefinite `0/N` spinner
+- **可操作的纠错进度** - 连接、推理、正文、重试、认证和超时状态现在会显示分片与尝试详情，不再长期停留在 `0/N` 转圈
+
+---
+
+## [2.5.7] - 2026-08-26
+
+### Fixed / 修复
+- **AI endpoint model consistency** - changing the OpenAI-compatible Base URL now invalidates stale model selections and feature assignments, while refreshed model lists reconcile every request to the active URL, key, and model combination
+- **AI 端点模型一致性** - 更换 OpenAI-compatible Base URL 后会清除旧模型选择与功能分配，刷新模型列表后确保请求使用同一组有效 URL、Key 和模型
+- **Long-running realtime transcription recovery** - Soniox and Volcengine unexpected WebSocket closures are now detected and automatically reconnected instead of silently dropping the remainder of a recording
+- **长时间实时转录恢复** - Soniox 与火山引擎的 WebSocket 异常关闭会被检测并自动重连，不再静默丢失录音后半段转录
+
+---
+
 ## [2.5.6] - 2026-07-28
 
 ### Added / 新增

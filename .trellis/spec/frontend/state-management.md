@@ -134,6 +134,71 @@ Use Zustand plus Session persistence when work spans components, navigation, or 
 
 ---
 
+## Scenario: Single Active AI Endpoint Model State
+
+### 1. Scope / Trigger
+
+Use this contract when changing the AI post-process Base URL, API key, model discovery, model selection, feature assignment, or OpenAI-compatible request model resolution.
+
+### 2. Signatures
+
+```ts
+invalidateAiEndpointModels(): Partial<AiPostProcessConfig>
+reconcileAiEndpointModels(
+  config: AiPostProcessConfig,
+  availableModels: string[],
+): Partial<AiPostProcessConfig>
+resolveModelForFeature(config: AiPostProcessConfig, feature: AiFeatureKey): string
+```
+
+### 3. Contracts
+
+- The app has one active OpenAI-compatible endpoint; normalized `baseUrl` is the boundary for endpoint-derived model state.
+- Changing Base URL clears `availableModels`, `selectedModels`, `defaultModel`, legacy `model`, and `modelAssignment`, but preserves prompts, glossary, automation, export, and correction settings.
+- A successful `/models` refresh reconciles every derived model field through one shared helper. Components must not implement private cleanup rules.
+- When a non-empty `availableModels` list exists, request-time model resolution accepts only candidates in that list. Empty lists preserve legacy/manual model compatibility.
+- Saved URL, credential, and resolved model must come from the same current `AiPostProcessConfig`; never retain an old endpoint model ID with new endpoint credentials.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+|-----------|-----------------|
+| Base URL changes | Immediately invalidate all endpoint-derived model fields |
+| Refreshed list retains selected/default model | Preserve the valid values |
+| No previous selection exists in refreshed list | Select the first returned model as safe default |
+| Feature assignment is absent from selected refreshed models | Drop the assignment and fall back to a valid default |
+| Known model list contains no valid candidate | Resolve an empty model and fail configuration before request |
+
+### 5. Good / Base / Bad Cases
+
+- Good: URL changes, old assignments disappear, refresh selects a new default, and all features resolve against the new list.
+- Base: an old/manual config has no fetched list and continues resolving its legacy model.
+- Bad: refresh updates only `availableModels` while feature dropdowns and persisted assignments still reference the old endpoint.
+
+### 6. Tests Required
+
+- Assert endpoint invalidation clears every model-derived field and no unrelated field.
+- Assert reconciliation preserves same-name models, drops stale assignments, and creates a safe default.
+- Assert request-time resolution rejects stale candidates when a current non-empty model list is known.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```ts
+updateAiPostProcessConfig({ availableModels: models })
+```
+
+#### Correct
+
+```ts
+updateAiPostProcessConfig(reconcileAiEndpointModels(config, models))
+```
+
+The shared reconciliation boundary prevents UI, persistence, and request behavior from diverging.
+
+---
+
 ## Scenario: Pausable Live Recording
 
 ### 1. Scope / Trigger
@@ -233,6 +298,80 @@ The orchestration layer owns ordering; resource services own their local generat
 
 ---
 
+## Scenario: Live Provider Unexpected Disconnect Recovery
+
+### 1. Scope / Trigger
+
+Use this contract when changing realtime Provider WebSocket close handling, `ProviderSessionManager` error propagation, or recording-time reconnect behavior.
+
+### 2. Signatures
+
+```ts
+ProviderSessionManager.reconnect(
+  vendorId: ASRVendor,
+  connectConfig: ProviderConfig,
+  callbacks: ProviderSessionCallbacks,
+  options: { epochOffsetMs?: number },
+): Promise<ASRProvider>
+```
+
+### 3. Contracts
+
+- Providers distinguish locally initiated close/drain from unexpected remote/network close.
+- An unexpected close after establishment emits one diagnostic `CONNECTION_CLOSED` error; an expected lifecycle close emits no recording-level error.
+- The recording orchestration layer, not the Provider, decides whether to reconnect or stop.
+- Recording-time recovery is single-flight and reuses the locked Provider setup snapshot; it never creates a new Session or rereads mutable global Provider settings.
+- Reconnect uses `getConnectionEpochOffset()` so connection-relative token timestamps remain session-relative.
+- Realtime recovery pauses and recreates the Provider capture pipeline around the new connection. This is mandatory for WebM Providers because a new WebSocket must receive a fresh container initialization header; forwarding chunks from the old `MediaRecorder` generation creates a connected-but-undecodable session.
+- Source-audio archive remains active during capture-pipeline and Provider recovery. Audio in the recovery window may be absent from live ASR, but must remain in the recording archive.
+- A recording-time watchdog treats missing capture chunks as a stalled capture pipeline. It may also recover a Provider when audio is still being sent, the source is recently audible, prior results existed, and result progress has stopped beyond the bounded threshold. Natural silence must not trigger recovery.
+- If reconnect fails, stop safely and surface the failure. Never continue recording indefinitely after live ASR has become unavailable.
+- If recording leaves `recording` while reconnect is in flight, disconnect the newly established Provider instead of leaking it past stop/pause.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+|-----------|-----------------|
+| User pause/stop closes Provider | Suppress close error; continue normal drain lifecycle |
+| Established socket closes unexpectedly | Emit one error and begin single-flight reconnect |
+| Duplicate error arrives during reconnect | Ignore duplicate recovery request |
+| Reconnect succeeds while still recording | Continue the same Session and warn that live recognition resumed |
+| Reconnect succeeds after recording started stopping | Disconnect the new Provider immediately |
+| Reconnect fails | Report error, stop recording, preserve transcript and archive to the boundary |
+
+### 5. Good / Base / Bad Cases
+
+- Good: a one-hour meeting loses its socket briefly, reconnects with a new epoch, and later tokens continue in the same Session.
+- Base: pause drains and closes the socket without triggering recovery.
+- Bad: Provider sets `idle` on remote close while `sendAudio()` silently discards the next ninety minutes.
+
+### 6. Tests Required
+
+- Provider tests assert Soniox and Volc unexpected closes emit once and expected disconnects emit zero errors.
+- Provider-session tests retain epoch fencing and timestamp offset behavior across reconnect.
+- Recording orchestration tests should assert single-flight recovery, successful continuation, failure-to-stop fallback, and stop/reconnect race cleanup when hook-level test infrastructure is extended.
+- Health detection tests must cover capture-chunk stalls, audible Provider-result stalls, and natural silence.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```ts
+ws.onclose = () => this.setState('idle')
+if (!this.ws) return
+```
+
+#### Correct
+
+```ts
+if (!closeExpected) emitError(createError('CONNECTION_CLOSED', reason))
+await providerSession.reconnect(vendorId, lockedConfig, callbacks, { epochOffsetMs })
+```
+
+Unexpected transport failure must become an explicit orchestration event rather than silent audio loss.
+
+---
+
 ## Scenario: Task-Scoped Recognition Context
 
 ### 1. Scope / Trigger
@@ -311,4 +450,76 @@ const correction = createCorrectionConfigSnapshot(useSettingsStore.getState().se
 const meetingContext = resolveMeetingContextSnapshot(globalContext, glossary, oneShotOverride)
 const setup = providerSession.resolveSetup(vendorId, settingsAtStart, meetingContext)
 const correction = createCorrectionConfigSnapshot(currentAiCredentials, session.meetingContext)
+```
+
+---
+
+## Scenario: Credential-Bound Correction Drafts and Streaming Transport
+
+### 1. Scope / Trigger
+
+Use this contract when changing saved AI endpoint credentials, correction retry/resume behavior, OpenAI-compatible streaming, request timeout policy, or correction progress UI.
+
+### 2. Signatures
+
+```ts
+createCorrectionConfigSnapshot(settings, meetingContext?): CorrectionConfigSnapshot
+isCorrectionConfigSnapshotCurrent(snapshot, settings): boolean
+requestCorrectionShard({ snapshot, apiKey, signal, timeouts, onProgress }): Promise<CorrectionShardResponse>
+```
+
+`CorrectionConfigSnapshot` persists normalized `baseUrl`, resolved correction `model`, non-secret `credentialVersion`, `transport`, structured-output mode, and a non-credential `configIdentity`. It never persists the API key or a key-derived fingerprint.
+
+### 3. Contracts
+
+- Increment `credentialVersion` only when the normalized Base URL or actual API key changes. Prompt, glossary, export, model, and streaming changes do not increment it.
+- Include model, credential version, transport, and structured-output mode in the Draft identity.
+- A matching Retry preserves completed shards and retries failed shards only. A mismatching or legacy Draft receives a new `runId`, current snapshot, new shards, and empty candidate/rejection sets.
+- Launch recovery must not automatically send a legacy or mismatching Draft to the current endpoint.
+- Correction accepts JSON and SSE regardless of the requested transport. Reasoning activity resets idle timeout but is never appended to Patch JSON.
+- HTTP 200 error envelopes are errors. `unauthorized_error`, invalid token, 401, and 403 are non-retryable `auth` failures.
+- Timeout phases are first byte, response idle, and absolute limit. Transport progress is checkpointed through existing shard fields and fenced by `runId`, `attemptId`, and `draftRevision`.
+- On the first shard's first-byte timeout, the single retry may use the main-window-only `ai-correction-recovery-fetch` IPC. The main process must use a dedicated non-default Electron Session, serialize recovery requests, enforce queue/body/response limits, preserve idle and absolute timeouts, and support cancellation. Never call `defaultSession.closeAllConnections()` because it can terminate realtime transcription WebSockets.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+|-----------|-----------------|
+| URL or key changes | Increment credential version; old Draft becomes mismatched |
+| Model, streaming, or structured output changes | Credential version unchanged; Draft identity changes |
+| Legacy Draft lacks identity fields | Preserve during normalization; block automatic resume |
+| SSE reasoning continues | Keep request alive; show thinking; do not alter Patch content |
+| HTTP 200 unauthorized envelope | Stop all workers as `blocked-auth`; do not retry |
+| No response activity | Persist timeout kind/duration/attempt and stop spinner |
+| Renderer connection pool stalls before response headers | Retry once through the isolated recovery Session without touching default Session connections |
+
+### 5. Good / Base / Bad Cases
+
+- Good: endpoint B is saved after endpoint A failed; Retry creates a new run and sends every shard only to B.
+- Base: unchanged saved configuration retries only the failed shard and preserves completed checkpoints.
+- Bad: old Draft URL/model is combined with the current key, or reasoning text is concatenated into Patch JSON.
+
+### 6. Tests Required
+
+- Credential version normalization and change rules; snapshot contains no key or key-derived data.
+- Matching partial Retry versus mismatching full rebuild with a new `runId`.
+- Legacy schema round-trip and launch recovery block.
+- JSON completion, SSE content, reasoning plus content, `[DONE]`, malformed SSE, and HTTP 200 error envelopes.
+- Auth worker cancellation, progress checkpointing, timeout phases, and external abort.
+- Isolated recovery dispatch, cancellation, idle-timeout classification, bounded request/response sizes, and no use of the default Session connection reset.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```ts
+requestCorrectionShard({ snapshot: oldDraft.config, apiKey: currentSettings.apiKey })
+```
+
+#### Correct
+
+```ts
+if (!isCorrectionConfigSnapshotCurrent(oldDraft.config, currentSettings)) {
+  rebuildDraftWithNewRunId(createCorrectionConfigSnapshot(currentSettings))
+}
 ```

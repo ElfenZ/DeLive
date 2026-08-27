@@ -12,6 +12,7 @@ const repository = vi.hoisted(() => ({
 }))
 const correction = vi.hoisted(() => ({
   createCorrectionConfigSnapshot: vi.fn(),
+  isCorrectionConfigSnapshotCurrent: vi.fn(),
   requestCorrectionShard: vi.fn(),
   CorrectionRequestError: class extends Error {},
 }))
@@ -35,6 +36,7 @@ function configSnapshot(overrides: Partial<CorrectionConfigSnapshot> = {}): Corr
   return {
     model: 'model', baseUrl: 'http://localhost/v1', promptLanguage: 'zh', promptVersion: 'patch-v1', schemaVersion: '1',
     structuredOutput: 'prompt-json', temperature: 0.1, glossary: [], background: '', correctionGuidance: '', chunkSize: 4000, contextSize: 500, concurrency: 1,
+    credentialVersion: 1, identityVersion: 1, configIdentity: 'current', transport: 'json',
     safetyLimits: { ...safetyLimits, ...overrides.safetyLimits }, credentialRef: 'ai-post-process', ...overrides,
   }
 }
@@ -77,6 +79,7 @@ describe('sessionStore patch correction runner', () => {
     vi.resetModules()
     vi.clearAllMocks()
     correction.createCorrectionConfigSnapshot.mockReturnValue(configSnapshot())
+    correction.isCorrectionConfigSnapshotCurrent.mockImplementation((snapshot: CorrectionConfigSnapshot) => snapshot.configIdentity === 'current')
     correction.requestCorrectionShard.mockResolvedValue({ patches: [{ op: 'replace', oldText: '侍应', replacement: '适应', before: '需要', after: '新的', category: 'homophone', reason: '同音' }] })
     postProcess.generateSessionBriefing.mockResolvedValue({
       postProcess: { status: 'success', summary: '摘要', titleSuggestion: 'AI 标题', model: 'model' },
@@ -200,6 +203,38 @@ describe('sessionStore patch correction runner', () => {
     await expect(running).resolves.toBe(source.transcript)
   })
 
+  it('locks the API key for the full correction lease when settings change mid-run', async () => {
+    correction.createCorrectionConfigSnapshot.mockReturnValue(configSnapshot({ chunkSize: 4, contextSize: 0, concurrency: 1 }))
+    let releaseFirst!: () => void
+    correction.requestCorrectionShard
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        releaseFirst = () => resolve({ patches: [] })
+      }))
+      .mockResolvedValue({ patches: [] })
+    const { useSessionStore } = await import('./sessionStore')
+    const { useSettingsStore } = await import('./settingsStore')
+    useSettingsStore.setState({
+      settings: {
+        ...useSettingsStore.getState().settings,
+        aiPostProcess: { ...useSettingsStore.getState().settings.aiPostProcess, apiKey: 'old-key' },
+      },
+    })
+    const source = session({ transcript: 'abcdefgh' })
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+    const running = useSessionStore.getState().detectSessionCorrectionIssues(source.id)
+    await vi.waitFor(() => expect(correction.requestCorrectionShard).toHaveBeenCalledTimes(1))
+    useSettingsStore.setState({
+      settings: {
+        ...useSettingsStore.getState().settings,
+        aiPostProcess: { ...useSettingsStore.getState().settings.aiPostProcess, apiKey: 'new-key' },
+      },
+    })
+    releaseFirst()
+    await running
+
+    expect(correction.requestCorrectionShard.mock.calls.map(([request]) => request.apiKey)).toEqual(['old-key', 'old-key'])
+  })
+
   it('auto-resumes only queued drafts loaded at launch', async () => {
     vi.stubGlobal('window', { electronAPI: undefined })
     vi.stubGlobal('localStorage', { getItem: () => null, setItem: () => undefined, removeItem: () => undefined })
@@ -239,6 +274,59 @@ describe('sessionStore patch correction runner', () => {
     release()
     await running
     expect(useSessionStore.getState().sessions[0].correction?.draft).toMatchObject({ status: 'paused', proposedPatches: [] })
+  })
+
+  it('retries only failed shards when the saved correction configuration still matches', async () => {
+    correction.createCorrectionConfigSnapshot.mockReturnValue(configSnapshot({ chunkSize: 4, contextSize: 0, concurrency: 1 }))
+    correction.requestCorrectionShard
+      .mockResolvedValueOnce({ patches: [] })
+      .mockRejectedValueOnce(new Error('temporary failure'))
+      .mockResolvedValue({ patches: [] })
+    const { useSessionStore } = await import('./sessionStore')
+    const source = session({ transcript: 'abcdefgh' })
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+    await expect(useSessionStore.getState().detectSessionCorrectionIssues(source.id)).rejects.toThrow('temporary failure')
+    const failedRunId = useSessionStore.getState().sessions[0].correction!.draft!.runId
+
+    await useSessionStore.getState().retrySessionCorrection(source.id)
+
+    expect(correction.requestCorrectionShard).toHaveBeenCalledTimes(3)
+    expect(useSessionStore.getState().sessions[0].correction?.draft).toMatchObject({
+      runId: failedRunId,
+      status: 'ready-for-review',
+    })
+  })
+
+  it('rebuilds every shard with a new run id when the saved correction configuration changed', async () => {
+    correction.createCorrectionConfigSnapshot.mockReturnValue(configSnapshot({ chunkSize: 4, contextSize: 0, concurrency: 1 }))
+    correction.requestCorrectionShard
+      .mockResolvedValueOnce({ patches: [] })
+      .mockRejectedValueOnce(new Error('old endpoint failed'))
+      .mockResolvedValue({ patches: [] })
+    const { useSessionStore } = await import('./sessionStore')
+    const source = session({ transcript: 'abcdefgh' })
+    useSessionStore.setState({ sessions: [source], correctionInFlight: {} })
+    await expect(useSessionStore.getState().detectSessionCorrectionIssues(source.id)).rejects.toThrow('old endpoint failed')
+    const oldRunId = useSessionStore.getState().sessions[0].correction!.draft!.runId
+    correction.isCorrectionConfigSnapshotCurrent.mockReturnValue(false)
+    correction.createCorrectionConfigSnapshot.mockReturnValue(configSnapshot({
+      baseUrl: 'https://new.example.com/v1',
+      model: 'new-model',
+      configIdentity: 'new-current',
+      chunkSize: 4,
+      contextSize: 0,
+      concurrency: 1,
+    }))
+
+    await useSessionStore.getState().retrySessionCorrection(source.id)
+
+    const rebuilt = useSessionStore.getState().sessions[0].correction!.draft!
+    expect(correction.requestCorrectionShard).toHaveBeenCalledTimes(4)
+    expect(rebuilt.runId).not.toBe(oldRunId)
+    expect(rebuilt.config).toMatchObject({ baseUrl: 'https://new.example.com/v1', model: 'new-model' })
+    expect(rebuilt.proposedPatches).toEqual([])
+    expect(rebuilt.rejectedPatches).toEqual([])
+    expect(rebuilt.status).toBe('ready-for-review')
   })
 
   it('serializes concurrent published patch toggles against the latest revision', async () => {

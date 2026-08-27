@@ -34,6 +34,7 @@ import {
 import { testProviderConfig } from '../utils/providerConfigTest'
 import { getDefaultSettings } from '../utils/storageShared'
 import { assertValidMeetingContext, resolveMeetingContextSnapshot } from '../utils/meetingContext'
+import { getRuntimeDiagnostics } from '../utils/runtimeDiagnostics'
 
 type SettingsGroup = 'provider' | 'capture' | 'appearance' | 'caption' | 'aiPostProcess' | 'openApi' | 'cloudBackup' | 'dataManagement' | 'about'
 
@@ -293,7 +294,11 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
       const key = localStorage.key(i)
       if (key) localStorageKeys.push(key)
     }
-    const result = await window.electronAPI.exportDiagnostics({ settings: settingsData, localStorageKeys })
+    const result = await window.electronAPI.exportDiagnostics({
+      settings: settingsData,
+      localStorageKeys,
+      runtimeDiagnostics: getRuntimeDiagnostics(),
+    })
     if (result.success) {
       setImportMessage({ type: 'success', text: t.settings.diagnosticsExported })
       setTimeout(() => setImportMessage(null), 3000)

@@ -13,9 +13,29 @@ import { normalizeTranscriptSessions } from './sessionSchema'
 import { getDefaultSettings } from './storageShared'
 import { generateId } from './storageUtils'
 import { normalizeGlossaryEntries, normalizeMeetingContextConfig } from './meetingContext'
+import { nextOpenAiCredentialVersion } from '../services/openAiCompatible'
 
 export const CURRENT_BACKUP_VERSION = '4.0'
 export const CURRENT_BACKUP_SCHEMA_VERSION = 4
+
+export function mergeImportedAiPostProcessConfig(
+  current: AiPostProcessConfig | undefined,
+  incoming: AiPostProcessConfig | undefined,
+): AiPostProcessConfig {
+  const mergedApiKey = current?.apiKey || incoming?.apiKey
+  return {
+    ...(incoming || {}),
+    apiKey: mergedApiKey,
+    credentialVersion: nextOpenAiCredentialVersion(
+      {
+        baseUrl: incoming?.baseUrl,
+        apiKey: incoming?.apiKey,
+        credentialVersion: incoming?.credentialVersion,
+      },
+      { baseUrl: incoming?.baseUrl, apiKey: mergedApiKey },
+    ),
+  }
+}
 
 function mergeProviderApiKeys(
   current?: Record<string, ProviderConfigData>,
@@ -229,6 +249,7 @@ function normalizeAiPostProcessConfig(value: unknown): AiPostProcessConfig | und
     baseUrl: typeof value.baseUrl === 'string' ? value.baseUrl : undefined,
     model: typeof value.model === 'string' ? value.model : undefined,
     apiKey: typeof value.apiKey === 'string' ? value.apiKey : undefined,
+    credentialVersion: positiveInteger(value.credentialVersion),
     promptLanguage,
     availableModels: Array.isArray(value.availableModels) ? normalizeStringArray(value.availableModels) : undefined,
     selectedModels: Array.isArray(value.selectedModels) ? normalizeStringArray(value.selectedModels) : undefined,
@@ -419,10 +440,10 @@ export async function importDataOverwrite(
     ...normalized.settings,
     apiKey: currentSettings.apiKey || normalized.settings.apiKey,
     providerConfigs: mergedProviderConfigs,
-    aiPostProcess: {
-      ...(normalized.settings.aiPostProcess || {}),
-      apiKey: currentSettings.aiPostProcess?.apiKey || normalized.settings.aiPostProcess?.apiKey,
-    },
+    aiPostProcess: mergeImportedAiPostProcessConfig(
+      currentSettings.aiPostProcess,
+      normalized.settings.aiPostProcess,
+    ),
     openApi: {
       ...(normalized.settings.openApi || {}),
       token: currentSettings.openApi?.token || normalized.settings.openApi?.token,

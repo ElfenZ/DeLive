@@ -215,6 +215,9 @@ export class SonioxProvider extends BaseASRProvider {
   private ws: WebSocket | null = null
   private finalTokens: TranscriptToken[] = []
   private resolveDrain: (() => void) | null = null
+  private closeExpected = false
+  private transportErrorEmitted = false
+  private hasConnected = false
 
   async connect(config: ProviderConfig): Promise<void> {
     const effectiveConfig = parseSonioxConfig(config).value
@@ -226,6 +229,9 @@ export class SonioxProvider extends BaseASRProvider {
     this.setState('connecting')
     this.finalTokens = []
     this.resolveDrain = null
+    this.closeExpected = false
+    this.transportErrorEmitted = false
+    this.hasConnected = false
 
     return new Promise((resolve, reject) => {
       try {
@@ -242,6 +248,7 @@ export class SonioxProvider extends BaseASRProvider {
           this.ws!.send(JSON.stringify(sonioxConfig))
           
           this.setState('connected')
+          this.hasConnected = true
           resolve()
         }
 
@@ -251,13 +258,22 @@ export class SonioxProvider extends BaseASRProvider {
 
         this.ws.onerror = (error) => {
           console.error('[SonioxProvider] WebSocket 错误:', error)
+          this.transportErrorEmitted = true
           this.emitError(this.createError('WEBSOCKET_ERROR', 'WebSocket 连接错误'))
           reject(error)
         }
 
         this.ws.onclose = (event) => {
           console.log('[SonioxProvider] WebSocket 关闭:', event.code, event.reason)
+          this.ws = null
           this.setState('idle')
+          if (this.hasConnected && !this.closeExpected && !this.transportErrorEmitted) {
+            this.transportErrorEmitted = true
+            this.emitError(this.createError(
+              'CONNECTION_CLOSED',
+              event.reason || `WebSocket 连接意外关闭 (${event.code})`,
+            ))
+          }
         }
       } catch (error) {
         console.error('[SonioxProvider] 连接失败:', error)
@@ -269,6 +285,7 @@ export class SonioxProvider extends BaseASRProvider {
 
   async disconnect(): Promise<void> {
     console.log('[SonioxProvider] 断开连接...')
+    this.closeExpected = true
     
     if (this.ws) {
       const ws = this.ws
@@ -340,6 +357,7 @@ export class SonioxProvider extends BaseASRProvider {
         this.emitFinished()
         this.resolveDrain?.()
         this.resolveDrain = null
+        this.closeExpected = true
         this.setState('idle')
       }
     } catch (error) {

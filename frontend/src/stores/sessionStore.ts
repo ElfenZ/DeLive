@@ -28,6 +28,7 @@ import {
 import {
   CorrectionRequestError,
   createCorrectionConfigSnapshot,
+  isCorrectionConfigSnapshotCurrent,
   requestCorrectionShard,
 } from '../services/aiCorrection'
 import {
@@ -93,6 +94,7 @@ interface CorrectionExecutionLease {
   runId: string
   generation: number
   controller: AbortController
+  apiKey?: string
 }
 
 let correctionExecutionGeneration = 0
@@ -476,10 +478,21 @@ export const useSessionStore = create<SessionState>((set, get) => {
     return result.correctedText
   }
 
-  const runCorrectionDraft = async (sessionId: string): Promise<string | null> => {
+  const runCorrectionDraft = async (
+    sessionId: string,
+    lockedCredential?: { apiKey?: string; configIdentity?: string },
+  ): Promise<string | null> => {
     const session = get().sessions.find((item) => item.id === sessionId)
     const draft = session?.correction?.draft
     if (!session || !draft) throw new Error('未找到可运行的纠错任务')
+    const currentSettings = useSettingsStore.getState().settings
+    if (lockedCredential) {
+      if (lockedCredential.configIdentity !== draft.config.configIdentity) {
+        throw new CorrectionRunError('纠错配置在任务启动前已变化，请使用当前配置重新检测', 'config-changed')
+      }
+    } else if (!isCorrectionConfigSnapshotCurrent(draft.config, currentSettings)) {
+      throw new CorrectionRunError('已保存的 AI 配置已变化，请使用当前配置重新检测', 'config-changed')
+    }
     const runId = draft.runId
     const existingLease = correctionExecutionLeases.get(sessionId)
     if (existingLease) return null
@@ -487,6 +500,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
       runId,
       generation: ++correctionExecutionGeneration,
       controller: new AbortController(),
+      apiKey: lockedCredential ? lockedCredential.apiKey : currentSettings.aiPostProcess?.apiKey,
     }
     correctionExecutionLeases.set(sessionId, lease)
     markCorrectionInFlight(sessionId)
@@ -552,8 +566,41 @@ export const useSessionStore = create<SessionState>((set, get) => {
               transcript: claimedSession.transcript,
               shard,
               snapshot: config,
-              apiKey: useSettingsStore.getState().settings.aiPostProcess?.apiKey,
+              apiKey: lease.apiKey,
               signal: lease.controller.signal,
+              onProgress: (progress) => {
+                void enqueueCorrectionMutation(sessionId, async () => {
+                  if (!isCurrentCorrectionLease(sessionId, lease)) return
+                  const latestSession = get().sessions.find((item) => item.id === sessionId)
+                  const latestDraft = latestSession?.correction?.draft
+                  const currentShard = latestDraft?.shards.find((item) => item.id === shard.id)
+                  if (!latestSession || !latestDraft || latestDraft.runId !== runId || !currentShard
+                    || currentShard.status !== 'running' && currentShard.status !== 'retrying'
+                    || currentShard.attemptId !== shard.attemptId || currentShard.draftRevision !== shard.draftRevision) return
+                  const revision = latestDraft.revision + 1
+                  const nextShard: CorrectionShardProgress = {
+                    ...currentShard,
+                    status: progress.stage === 'retry-countdown' ? 'retrying' : 'running',
+                    attempt: progress.attempt,
+                    attemptLimit: progress.maxAttempts,
+                    nextRetryAt: progress.nextRetryAt,
+                    stage: progress.stage,
+                    stageUpdatedAt: progress.at,
+                    lastActivityAt: progress.stage === 'thinking' || progress.stage === 'receiving-content'
+                      ? progress.at : currentShard.lastActivityAt,
+                  }
+                  await checkpointCorrection(sessionId, {
+                    ...latestSession.correction!,
+                    status: 'detecting',
+                    draft: {
+                      ...latestDraft,
+                      revision,
+                      updatedAt: progress.at,
+                      shards: latestDraft.shards.map((item) => item.id === nextShard.id ? nextShard : item),
+                    },
+                  })
+                })
+              },
             })
           } catch (error) {
             if (!isCurrentCorrectionLease(sessionId, lease)) return
@@ -575,7 +622,15 @@ export const useSessionStore = create<SessionState>((set, get) => {
                 error: message,
                 updatedAt: Date.now(),
                 shards: latestDraft.shards.map((item) => item.id === shard.id
-                  ? { ...item, status: 'failed' as const, errorCode: code, error: message, draftRevision: revision }
+                  ? {
+                      ...item,
+                      status: 'failed' as const,
+                      errorCode: code,
+                      error: message,
+                      timeoutKind: error instanceof CorrectionRequestError ? error.timeoutKind : undefined,
+                      timeoutMs: error instanceof CorrectionRequestError ? error.timeoutMs : undefined,
+                      draftRevision: revision,
+                    }
                   : item.status === 'running' ? { ...item, status: 'pending' as const, attemptId: undefined, draftRevision: revision } : item),
               }
               await checkpointCorrection(sessionId, { ...latestSession.correction!, status: 'error', error: message, draft: failedDraft })
@@ -602,6 +657,8 @@ export const useSessionStore = create<SessionState>((set, get) => {
               rejectedPatches: rejected,
               completedAt: Date.now(),
               draftRevision: revision,
+              stage: undefined,
+              nextRetryAt: undefined,
             }
             const nextDraft = {
               ...latestDraft,
@@ -754,7 +811,10 @@ export const useSessionStore = create<SessionState>((set, get) => {
         draft,
       }
       await checkpointCorrection(sessionId, correction)
-      return await runCorrectionDraft(sessionId)
+      return await runCorrectionDraft(sessionId, {
+        apiKey: settings.aiPostProcess?.apiKey,
+        configIdentity: config.configIdentity,
+      })
     } finally {
       correctionStartReservations.delete(sessionId)
     }
@@ -1119,6 +1179,35 @@ export const useSessionStore = create<SessionState>((set, get) => {
       set({ sessions, recoverySession: recoverableSession })
 
       for (const session of sessions) {
+        const draft = session.correction?.draft
+        const currentSettings = useSettingsStore.getState().settings
+        if (draft && (draft.status === 'queued' || draft.status === 'running' || draft.status === 'retrying')
+          && !isCorrectionConfigSnapshotCurrent(draft.config, currentSettings)) {
+          const revision = draft.revision + 1
+          const message = draft.config.configIdentity
+            ? '已保存的 AI 配置已变化，请使用当前配置重新检测'
+            : '旧纠错任务缺少可验证配置，请使用当前配置重新检测'
+          await checkpointCorrection(session.id, {
+            ...session.correction!,
+            status: 'error',
+            error: message,
+            draft: {
+              ...draft,
+              revision,
+              status: 'failed',
+              errorCode: draft.config.configIdentity ? 'config-changed' : 'legacy-config',
+              error: message,
+              updatedAt: Date.now(),
+              shards: draft.shards.map((shard) => shard.status === 'running' || shard.status === 'retrying'
+                ? { ...shard, status: 'pending', attemptId: undefined, draftRevision: revision }
+                : shard),
+            },
+          })
+          if (session.autoPostProcessWorkflow?.step === 'correction') {
+            failAutoPostProcessWorkflow(session.id, message, 'correction')
+          }
+          continue
+        }
         const workflow = session.autoPostProcessWorkflow
         if (workflow) {
           if ((workflow.status === 'queued' || workflow.status === 'running')
@@ -1692,6 +1781,12 @@ export const useSessionStore = create<SessionState>((set, get) => {
       })
     },
     resumeSessionCorrection: async (sessionId) => {
+      const resumableDraft = get().sessions.find((item) => item.id === sessionId)?.correction?.draft
+      const resumeSettings = useSettingsStore.getState().settings
+      if (resumableDraft && !isCorrectionConfigSnapshotCurrent(resumableDraft.config, resumeSettings)) {
+        await get().retrySessionCorrection(sessionId)
+        return
+      }
       const workflow = get().sessions.find((item) => item.id === sessionId)?.autoPostProcessWorkflow
       if (workflow?.step === 'correction' && workflow.status !== 'completed') {
         updateAutoPostProcessWorkflow(sessionId, { status: 'queued', error: undefined })
@@ -1705,7 +1800,10 @@ export const useSessionStore = create<SessionState>((set, get) => {
         await checkpointCorrection(sessionId, { ...session.correction!, status: 'detecting', error: undefined, draft: queued })
       })
       try {
-        await runCorrectionDraft(sessionId)
+        await runCorrectionDraft(sessionId, {
+          apiKey: resumeSettings.aiPostProcess?.apiKey,
+          configIdentity: resumableDraft?.config.configIdentity,
+        })
       } catch (error) {
         if (workflow?.step === 'correction') failAutoPostProcessWorkflow(sessionId, error, 'correction')
         throw error
@@ -1713,23 +1811,93 @@ export const useSessionStore = create<SessionState>((set, get) => {
       if (workflow?.step === 'correction') await runAutoAiPostProcessWorkflow(sessionId)
     },
     retrySessionCorrection: async (sessionId) => {
+      if (correctionStartReservations.has(sessionId)) throw new Error('纠错任务正在启动')
+      correctionStartReservations.add(sessionId)
+      revokeCorrectionLease(sessionId)
       const workflow = get().sessions.find((item) => item.id === sessionId)?.autoPostProcessWorkflow
       if (workflow?.step === 'correction' && workflow.status !== 'completed') {
         updateAutoPostProcessWorkflow(sessionId, { status: 'queued', error: undefined })
       }
-      await enqueueCorrectionMutation(sessionId, async () => {
-        const session = get().sessions.find((item) => item.id === sessionId)
-        const draft = session?.correction?.draft
-        if (!session || !draft) return
-        const revision = draft.revision + 1
-        const queued = { ...draft, status: 'queued' as const, error: undefined, errorCode: undefined, pauseRequested: false, revision, updatedAt: Date.now(), shards: draft.shards.map((shard) => shard.status === 'failed' || shard.status === 'running' || shard.status === 'retrying' ? { ...shard, status: 'pending' as const, attemptId: undefined, error: undefined, errorCode: undefined, draftRevision: revision } : shard) }
-        await checkpointCorrection(sessionId, { ...session.correction!, status: 'detecting', error: undefined, draft: queued })
-      })
       try {
-        await runCorrectionDraft(sessionId)
+        let lockedCredential: { apiKey?: string; configIdentity?: string } | undefined
+        await enqueueCorrectionMutation(sessionId, async () => {
+          const session = get().sessions.find((item) => item.id === sessionId)
+          const draft = session?.correction?.draft
+          if (!session || !draft) return
+          const currentSettings = useSettingsStore.getState().settings
+          lockedCredential = {
+            apiKey: currentSettings.aiPostProcess?.apiKey,
+            configIdentity: undefined,
+          }
+          const matchesCurrentConfig = isCorrectionConfigSnapshotCurrent(draft.config, currentSettings)
+          const now = Date.now()
+          if (!matchesCurrentConfig) {
+            const config = createCorrectionConfigSnapshot(currentSettings, session.meetingContext)
+            lockedCredential.configIdentity = config.configIdentity
+            const baseTranscriptHash = await sha256Utf8(session.transcript)
+            const rebuilt = {
+              runId: generateId(),
+              revision: 1,
+              trigger: draft.trigger,
+              mode: draft.mode,
+              status: 'queued' as const,
+              baseTranscriptHash,
+              config,
+              shards: createCorrectionShards(session.transcript, config.chunkSize, config.contextSize).map((shard) => ({
+                ...shard,
+                status: 'pending' as const,
+                attempt: 0,
+                draftRevision: 1,
+              })),
+              proposedPatches: [],
+              rejectedPatches: [],
+              requestedAt: now,
+              updatedAt: now,
+            }
+            await checkpointCorrection(sessionId, {
+              ...session.correction!,
+              status: 'detecting',
+              error: undefined,
+              model: config.model,
+              requestedAt: now,
+              draft: rebuilt,
+            })
+            return
+          }
+          const revision = draft.revision + 1
+          lockedCredential.configIdentity = draft.config.configIdentity
+          const queued = {
+            ...draft,
+            status: 'queued' as const,
+            error: undefined,
+            errorCode: undefined,
+            pauseRequested: false,
+            revision,
+            updatedAt: now,
+            shards: draft.shards.map((shard) => shard.status === 'failed' || shard.status === 'running' || shard.status === 'retrying'
+              ? {
+                  ...shard,
+                  status: 'pending' as const,
+                  attempt: 0,
+                  attemptId: undefined,
+                  error: undefined,
+                  errorCode: undefined,
+                  timeoutKind: undefined,
+                  timeoutMs: undefined,
+                  stage: undefined,
+                  nextRetryAt: undefined,
+                  draftRevision: revision,
+                }
+              : shard),
+          }
+          await checkpointCorrection(sessionId, { ...session.correction!, status: 'detecting', error: undefined, draft: queued })
+        })
+        await runCorrectionDraft(sessionId, lockedCredential)
       } catch (error) {
         if (workflow?.step === 'correction') failAutoPostProcessWorkflow(sessionId, error, 'correction')
         throw error
+      } finally {
+        correctionStartReservations.delete(sessionId)
       }
       if (workflow?.step === 'correction') await runAutoAiPostProcessWorkflow(sessionId)
     },

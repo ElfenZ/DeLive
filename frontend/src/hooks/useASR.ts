@@ -19,6 +19,8 @@ import { buildPcmWavBlob } from '../utils/pcmWav'
 import { AudioProcessor } from '../utils/audioProcessor'
 import { readRecordingElapsedMs } from '../utils/recordingTimeline'
 import { resolveMeetingContextSnapshot } from '../utils/meetingContext'
+import { recordRuntimeDiagnostic } from '../utils/runtimeDiagnostics'
+import { detectRealtimeStall } from '../utils/realtimeHealth'
 
 interface UseASROptions {
   onError?: (message: string) => void
@@ -29,6 +31,9 @@ interface UseASROptions {
 
 const SOURCE_AUDIO_FLUSH_INTERVAL_MS = 1000
 const SOURCE_AUDIO_FLUSH_BYTES = 256 * 1024
+const REALTIME_HEALTH_CHECK_INTERVAL_MS = 5_000
+const REALTIME_HEALTH_RECOVERY_COOLDOWN_MS = 60_000
+const AUDIBLE_PCM_PEAK_THRESHOLD = 500
 
 function concatArrayBuffers(chunks: ArrayBuffer[], totalBytes: number): ArrayBuffer {
   if (chunks.length === 1 && chunks[0].byteLength === totalBytes) {
@@ -44,6 +49,14 @@ function concatArrayBuffers(chunks: ArrayBuffer[], totalBytes: number): ArrayBuf
   return output.buffer
 }
 
+function hasAudiblePcm(data: ArrayBuffer): boolean {
+  const samples = new Int16Array(data)
+  for (let index = 0; index < samples.length; index += 8) {
+    if (Math.abs(samples[index]) >= AUDIBLE_PCM_PEAK_THRESHOLD) return true
+  }
+  return false
+}
+
 export function useASR(options: UseASROptions = {}) {
   const captureRef = useRef(new CaptureManager())
   const captionRef = useRef(new CaptionBridge())
@@ -52,6 +65,10 @@ export function useASR(options: UseASROptions = {}) {
   const lastRestartTimeRef = useRef(0)
   const selectedVendorRef = useRef<ASRVendor | null>(null)
   const stopRecordingRef = useRef<() => Promise<string | null>>(async () => null)
+  const recoverProviderConnectionRef = useRef<(error: import('../types/asr').ASRError) => Promise<void>>(async () => undefined)
+  const isProviderRecoveringRef = useRef(false)
+  const lastAudibleSourceAtRef = useRef(0)
+  const lastHealthRecoveryAtRef = useRef(0)
   const microphoneWarningShownRef = useRef(false)
   const activeCaptureAudioOptionsRef = useRef<CaptureAudioOptions | null>(null)
   const sourceAudioChunksRef = useRef<Array<Blob | ArrayBuffer>>([])
@@ -190,6 +207,8 @@ export function useASR(options: UseASROptions = {}) {
     archiveDeliveryEnabledRef.current = false
     sourceAudioPendingChunksRef.current = []
     sourceAudioPendingBytesRef.current = 0
+    lastAudibleSourceAtRef.current = 0
+    lastHealthRecoveryAtRef.current = 0
   }, [clearSourceAudioFlushTimer])
 
   const stopSourceAudioArchive = useCallback(() => {
@@ -280,6 +299,9 @@ export function useASR(options: UseASROptions = {}) {
           return
         }
         const chunk = pcmData.slice(0)
+        if (hasAudiblePcm(chunk)) {
+          lastAudibleSourceAtRef.current = Date.now()
+        }
         sourceAudioPendingChunksRef.current.push(chunk)
         sourceAudioPendingBytesRef.current += chunk.byteLength
         if (sourceAudioPendingBytesRef.current >= SOURCE_AUDIO_FLUSH_BYTES) {
@@ -451,6 +473,7 @@ export function useASR(options: UseASROptions = {}) {
     }
 
     console.log('[useASR] 停止录制...')
+    recordRuntimeDiagnostic('recording', 'stop-start', { initialState })
     const stopStartedAt = Date.now()
     archiveDeliveryEnabledRef.current = false
     const sessionId = useSessionStore.getState().currentSessionId
@@ -471,6 +494,10 @@ export function useASR(options: UseASROptions = {}) {
       captureRef.current.stop()
       await providerSessionRef.current.disconnect()
       completedSessionId = endCurrentSession({ sourceMetaPatch, duration })
+      recordRuntimeDiagnostic('recording', 'stop-complete', {
+        completedSessionId,
+        duration,
+      })
     } finally {
       captureRef.current.stop()
       await providerSessionRef.current.disconnect()
@@ -569,9 +596,10 @@ export function useASR(options: UseASROptions = {}) {
         console.warn('[useASR] 生命周期切换中收到 Provider 错误（忽略）:', error.code, error.message)
         return
       }
-      options.onError?.(`${error.code}: ${error.message}`)
       if (currentState === 'recording') {
-        void stopRecordingRef.current()
+        void recoverProviderConnectionRef.current(error)
+      } else {
+        options.onError?.(`${error.code}: ${error.message}`)
       }
     },
 
@@ -579,6 +607,107 @@ export function useASR(options: UseASROptions = {}) {
       options.onFinished?.()
     },
   }), [applyTranscriptEvent, options])
+
+  const recoverProviderConnection = useCallback(async (error: import('../types/asr').ASRError) => {
+    if (isProviderRecoveringRef.current) {
+      recordRuntimeDiagnostic('recording', 'provider-recovery-duplicate', { code: error.code })
+      return
+    }
+    if (useSessionStore.getState().recordingState !== 'recording') return
+    const locked = lockedProviderRef.current
+    if (!locked) {
+      options.onError?.(`${error.code}: ${error.message}`)
+      await stopRecordingRef.current()
+      return
+    }
+
+    isProviderRecoveringRef.current = true
+    recordRuntimeDiagnostic('recording', 'provider-recovery-start', {
+      providerId: locked.vendorId,
+      code: error.code,
+      message: error.message,
+      epochOffsetMs: getConnectionEpochOffset(),
+    })
+    options.onWarning?.('实时转录连接中断，正在自动重连；录音仍会继续保存')
+    try {
+      captureDeliveryEnabledRef.current = false
+      await captureRef.current.pauseCapture()
+      recordRuntimeDiagnostic('recording', 'provider-recovery-capture-paused', {
+        providerId: locked.vendorId,
+      })
+      await providerSessionRef.current.reconnect(
+        locked.vendorId,
+        locked.setup.connectConfig,
+        buildProviderCallbacks(),
+        { epochOffsetMs: getConnectionEpochOffset() },
+      )
+      if (useSessionStore.getState().recordingState !== 'recording') {
+        await providerSessionRef.current.disconnect()
+        return
+      }
+      await captureRef.current.resumeCapture(locked.setup.providerInfo.capabilities)
+      if (useSessionStore.getState().recordingState !== 'recording') {
+        await captureRef.current.pauseCapture()
+        await providerSessionRef.current.disconnect()
+        return
+      }
+      captureDeliveryEnabledRef.current = true
+      recordRuntimeDiagnostic('recording', 'provider-recovery-success', {
+        providerId: locked.vendorId,
+      })
+      options.onWarning?.('实时转录连接已恢复')
+    } catch (reconnectError) {
+      const message = reconnectError instanceof Error ? reconnectError.message : String(reconnectError)
+      recordRuntimeDiagnostic('recording', 'provider-recovery-failure', {
+        providerId: locked.vendorId,
+        code: error.code,
+        reconnectError: message,
+      })
+      options.onError?.(`${error.code}: ${error.message}；自动重连失败：${message}`)
+      await stopRecordingRef.current()
+    } finally {
+      isProviderRecoveringRef.current = false
+    }
+  }, [buildProviderCallbacks, getConnectionEpochOffset, options])
+
+  recoverProviderConnectionRef.current = recoverProviderConnection
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (useSessionStore.getState().recordingState !== 'recording'
+        || !captureDeliveryEnabledRef.current
+        || isProviderRecoveringRef.current) {
+        return
+      }
+
+      const locked = lockedProviderRef.current
+      if (!locked || locked.setup.providerInfo.capabilities.transport.type !== 'realtime') return
+
+      const now = Date.now()
+      if (now - lastHealthRecoveryAtRef.current < REALTIME_HEALTH_RECOVERY_COOLDOWN_MS) return
+      const stallKind = detectRealtimeStall({
+        now,
+        capture: captureRef.current.getHealthSnapshot(),
+        provider: providerSessionRef.current.getHealthSnapshot(),
+        lastAudibleSourceAt: lastAudibleSourceAtRef.current,
+      })
+      if (!stallKind) return
+
+      lastHealthRecoveryAtRef.current = now
+      const error = stallKind === 'capture'
+        ? { code: 'CAPTURE_STALLED', message: '实时音频采集已停止产生数据' }
+        : { code: 'PROVIDER_STALLED', message: '实时音频仍在发送，但识别结果长时间没有更新' }
+      recordRuntimeDiagnostic('recording', 'health-watchdog-triggered', {
+        stallKind,
+        capture: captureRef.current.getHealthSnapshot(),
+        provider: providerSessionRef.current.getHealthSnapshot(),
+        lastAudibleSourceAt: lastAudibleSourceAtRef.current || null,
+      })
+      void recoverProviderConnectionRef.current(error)
+    }, REALTIME_HEALTH_CHECK_INTERVAL_MS)
+
+    return () => clearInterval(timer)
+  }, [])
 
   const pauseRecording = useCallback(async (): Promise<void> => {
     if (!transitionRecordingState('pausing')) return
@@ -834,6 +963,11 @@ export function useASR(options: UseASROptions = {}) {
     console.log(
       `[useASR] 开始录制，提供商: ${vendorId}, transport=${setup.providerInfo.capabilities.transport.type}`,
     )
+    recordRuntimeDiagnostic('recording', 'start-requested', {
+      providerId: vendorId,
+      transport: setup.providerInfo.capabilities.transport.type,
+      audioInputMode: setup.providerInfo.capabilities.audioInputMode,
+    })
 
     const capture = captureRef.current
     const audioOptions = buildCaptureAudioOptions()
@@ -915,6 +1049,11 @@ export function useASR(options: UseASROptions = {}) {
       }
 
       options.onStarted?.()
+      recordRuntimeDiagnostic('recording', 'start-complete', {
+        providerId: vendorId,
+        sessionId,
+        captureMode: capture.currentCaptureMode,
+      })
       console.log('[useASR] 录制已开始')
     } catch (error) {
       console.error('[useASR] 启动失败:', error)

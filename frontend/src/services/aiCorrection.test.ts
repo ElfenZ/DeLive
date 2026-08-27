@@ -10,6 +10,7 @@ import {
   normalizeAiCorrectionGlossary,
   requestCorrectionShard,
 } from './aiCorrection'
+import { nextOpenAiCredentialVersion } from './openAiCompatible'
 
 function session(transcript = '需要侍应新的工作。'): TranscriptSession {
   return {
@@ -39,15 +40,25 @@ function settings(overrides: Partial<NonNullable<AppSettings['aiPostProcess']>> 
 }
 
 function response(content: string, status = 200, headers: Record<string, string> = {}) {
+  const payload = {
+    choices: [{ message: { content } }],
+    usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+  }
   return {
     ok: status >= 200 && status < 300,
     status,
     headers: { get: (name: string) => headers[name] ?? null },
-    json: async () => ({
-      choices: [{ message: { content } }],
-      usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
-    }),
-    text: async () => content,
+    json: async () => payload,
+    text: async () => status >= 200 && status < 300 ? JSON.stringify(payload) : content,
+  }
+}
+
+function rawResponse(body: string, contentType: string) {
+  return {
+    ok: true,
+    status: 200,
+    headers: { get: (name: string) => name.toLowerCase() === 'content-type' ? contentType : null },
+    text: async () => body,
   }
 }
 
@@ -68,6 +79,14 @@ describe('aiCorrection config and body', () => {
     expect(snapshot.concurrency).toBe(1)
     expect(snapshot).not.toHaveProperty('apiKey')
     expect(snapshot.credentialRef).toBe('ai-post-process')
+    expect(snapshot.configIdentity).not.toContain('secret')
+  })
+
+  it('increments credential version only when normalized URL or key changes', () => {
+    const current = { baseUrl: 'https://api.example.com/v1/', apiKey: 'key-a', credentialVersion: 4 }
+    expect(nextOpenAiCredentialVersion(current, { baseUrl: ' https://api.example.com/v1 ', apiKey: 'key-a' })).toBe(4)
+    expect(nextOpenAiCredentialVersion(current, { baseUrl: 'https://api-b.example.com/v1', apiKey: 'key-a' })).toBe(5)
+    expect(nextOpenAiCredentialVersion(current, { baseUrl: current.baseUrl, apiKey: 'key-b' })).toBe(5)
   })
 
   it('normalizes and deduplicates glossary entries', () => {
@@ -84,7 +103,7 @@ describe('aiCorrection config and body', () => {
     ['json_schema', 'json_schema'],
   ] as const)('builds %s response format without streaming', (mode, expected) => {
     const transcript = 'before CORE after'
-    const snapshot = createCorrectionConfigSnapshot(settings({ correctionStructuredOutput: mode }))
+    const snapshot = createCorrectionConfigSnapshot(settings({ correctionStructuredOutput: mode, enableStreaming: false }))
     const body = buildCorrectionRequestBody({
       transcript,
       shard: { id: 's', index: 0, contextStart: 0, coreStart: 7, coreEnd: 11, contextEnd: transcript.length },
@@ -95,6 +114,18 @@ describe('aiCorrection config and body', () => {
     const user = (body.messages as Array<{ role: string; content: string }>)[1].content
     expect(user).toContain('<EDITABLE_CORE>\nCORE\n</EDITABLE_CORE>')
     expect(user).toContain('<READ_ONLY_BEFORE>\nbefore ')
+  })
+
+  it('uses streaming transport when enabled', () => {
+    const transcript = 'CORE'
+    const snapshot = createCorrectionConfigSnapshot(settings({ enableStreaming: true }))
+    const body = buildCorrectionRequestBody({
+      transcript,
+      shard: { id: 's', index: 0, contextStart: 0, coreStart: 0, coreEnd: transcript.length, contextEnd: transcript.length },
+      snapshot,
+    })
+    expect(snapshot.transport).toBe('sse')
+    expect(body.stream).toBe(true)
   })
 
   it('injects bounded context as JSON data before transcript regions without replacing the fixed contract', () => {
@@ -183,6 +214,7 @@ describe('aiCorrection config and body', () => {
 
 describe('aiCorrection transport', () => {
   beforeEach(() => {
+    vi.unstubAllGlobals()
     vi.restoreAllMocks()
     vi.useRealTimers()
   })
@@ -198,6 +230,52 @@ describe('aiCorrection transport', () => {
     expect(result.patches).toEqual([validPatch])
     expect(result.usage?.totalTokens).toBe(30)
     expect(result.attempt).toBe(1)
+  })
+
+  it('parses SSE reasoning activity without appending it to patch content', async () => {
+    const sse = [
+      'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}',
+      '',
+      `data: ${JSON.stringify({ choices: [{ delta: { content: JSON.stringify({ patches: [validPatch] }) } }] })}`,
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n')
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(rawResponse(sse, 'text/event-stream')))
+    const transcript = session().transcript
+    await expect(requestCorrectionShard({
+      transcript,
+      shard: createCorrectionShards(transcript)[0],
+      snapshot: createCorrectionConfigSnapshot(settings({ enableStreaming: true })),
+    })).resolves.toMatchObject({ patches: [validPatch] })
+  })
+
+  it('rejects responses above the 5 MB safety limit', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(rawResponse(
+      'x'.repeat(5 * 1024 * 1024 + 1),
+      'application/json',
+    )))
+    const transcript = session().transcript
+    await expect(requestCorrectionShard({
+      transcript,
+      shard: createCorrectionShards(transcript)[0],
+      snapshot: createCorrectionConfigSnapshot(settings({ enableStreaming: false })),
+      maxAttempts: 1,
+    })).rejects.toMatchObject({ code: 'protocol' })
+  })
+
+  it('classifies HTTP 200 unauthorized envelopes as non-retryable auth errors', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(rawResponse(JSON.stringify({
+      error: { type: 'unauthorized_error', message: 'invalid token' },
+    }), 'application/json'))
+    vi.stubGlobal('fetch', fetchMock)
+    const transcript = session().transcript
+    await expect(requestCorrectionShard({
+      transcript,
+      shard: createCorrectionShards(transcript)[0],
+      snapshot: createCorrectionConfigSnapshot(settings()),
+    })).rejects.toMatchObject({ code: 'auth', retryable: false })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
   it('never sends the safe-storage placeholder as an authorization token', async () => {
@@ -228,6 +306,89 @@ describe('aiCorrection transport', () => {
     await vi.advanceTimersByTimeAsync(2_000)
     await expect(promise).resolves.toMatchObject({ attempt: 2 })
     expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('retries a first-byte timeout through an isolated Electron network session', async () => {
+    vi.useFakeTimers()
+    const aiCorrectionRecoveryFetch = vi.fn().mockResolvedValue({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ choices: [{ message: { content: JSON.stringify({ patches: [] }) } }] }),
+    })
+    const cancelAiCorrectionRecoveryFetch = vi.fn().mockResolvedValue(false)
+    vi.stubGlobal('window', { electronAPI: { aiCorrectionRecoveryFetch, cancelAiCorrectionRecoveryFetch } })
+    const fetchMock = vi.fn().mockReturnValueOnce(new Promise(() => undefined))
+    vi.stubGlobal('fetch', fetchMock)
+    const transcript = session().transcript
+    const promise = requestCorrectionShard({
+      transcript,
+      shard: createCorrectionShards(transcript)[0],
+      snapshot: createCorrectionConfigSnapshot(settings()),
+      maxAttempts: 2,
+      timeouts: { firstByteMs: 100, idleMs: 1_000, absoluteMs: 10_000 },
+    })
+
+    await vi.advanceTimersByTimeAsync(100)
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    await expect(promise).resolves.toMatchObject({ attempt: 2 })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(aiCorrectionRecoveryFetch).toHaveBeenCalledWith(expect.objectContaining({
+      url: 'http://127.0.0.1:11434/v1/chat/completions',
+      firstByteTimeoutMs: 100,
+      idleTimeoutMs: 1_000,
+      absoluteTimeoutMs: 10_000,
+    }))
+  })
+
+  it('cancels an isolated recovery request when the correction lease is aborted', async () => {
+    vi.useFakeTimers()
+    const aiCorrectionRecoveryFetch = vi.fn().mockReturnValue(new Promise(() => undefined))
+    const cancelAiCorrectionRecoveryFetch = vi.fn().mockResolvedValue(true)
+    vi.stubGlobal('window', { electronAPI: { aiCorrectionRecoveryFetch, cancelAiCorrectionRecoveryFetch } })
+    vi.stubGlobal('fetch', vi.fn().mockReturnValue(new Promise(() => undefined)))
+    const controller = new AbortController()
+    const transcript = session().transcript
+    const promise = requestCorrectionShard({
+      transcript,
+      shard: createCorrectionShards(transcript)[0],
+      snapshot: createCorrectionConfigSnapshot(settings()),
+      signal: controller.signal,
+      maxAttempts: 2,
+      timeouts: { firstByteMs: 100, idleMs: 1_000, absoluteMs: 10_000 },
+    })
+    const assertion = expect(promise).rejects.toMatchObject({ code: 'aborted' })
+
+    await vi.advanceTimersByTimeAsync(1_100)
+    controller.abort()
+
+    await assertion
+    expect(cancelAiCorrectionRecoveryFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('preserves idle-timeout classification from the isolated recovery session', async () => {
+    vi.useFakeTimers()
+    const aiCorrectionRecoveryFetch = vi.fn().mockRejectedValue(new Error('AI_RECOVERY_IDLE_TIMEOUT'))
+    vi.stubGlobal('window', {
+      electronAPI: {
+        aiCorrectionRecoveryFetch,
+        cancelAiCorrectionRecoveryFetch: vi.fn().mockResolvedValue(false),
+      },
+    })
+    vi.stubGlobal('fetch', vi.fn().mockReturnValue(new Promise(() => undefined)))
+    const transcript = session().transcript
+    const promise = requestCorrectionShard({
+      transcript,
+      shard: createCorrectionShards(transcript)[0],
+      snapshot: createCorrectionConfigSnapshot(settings()),
+      maxAttempts: 2,
+      timeouts: { firstByteMs: 100, idleMs: 1_000, absoluteMs: 10_000 },
+    })
+    const assertion = expect(promise).rejects.toMatchObject({ code: 'timeout', timeoutKind: 'idle', timeoutMs: 1_000 })
+
+    await vi.advanceTimersByTimeAsync(1_100)
+
+    await assertion
   })
 
   it.each([400, 401, 403, 404])('does not retry HTTP %s', async (status) => {

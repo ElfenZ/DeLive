@@ -23,6 +23,8 @@ import {
   normalizeGlossaryEntries,
   normalizeMeetingContextConfig,
 } from '../utils/meetingContext'
+import { nextOpenAiCredentialVersion, normalizeOpenAiBaseUrl } from '../services/openAiCompatible'
+import { SAFE_STORAGE_PLACEHOLDER } from '../utils/secretStorage'
 
 const defaultCaptionStyle: CaptionStyle = {
   fontSize: 24,
@@ -105,6 +107,10 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       aiPostProcess: {
         ...defaultSettings.aiPostProcess,
         ...(settings.aiPostProcess || {}),
+        credentialVersion: Number.isInteger(settings.aiPostProcess?.credentialVersion)
+          && (settings.aiPostProcess?.credentialVersion || 0) > 0
+          ? settings.aiPostProcess!.credentialVersion
+          : 1,
         glossary: normalizedGlossary.value,
       },
       meetingContext: normalizedMeetingContext.value,
@@ -155,9 +161,20 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     if (normalizedGlossary?.errors.length) {
       throw new MeetingContextValidationError(normalizedGlossary.errors)
     }
+    const nextApiKey = config.apiKey === SAFE_STORAGE_PLACEHOLDER
+      ? currentConfig.apiKey
+      : config.apiKey ?? currentConfig.apiKey
+    const nextBaseUrl = normalizeOpenAiBaseUrl(config.baseUrl ?? currentConfig.baseUrl ?? '')
+    const credentialVersion = nextOpenAiCredentialVersion(currentConfig, {
+      baseUrl: nextBaseUrl,
+      apiKey: nextApiKey,
+    })
     const nextConfig = enforceAiAutomationExclusivity({
       ...currentConfig,
       ...config,
+      ...(config.baseUrl !== undefined ? { baseUrl: nextBaseUrl } : {}),
+      apiKey: nextApiKey,
+      credentialVersion,
       ...(normalizedGlossary ? { glossary: normalizedGlossary.value } : {}),
     })
     const inMemorySettings = {

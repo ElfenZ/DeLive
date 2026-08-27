@@ -30,8 +30,10 @@ import type {
 } from '../types'
 import { resolveMeetingContextSnapshot } from '../utils/meetingContext'
 import { createSonioxRecognitionSnapshot, parseSonioxConfig } from '../utils/sonioxConfig'
+import { recordRuntimeDiagnostic } from '../utils/runtimeDiagnostics'
 
 export const PROVIDER_DRAIN_TIMEOUT_MS = 2_000
+const PROVIDER_DIAGNOSTIC_INTERVAL_MS = 30_000
 
 export interface ProviderSessionCallbacks {
   onTokens: (tokens: TranscriptToken[]) => void
@@ -47,6 +49,16 @@ export interface ProviderSetup {
   captureRestartStrategy: CaptureRestartStrategy
   meetingContext: MeetingContextSnapshot
   recognitionConfig: RecognitionConfigSnapshot
+}
+
+export interface ProviderSessionHealthSnapshot {
+  providerId: ASRVendor
+  providerState: ASRProvider['state']
+  connectedAt: number
+  sentAudioChunks: number
+  lastAudioSentAt: number
+  receivedEventCount: number
+  lastEventAt: number
 }
 
 export type ProviderSessionDrainStatus = 'no-provider' | 'finished' | 'timeout'
@@ -78,6 +90,13 @@ interface ProviderConnection {
   disconnectError?: unknown
   disconnectPromise?: Promise<void>
   closePromise?: Promise<ProviderSessionDisconnectResult>
+  sentAudioChunks: number
+  sentAudioBytes: number
+  lastAudioSentAt: number
+  receivedEventCount: number
+  lastEventAt: number
+  lastDiagnosticAt: number
+  connectedAt: number
 }
 
 export class ProviderSessionManager {
@@ -91,6 +110,20 @@ export class ProviderSessionManager {
 
   get currentConnectionEpoch(): number | null {
     return this.connection?.epoch ?? null
+  }
+
+  getHealthSnapshot(): ProviderSessionHealthSnapshot | null {
+    const connection = this.connection
+    if (!connection) return null
+    return {
+      providerId: connection.provider.id,
+      providerState: connection.provider.state,
+      connectedAt: connection.connectedAt,
+      sentAudioChunks: connection.sentAudioChunks,
+      lastAudioSentAt: connection.lastAudioSentAt,
+      receivedEventCount: connection.receivedEventCount,
+      lastEventAt: connection.lastEventAt,
+    }
   }
 
   /** Absolute end timestamp from final tokens observed by this manager. */
@@ -190,15 +223,28 @@ export class ProviderSessionManager {
       draining: false,
       terminalEventCount: 0,
       expectedErrors: [],
+      sentAudioChunks: 0,
+      sentAudioBytes: 0,
+      lastAudioSentAt: 0,
+      receivedEventCount: 0,
+      lastEventAt: 0,
+      lastDiagnosticAt: 0,
+      connectedAt: Date.now(),
     }
     this.connection = connection
     this.bindListeners(connection)
 
     console.log('[ProviderSession] 连接 Provider...', { epoch: connection.epoch })
+    recordRuntimeDiagnostic('provider-session', 'connect-start', this.buildDiagnosticDetails(connection))
     try {
       await provider.connect(connectConfig)
+      recordRuntimeDiagnostic('provider-session', 'connect-success', this.buildDiagnosticDetails(connection))
       return provider
     } catch (error) {
+      recordRuntimeDiagnostic('provider-session', 'connect-failure', {
+        ...this.buildDiagnosticDetails(connection),
+        error: error instanceof Error ? error.message : String(error),
+      })
       this.cleanupConnection(connection)
       throw error
     }
@@ -249,6 +295,14 @@ export class ProviderSessionManager {
     if (!connection || !connection.acceptingAudio) {
       return
     }
+    const now = Date.now()
+    connection.sentAudioChunks += 1
+    connection.sentAudioBytes += data instanceof Blob ? data.size : data.byteLength
+    connection.lastAudioSentAt = now
+    if (now - connection.lastDiagnosticAt >= PROVIDER_DIAGNOSTIC_INTERVAL_MS) {
+      connection.lastDiagnosticAt = now
+      recordRuntimeDiagnostic('provider-session', 'audio-send', this.buildDiagnosticDetails(connection))
+    }
     connection.provider.sendAudio(data)
   }
 
@@ -295,6 +349,13 @@ export class ProviderSessionManager {
       ...(connection.drainError === undefined ? {} : { drainError: connection.drainError }),
       ...(connection.disconnectError === undefined ? {} : { disconnectError: connection.disconnectError }),
     }
+    recordRuntimeDiagnostic('provider-session', 'disconnect-complete', {
+      ...this.buildDiagnosticDetails(connection),
+      status: result.status,
+      expectedErrorCount: result.expectedErrors.length,
+      hasDrainError: result.drainError !== undefined,
+      hasDisconnectError: result.disconnectError !== undefined,
+    })
     this.cleanupConnection(connection)
     return result
   }
@@ -371,6 +432,7 @@ export class ProviderSessionManager {
       if (!this.shouldDispatch(connection)) return
       const normalizedTokens = this.normalizeTokenTimestamps(connection, tokens)
       this.trackConfirmedTokenEndMs(normalizedTokens)
+      this.recordProviderEvent(connection, 'tokens')
       console.log('[ProviderSession] 收到 tokens:', normalizedTokens.length)
       connection.callbacks.onTokens(normalizedTokens)
     })
@@ -378,6 +440,7 @@ export class ProviderSessionManager {
     if (!provider.info.capabilities.prefersTokenEvents) {
       provider.on('onPartial', (text: string) => {
         if (!this.shouldDispatch(connection)) return
+        this.recordProviderEvent(connection, 'partial')
         console.log('[ProviderSession] 收到 partial:', text.substring(0, 50))
         connection.callbacks.onPartial(text)
       })
@@ -386,6 +449,7 @@ export class ProviderSessionManager {
     if (!provider.info.capabilities.prefersTokenEvents) {
       provider.on('onFinal', (text: string) => {
         if (!this.shouldDispatch(connection)) return
+        this.recordProviderEvent(connection, 'final')
         console.log('[ProviderSession] 收到 final:', text.substring(0, 50))
         connection.callbacks.onFinal(text)
       })
@@ -399,11 +463,17 @@ export class ProviderSessionManager {
         return
       }
       console.error('[ProviderSession] Provider 错误:', error)
+      recordRuntimeDiagnostic('provider-session', 'provider-error', {
+        ...this.buildDiagnosticDetails(connection),
+        code: error.code,
+        message: error.message,
+      })
       connection.callbacks.onError(error)
     })
 
     provider.on('onFinished', () => {
       if (!this.shouldDispatch(connection)) return
+      this.recordProviderEvent(connection, 'finished')
       this.recordTerminalEvent(connection)
       console.log('[ProviderSession] 转录完成')
       connection.callbacks.onFinished()
@@ -446,6 +516,37 @@ export class ProviderSessionManager {
       if (token.isFinal && Number.isFinite(token.endMs)) {
         this.maxConfirmedTokenEndMs = Math.max(this.maxConfirmedTokenEndMs, token.endMs!)
       }
+    }
+  }
+
+  private recordProviderEvent(connection: ProviderConnection, eventKind: string): void {
+    const now = Date.now()
+    connection.receivedEventCount += 1
+    connection.lastEventAt = now
+    if (now - connection.lastDiagnosticAt >= PROVIDER_DIAGNOSTIC_INTERVAL_MS) {
+      connection.lastDiagnosticAt = now
+      recordRuntimeDiagnostic('provider-session', 'provider-result', {
+        ...this.buildDiagnosticDetails(connection),
+        eventKind,
+      })
+    }
+  }
+
+  private buildDiagnosticDetails(connection: ProviderConnection): Record<string, unknown> {
+    return {
+      providerId: connection.provider.id,
+      providerState: connection.provider.state,
+      epoch: connection.epoch,
+      epochOffsetMs: connection.epochOffsetMs,
+      acceptingAudio: connection.acceptingAudio,
+      acceptingEvents: connection.acceptingEvents,
+      draining: connection.draining,
+      sentAudioChunks: connection.sentAudioChunks,
+      sentAudioBytes: connection.sentAudioBytes,
+      lastAudioSentAt: connection.lastAudioSentAt || null,
+      receivedEventCount: connection.receivedEventCount,
+      lastEventAt: connection.lastEventAt || null,
+      connectedAt: connection.connectedAt,
     }
   }
 }

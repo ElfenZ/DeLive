@@ -7,6 +7,25 @@ export interface WhatsNewEntry {
 
 const entries: WhatsNewEntry[] = [
   {
+    version: '2.5.10',
+    date: '2026-08-27',
+    features: [],
+    fixes: [
+      {
+        zh: '实时转录重连会同时重建音频采集管线，确保新的 Soniox 连接收到完整 WebM 初始化数据',
+        en: 'Realtime reconnects now rebuild the audio capture pipeline so new Soniox sessions receive valid WebM initialization data',
+      },
+      {
+        zh: '新增实时链路看门狗，可自动恢复音频块停滞及有声音但识别结果长期不更新的问题，同时保留完整源录音',
+        en: 'A realtime health watchdog now recovers stalled capture or Provider progress while preserving the complete source recording',
+      },
+      {
+        zh: '加强 AI 纠错备份凭据隔离、SSE 心跳兼容性、响应大小限制和增量解析',
+        en: 'Improved AI correction credential isolation, SSE heartbeat compatibility, response limits, and incremental parsing',
+      },
+    ],
+  },
+  {
     version: '2.5.6',
     date: '2026-07-28',
     features: [

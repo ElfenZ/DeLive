@@ -596,6 +596,11 @@ function normalizeCorrectionConfig(value: unknown): CorrectionConfigSnapshot | n
     concurrency,
     safetyLimits,
     credentialRef: 'ai-post-process',
+    credentialVersion: typeof value.credentialVersion === 'number' && Number.isInteger(value.credentialVersion) && value.credentialVersion > 0
+      ? value.credentialVersion : undefined,
+    identityVersion: value.identityVersion === 1 ? 1 : undefined,
+    configIdentity: getString(value.configIdentity),
+    transport: value.transport === 'json' || value.transport === 'sse' ? value.transport : undefined,
   }
 }
 
@@ -630,8 +635,16 @@ function normalizeShard(value: unknown): CorrectionShardProgress | null {
     patches,
     rejectedPatches,
     nextRetryAt: getNumber(value.nextRetryAt),
+    stage: value.stage === 'connecting' || value.stage === 'waiting-response' || value.stage === 'thinking'
+      || value.stage === 'receiving-content' || value.stage === 'retry-countdown' ? value.stage : undefined,
+    stageUpdatedAt: getNumber(value.stageUpdatedAt),
+    lastActivityAt: getNumber(value.lastActivityAt),
+    attemptLimit: getNumber(value.attemptLimit),
     errorCode: getString(value.errorCode),
     error: getString(value.error),
+    timeoutKind: value.timeoutKind === 'first-byte' || value.timeoutKind === 'idle' || value.timeoutKind === 'absolute'
+      ? value.timeoutKind : undefined,
+    timeoutMs: getNumber(value.timeoutMs),
     completedAt: getNumber(value.completedAt),
   }
 }

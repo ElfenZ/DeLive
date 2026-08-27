@@ -10,6 +10,11 @@ import type {
   TranscriptTextSourceKind,
   TranscriptTextSourceMetadata,
 } from '../types'
+import {
+  createOpenAiRequestContext,
+  extractOpenAiErrorEnvelope,
+  extractOpenAiMessageContent,
+} from './openAiCompatible'
 
 const DEFAULT_AI_BASE_URL = 'http://127.0.0.1:11434/v1'
 const DEFAULT_PROMPT_LANGUAGE: NonNullable<AiPostProcessConfig['promptLanguage']> = 'zh'
@@ -24,17 +29,16 @@ export async function fetchAvailableModels(
   baseUrl: string,
   apiKey?: string,
 ): Promise<string[]> {
-  const url = `${baseUrl.replace(/\/+$/, '')}/models`
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  if (apiKey?.trim()) headers.Authorization = `Bearer ${apiKey.trim()}`
-
-  const res = await fetch(url, { headers, signal: AbortSignal.timeout(15_000) })
+  const context = createOpenAiRequestContext(baseUrl, apiKey)
+  const res = await fetch(context.modelsUrl, { headers: context.headers, signal: AbortSignal.timeout(15_000) })
   if (!res.ok) {
     const text = await res.text().catch(() => '')
     throw new Error(text || `HTTP ${res.status}`)
   }
 
   const payload = (await res.json()) as ModelsApiResponse
+  const envelope = extractOpenAiErrorEnvelope(payload)
+  if (envelope) throw new Error(envelope.message)
   const models = (payload.data ?? [])
     .map((m) => m.id)
     .filter(Boolean)
@@ -44,14 +48,64 @@ export async function fetchAvailableModels(
   return models
 }
 
+export function invalidateAiEndpointModels(): Partial<AiPostProcessConfig> {
+  return {
+    availableModels: [],
+    selectedModels: [],
+    defaultModel: '',
+    model: '',
+    modelAssignment: {},
+  }
+}
+
+export function reconcileAiEndpointModels(
+  config: AiPostProcessConfig,
+  availableModels: string[],
+): Partial<AiPostProcessConfig> {
+  const available = Array.from(new Set(availableModels.map(model => model.trim()).filter(Boolean)))
+  const availableSet = new Set(available)
+  const selectedModels = (config.selectedModels ?? []).filter(model => availableSet.has(model))
+  const validDefault = [config.defaultModel, config.model]
+    .map(model => model?.trim() || '')
+    .find(model => availableSet.has(model)) || ''
+
+  if (validDefault && !selectedModels.includes(validDefault)) {
+    selectedModels.push(validDefault)
+  }
+  if (selectedModels.length === 0 && available.length > 0) {
+    selectedModels.push(available[0])
+  }
+
+  const selectedSet = new Set(selectedModels)
+  const modelAssignment = Object.fromEntries(
+    Object.entries(config.modelAssignment ?? {})
+      .filter(([, model]) => typeof model === 'string' && selectedSet.has(model.trim()))
+      .map(([feature, model]) => [feature, model!.trim()]),
+  ) as AiPostProcessConfig['modelAssignment']
+
+  return {
+    availableModels: available,
+    selectedModels,
+    defaultModel: validDefault || selectedModels[0] || '',
+    model: availableSet.has(config.model?.trim() || '') ? config.model?.trim() : '',
+    modelAssignment,
+  }
+}
+
 export function resolveModelForFeature(
   config: AiPostProcessConfig,
   feature: AiFeatureKey,
 ): string {
-  const assigned = config.modelAssignment?.[feature]
-  if (assigned?.trim()) return assigned.trim()
-  if (config.defaultModel?.trim()) return config.defaultModel.trim()
-  if (config.model?.trim()) return config.model.trim()
+  const candidates = [
+    config.modelAssignment?.[feature],
+    config.defaultModel,
+    config.model,
+  ].map(model => model?.trim() || '').filter(Boolean)
+  const available = (config.availableModels ?? []).map(model => model.trim()).filter(Boolean)
+  if (available.length === 0) return candidates[0] || ''
+  const availableSet = new Set(available)
+  const validCandidate = candidates.find(model => availableSet.has(model))
+  if (validCandidate) return validCandidate
   return ''
 }
 
@@ -236,22 +290,6 @@ function normalizeMindMapPayload(payload: SessionMindMapPayload, model: string):
   }
 }
 
-function extractTextContent(content: ChatCompletionResponse['choices']): string {
-  const messageContent = content?.[0]?.message?.content
-  if (typeof messageContent === 'string') {
-    return messageContent.trim()
-  }
-
-  if (Array.isArray(messageContent)) {
-    return messageContent
-      .map((part) => part?.type === 'text' && typeof part.text === 'string' ? part.text : '')
-      .join('\n')
-      .trim()
-  }
-
-  return ''
-}
-
 function extractJsonObject(raw: string): string {
   const trimmed = raw.trim()
   if (!trimmed) {
@@ -333,6 +371,26 @@ function fastTextHash(text: string): string {
     hash = Math.imul(hash, 0x01000193)
   }
   return `fnv1a-${(hash >>> 0).toString(16).padStart(8, '0')}-${text.length}`
+}
+
+function assertOpenAiPayload(payload: unknown): void {
+  const envelope = extractOpenAiErrorEnvelope(payload)
+  if (envelope) throw new Error(envelope.message)
+}
+
+export function extractSessionQaStreamChunk(data: string): string | undefined {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(data)
+  } catch {
+    return undefined
+  }
+  assertOpenAiPayload(parsed)
+  const choices = parsed && typeof parsed === 'object'
+    ? (parsed as { choices?: Array<{ delta?: { content?: unknown } }> }).choices
+    : undefined
+  const content = choices?.[0]?.delta?.content
+  return typeof content === 'string' ? content : undefined
 }
 
 export interface ResolvedTranscriptText {
@@ -561,7 +619,7 @@ export async function generateSessionBriefing(
   settings: AppSettings,
 ): Promise<SessionBriefingResult> {
   const config = getAiConfig(settings)
-  const baseUrl = config.baseUrl?.trim().replace(/\/+$/, '') || DEFAULT_AI_BASE_URL
+  const requestContext = createOpenAiRequestContext(config.baseUrl || DEFAULT_AI_BASE_URL, config.apiKey)
   const model = resolveModelForFeature(config, 'briefing')
   const promptLanguage = config.promptLanguage || DEFAULT_PROMPT_LANGUAGE
 
@@ -577,12 +635,9 @@ export async function generateSessionBriefing(
     throw new Error('当前会话没有可用于 AI 分析的转录内容')
   }
 
-  const response = await fetch(`${baseUrl}/chat/completions`, {
+  const response = await fetch(requestContext.completionUrl, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(config.apiKey?.trim() ? { Authorization: `Bearer ${config.apiKey.trim()}` } : {}),
-    },
+    headers: requestContext.headers,
     body: JSON.stringify({
       model,
       temperature: 0.2,
@@ -600,7 +655,8 @@ export async function generateSessionBriefing(
   }
 
   const payload = await response.json() as ChatCompletionResponse
-  const content = extractTextContent(payload.choices)
+  assertOpenAiPayload(payload)
+  const content = extractOpenAiMessageContent(payload).trim()
   const postProcess = parseAiBriefingResponse(content, model)
   const source = resolveTranscriptText(session, config.preferCorrectedText)
   Object.assign(postProcess, sourceMetadata(source))
@@ -615,7 +671,7 @@ export async function askQuestionForSession(
   options?: { conversationId?: string },
 ): Promise<SessionQaResult> {
   const config = getAiConfig(settings)
-  const baseUrl = config.baseUrl?.trim().replace(/\/+$/, '') || DEFAULT_AI_BASE_URL
+  const requestContext = createOpenAiRequestContext(config.baseUrl || DEFAULT_AI_BASE_URL, config.apiKey)
   const model = resolveModelForFeature(config, 'chat')
   const promptLanguage = config.promptLanguage || DEFAULT_PROMPT_LANGUAGE
   const normalizedQuestion = question.trim()
@@ -638,12 +694,9 @@ export async function askQuestionForSession(
 
   const conversationId = options?.conversationId?.trim()
 
-  const response = await fetch(`${baseUrl}/chat/completions`, {
+  const response = await fetch(requestContext.completionUrl, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(config.apiKey?.trim() ? { Authorization: `Bearer ${config.apiKey.trim()}` } : {}),
-    },
+    headers: requestContext.headers,
     body: JSON.stringify({
       model,
       temperature: 0.2,
@@ -671,7 +724,8 @@ export async function askQuestionForSession(
   }
 
   const payload = await response.json() as ChatCompletionResponse
-  const content = extractTextContent(payload.choices)
+  assertOpenAiPayload(payload)
+  const content = extractOpenAiMessageContent(payload).trim()
   const result = parseSessionQaResponse(content, model)
   result.source = resolveTranscriptText(session, config.preferCorrectedText)
   return result
@@ -691,7 +745,7 @@ export async function askQuestionForSessionStreaming(
   options?: { conversationId?: string; signal?: AbortSignal },
 ): Promise<void> {
   const config = getAiConfig(settings)
-  const baseUrl = config.baseUrl?.trim().replace(/\/+$/, '') || DEFAULT_AI_BASE_URL
+  const requestContext = createOpenAiRequestContext(config.baseUrl || DEFAULT_AI_BASE_URL, config.apiKey)
   const model = resolveModelForFeature(config, 'chat')
   const promptLanguage = config.promptLanguage || DEFAULT_PROMPT_LANGUAGE
   const normalizedQuestion = question.trim()
@@ -703,12 +757,9 @@ export async function askQuestionForSessionStreaming(
 
   const conversationId = options?.conversationId?.trim()
 
-  const res = await fetch(`${baseUrl}/chat/completions`, {
+  const res = await fetch(requestContext.completionUrl, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(config.apiKey?.trim() ? { Authorization: `Bearer ${config.apiKey.trim()}` } : {}),
-    },
+    headers: requestContext.headers,
     body: JSON.stringify({
       model,
       temperature: 0.2,
@@ -758,17 +809,10 @@ export async function askQuestionForSessionStreaming(
         const data = trimmed.slice(5).trim()
         if (data === '[DONE]') continue
 
-        try {
-          const parsed = JSON.parse(data) as {
-            choices?: Array<{ delta?: { content?: string } }>
-          }
-          const content = parsed.choices?.[0]?.delta?.content
-          if (content) {
-            fullText += content
-            callbacks.onChunk(fullText)
-          }
-        } catch {
-          // skip malformed JSON chunks
+        const content = extractSessionQaStreamChunk(data)
+        if (content) {
+          fullText += content
+          callbacks.onChunk(fullText)
         }
       }
     }
@@ -789,7 +833,7 @@ export async function generateSessionMindMap(
   settings: AppSettings,
 ): Promise<SessionMindMapResult> {
   const config = getAiConfig(settings)
-  const baseUrl = config.baseUrl?.trim().replace(/\/+$/, '') || DEFAULT_AI_BASE_URL
+  const requestContext = createOpenAiRequestContext(config.baseUrl || DEFAULT_AI_BASE_URL, config.apiKey)
   const model = resolveModelForFeature(config, 'mindmap')
   const promptLanguage = config.promptLanguage || DEFAULT_PROMPT_LANGUAGE
 
@@ -805,12 +849,9 @@ export async function generateSessionMindMap(
     throw new Error('当前会话没有可用于生成思维导图的转录内容')
   }
 
-  const response = await fetch(`${baseUrl}/chat/completions`, {
+  const response = await fetch(requestContext.completionUrl, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(config.apiKey?.trim() ? { Authorization: `Bearer ${config.apiKey.trim()}` } : {}),
-    },
+    headers: requestContext.headers,
     body: JSON.stringify({
       model,
       temperature: 0.2,
@@ -828,7 +869,8 @@ export async function generateSessionMindMap(
   }
 
   const payload = await response.json() as ChatCompletionResponse
-  const content = extractTextContent(payload.choices)
+  assertOpenAiPayload(payload)
+  const content = extractOpenAiMessageContent(payload).trim()
   const mindMap = parseSessionMindMapResponse(content, model)
   const source = resolveTranscriptText(session, config.preferCorrectedText)
   Object.assign(mindMap, sourceMetadata(source))

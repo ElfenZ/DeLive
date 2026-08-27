@@ -123,6 +123,12 @@ export interface DiagnosticsExportResult {
 export interface DiagnosticsExportPayload {
   settings: Record<string, unknown>
   localStorageKeys: string[]
+  runtimeDiagnostics?: Array<{
+    timestamp: string
+    scope: string
+    event: string
+    details?: Record<string, unknown>
+  }>
 }
 
 // ─── Open API types ───
@@ -217,6 +223,23 @@ export interface SessionDetail {
     rejectedPatches?: number
     updatedAt?: number
   }
+}
+
+export interface AiCorrectionRecoveryRequest {
+  requestId: string
+  url: string
+  apiKey?: string
+  body: string
+  firstByteTimeoutMs: number
+  idleTimeoutMs: number
+  absoluteTimeoutMs: number
+}
+
+export interface AiCorrectionRecoveryResponse {
+  status: number
+  contentType?: string
+  retryAfter?: string
+  body: string
 }
 
 export interface AutoExportFileRequest {
@@ -331,6 +354,8 @@ export interface RecordingArchiveRecoverResult {
 export interface ElectronAPI {
   getAppVersion: () => Promise<string>
   getProxyPort: () => Promise<number>
+  aiCorrectionRecoveryFetch: (request: AiCorrectionRecoveryRequest) => Promise<AiCorrectionRecoveryResponse>
+  cancelAiCorrectionRecoveryFetch: (requestId: string) => Promise<boolean>
   minimizeToTray: () => Promise<void>
   windowMinimize: (source?: string) => Promise<void>
   windowMaximize: () => Promise<void>

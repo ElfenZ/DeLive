@@ -162,6 +162,7 @@ export function getDefaultSettings(): AppSettings {
       baseUrl: 'http://127.0.0.1:11434/v1',
       model: '',
       apiKey: '',
+      credentialVersion: 1,
       promptLanguage: 'zh',
       glossary: [],
       autoCorrectionDetection: false,

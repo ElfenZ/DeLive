@@ -11,7 +11,7 @@ import { registerAppShortcuts } from './shortcuts'
 import { createAppTray, findIconPath, rebuildTrayMenu } from './tray'
 import { registerUpdaterIpc } from './updaterIpc'
 import { installLogInterceptor, registerDiagnosticsIpc } from './diagnosticsIpc'
-import { registerTrustedWindow } from './ipcSecurity'
+import { assertTrustedSender, registerTrustedWindow } from './ipcSecurity'
 import { registerSafeStorageIpc } from './safeStorageIpc'
 import { startVolcProxyServer, type ProxyServerRuntime } from './volcProxy'
 import { registerApiIpc } from './apiIpc'
@@ -19,6 +19,7 @@ import { attachApiServer, type ApiServerAttachment } from './apiServer'
 import { registerCloudBackupIpc } from './cloudBackup/cloudBackupIpc'
 import { refreshElectronLang, getElectronStrings } from './i18n'
 import { isAutoUpdateSupported } from './updaterSupport'
+import type { AiCorrectionRecoveryRequest, AiCorrectionRecoveryResponse } from '../shared/electronApi'
 
 installLogInterceptor()
 
@@ -35,6 +36,51 @@ let tray: Tray | null = null
 let isQuitting = false
 let proxyServerRuntime: ProxyServerRuntime | null = null
 let apiServerAttachment: ApiServerAttachment | null = null
+let aiCorrectionRecoveryQueue: Promise<void> = Promise.resolve()
+const aiCorrectionRecoveryControllers = new Map<string, AbortController>()
+let aiCorrectionRecoveryPending = 0
+const MAX_AI_CORRECTION_RECOVERY_QUEUE = 4
+const MAX_AI_CORRECTION_RECOVERY_RESPONSE_BYTES = 5 * 1024 * 1024
+
+async function readLimitedRecoveryResponse(
+  response: Response,
+  controller: AbortController,
+  idleTimeoutMs: number,
+): Promise<string> {
+  const reader = response.body?.getReader()
+  if (!reader) return ''
+  const decoder = new TextDecoder()
+  let body = ''
+  let bytes = 0
+  try {
+    while (true) {
+      let idleTimer: ReturnType<typeof setTimeout> | undefined
+      const idle = new Promise<never>((_, reject) => {
+        idleTimer = setTimeout(() => {
+          controller.abort()
+          reject(new Error('AI_RECOVERY_IDLE_TIMEOUT'))
+        }, idleTimeoutMs)
+      })
+      let result: ReadableStreamReadResult<Uint8Array>
+      try {
+        result = await Promise.race([reader.read(), idle])
+      } finally {
+        if (idleTimer) clearTimeout(idleTimer)
+      }
+      if (result.done) break
+      bytes += result.value.byteLength
+      if (bytes > MAX_AI_CORRECTION_RECOVERY_RESPONSE_BYTES) {
+        controller.abort()
+        throw new Error('AI_RECOVERY_RESPONSE_TOO_LARGE')
+      }
+      body += decoder.decode(result.value, { stream: true })
+    }
+    body += decoder.decode()
+    return body
+  } finally {
+    reader.releaseLock()
+  }
+}
 
 const isDev = process.env.NODE_ENV === 'development'
 
@@ -194,6 +240,99 @@ app.on('before-quit', () => {
 ipcMain.handle('get-proxy-port', () => {
   if (!proxyServerRuntime) throw new Error('Local proxy server is not ready')
   return proxyServerRuntime.port
+})
+
+ipcMain.handle('ai-correction-recovery-fetch', async (event, request: AiCorrectionRecoveryRequest) => {
+  assertTrustedSender(event, 'ai-correction-recovery-fetch')
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender.id !== mainWindow.webContents.id) {
+    throw new Error('AI correction recovery is restricted to the main window')
+  }
+  const parsed = new URL(request.url)
+  if (typeof request.requestId !== 'string' || !/^[a-zA-Z0-9-]{8,100}$/.test(request.requestId)) {
+    throw new Error('Invalid AI recovery request id')
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') throw new Error('Unsupported AI recovery URL protocol')
+  if (typeof request.body !== 'string' || request.body.length > 1_000_000) throw new Error('Invalid AI recovery request body')
+  if (!Number.isFinite(request.absoluteTimeoutMs) || request.absoluteTimeoutMs < 1_000 || request.absoluteTimeoutMs > 10 * 60_000) {
+    throw new Error('Invalid AI recovery timeout')
+  }
+  if (!Number.isFinite(request.idleTimeoutMs) || request.idleTimeoutMs < 1_000 || request.idleTimeoutMs > 2 * 60_000) {
+    throw new Error('Invalid AI recovery idle timeout')
+  }
+  if (!Number.isFinite(request.firstByteTimeoutMs) || request.firstByteTimeoutMs < 1_000 || request.firstByteTimeoutMs > 5 * 60_000) {
+    throw new Error('Invalid AI recovery first-byte timeout')
+  }
+  if (aiCorrectionRecoveryPending >= MAX_AI_CORRECTION_RECOVERY_QUEUE) {
+    throw new Error('AI correction recovery queue is full')
+  }
+
+  const execute = async (): Promise<AiCorrectionRecoveryResponse> => {
+    const recoverySession = session.fromPartition('ai-correction-recovery')
+    const controller = aiCorrectionRecoveryControllers.get(request.requestId)
+    if (!controller) throw new Error('AI recovery request was cancelled before dispatch')
+    if (controller.signal.aborted) throw new Error('AI recovery request was cancelled before dispatch')
+    await recoverySession.closeAllConnections()
+    if (controller.signal.aborted) throw new Error('AI recovery request was cancelled before dispatch')
+    console.warn('[AI Correction Recovery] Dispatching through isolated network session', {
+      endpoint: `${parsed.protocol}//${parsed.host}`,
+    })
+    const absoluteTimer = setTimeout(() => controller.abort(), request.absoluteTimeoutMs)
+    let firstByteTimedOut = false
+    const firstByteTimer = setTimeout(() => {
+      firstByteTimedOut = true
+      controller.abort()
+    }, request.firstByteTimeoutMs)
+    try {
+      let response: Response
+      try {
+        response = await recoverySession.fetch(parsed.toString(), {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(request.apiKey?.trim() ? { Authorization: `Bearer ${request.apiKey.trim()}` } : {}),
+          },
+          body: request.body,
+          signal: controller.signal,
+        })
+      } catch (error) {
+        if (firstByteTimedOut) throw new Error('AI_RECOVERY_FIRST_BYTE_TIMEOUT')
+        throw error
+      } finally {
+        clearTimeout(firstByteTimer)
+      }
+      return {
+        status: response.status,
+        contentType: response.headers.get('Content-Type') || undefined,
+        retryAfter: response.headers.get('Retry-After') || undefined,
+        body: await readLimitedRecoveryResponse(response, controller, request.idleTimeoutMs),
+      }
+    } finally {
+      clearTimeout(firstByteTimer)
+      clearTimeout(absoluteTimer)
+    }
+  }
+
+  if (aiCorrectionRecoveryControllers.has(request.requestId)) throw new Error('Duplicate AI recovery request id')
+  aiCorrectionRecoveryControllers.set(request.requestId, new AbortController())
+  aiCorrectionRecoveryPending += 1
+  const result = aiCorrectionRecoveryQueue.then(execute, execute)
+  aiCorrectionRecoveryQueue = result.then(() => undefined, () => undefined)
+  try {
+    return await result
+  } finally {
+    aiCorrectionRecoveryControllers.delete(request.requestId)
+    aiCorrectionRecoveryPending = Math.max(0, aiCorrectionRecoveryPending - 1)
+  }
+})
+
+ipcMain.handle('cancel-ai-correction-recovery-fetch', (event, requestId: unknown) => {
+  assertTrustedSender(event, 'cancel-ai-correction-recovery-fetch')
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender.id !== mainWindow.webContents.id) return false
+  if (typeof requestId !== 'string') return false
+  const controller = aiCorrectionRecoveryControllers.get(requestId)
+  if (!controller) return false
+  controller.abort()
+  return true
 })
 
 registerLocalRuntimeIpc({

@@ -143,6 +143,15 @@ export interface CorrectionShardPlan {
 
 export type CorrectionShardStatus = 'pending' | 'running' | 'retrying' | 'completed' | 'failed'
 
+export type CorrectionRequestStage =
+  | 'connecting'
+  | 'waiting-response'
+  | 'thinking'
+  | 'receiving-content'
+  | 'retry-countdown'
+
+export type CorrectionTimeoutKind = 'first-byte' | 'idle' | 'absolute'
+
 export interface CorrectionShardProgress extends CorrectionShardPlan {
   status: CorrectionShardStatus
   attempt: number
@@ -151,8 +160,14 @@ export interface CorrectionShardProgress extends CorrectionShardPlan {
   patches?: ResolvedCorrectionPatch[]
   rejectedPatches?: ResolvedCorrectionPatch[]
   nextRetryAt?: number
+  stage?: CorrectionRequestStage
+  stageUpdatedAt?: number
+  lastActivityAt?: number
+  attemptLimit?: number
   errorCode?: string
   error?: string
+  timeoutKind?: CorrectionTimeoutKind
+  timeoutMs?: number
   completedAt?: number
 }
 
@@ -174,6 +189,10 @@ export interface CorrectionConfigSnapshot {
   concurrency: number
   safetyLimits: CorrectionPatchSafetyLimits
   credentialRef: 'ai-post-process'
+  credentialVersion?: number
+  identityVersion?: 1
+  configIdentity?: string
+  transport?: 'json' | 'sse'
 }
 
 export type CorrectionDraftStatus =
@@ -440,6 +459,7 @@ export interface AiPostProcessConfig {
   provider?: 'openai-compatible'
   baseUrl?: string
   apiKey?: string
+  credentialVersion?: number
   promptLanguage?: 'zh' | 'en'
 
   /** @deprecated Use defaultModel instead */

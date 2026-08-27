@@ -3,6 +3,8 @@ import { AlertCircle, Check, CheckCircle2, Loader2, Pause, Play, RotateCcw, Spel
 import type { CorrectionIssueCategory, LegacyCorrectionIssueCategory, ResolvedCorrectionPatch, TranscriptSession } from '../../types'
 import type { CorrectionDiffPart } from '../../utils/correctionPatch'
 import { resolveModelForFeature } from '../../services/aiPostProcess'
+import { isCorrectionConfigSnapshotCurrent } from '../../services/aiCorrection'
+import { safeOpenAiEndpoint } from '../../services/openAiCompatible'
 import { useSessionStore } from '../../stores/sessionStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useUIStore } from '../../stores/uiStore'
@@ -77,6 +79,16 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
   const legacy = correction?.legacy
   const mode = settings.aiPostProcess?.correctionMode || 'quick'
   const configured = Boolean(settings.aiPostProcess?.enabled && resolveModelForFeature(settings.aiPostProcess || {}, 'correction'))
+  const draftConfigCurrent = draft ? isCorrectionConfigSnapshotCurrent(draft.config, settings) : true
+  const activeShard = draft?.shards.find((shard) => shard.status === 'running' || shard.status === 'retrying')
+    || draft?.shards.find((shard) => shard.status === 'failed')
+  const endpointLabel = draft ? (() => {
+    try {
+      return new URL(safeOpenAiEndpoint(draft.config.baseUrl)).host
+    } catch {
+      return safeOpenAiEndpoint(draft.config.baseUrl)
+    }
+  })() : ''
 
   useEffect(() => {
     if (draft?.runId) {
@@ -116,6 +128,17 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
     draft?.proposedPatches.length
     && draft.proposedPatches.every((patch) => selected.has(patch.id)),
   )
+  const progressLabel = activeShard?.stage === 'connecting'
+    ? (isZh ? '正在连接纠错服务…' : 'Connecting to correction service…')
+    : activeShard?.stage === 'waiting-response'
+      ? (isZh ? '请求已提交，等待服务端响应…' : 'Request submitted; waiting for the service response…')
+    : activeShard?.stage === 'thinking'
+      ? (isZh ? '模型推理中，服务仍持续返回活动…' : 'The model is reasoning and the service remains active…')
+      : activeShard?.stage === 'receiving-content'
+        ? (isZh ? '正在接收纠错正文…' : 'Receiving correction content…')
+        : activeShard?.stage === 'retry-countdown'
+          ? (isZh ? `第 ${activeShard.index + 1} 个分片等待重试` : `Shard ${activeShard.index + 1} is waiting to retry`)
+          : (isZh ? '等待模型响应…' : 'Waiting for the model response…')
   const persistDraftEdit = async (patch: ResolvedCorrectionPatch) => {
     const replacement = draftEdits[patch.id] ?? patch.replacement
     if (replacement === patch.replacement) return
@@ -186,15 +209,18 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
         {draft && !reviewReady && (
           <section className="space-y-4 rounded-xl border border-border bg-muted/20 p-5">
             <div className="flex items-center justify-between gap-4">
-              <div><p className="text-sm font-medium">{draft.status === 'paused' ? (isZh ? '任务已暂停' : 'Task paused') : draft.status === 'failed' || draft.status === 'blocked-auth' ? (isZh ? '任务需要处理' : 'Task needs attention') : (isZh ? '正在逐片检测' : 'Detecting shard by shard')}</p><p className="mt-1 text-xs text-muted-foreground">{completedShards}/{totalShards} {isZh ? '分片完成' : 'shards completed'} · {draft.proposedPatches.length} {isZh ? '合法候选' : 'valid candidates'} · {draft.rejectedPatches.length} {isZh ? '已拒绝' : 'rejected'}</p></div>
+              <div><p className="text-sm font-medium">{draft.status === 'paused' ? (isZh ? '任务已暂停' : 'Task paused') : draft.status === 'failed' || draft.status === 'blocked-auth' ? (isZh ? '任务需要处理' : 'Task needs attention') : (isZh ? '正在逐片检测' : 'Detecting shard by shard')}</p><p className="mt-1 text-xs text-muted-foreground">{completedShards}/{totalShards} {isZh ? '分片完成' : 'shards completed'} · {draft.proposedPatches.length} {isZh ? '合法候选' : 'valid candidates'} · {draft.rejectedPatches.length} {isZh ? '已拒绝' : 'rejected'}</p><p className="mt-1 max-w-xl truncate text-xs text-muted-foreground" title={`${draft.config.baseUrl} · ${draft.config.model}`}>{endpointLabel} · {draft.config.model} · {(draft.config.transport || 'legacy').toUpperCase()}{activeShard ? ` · ${isZh ? '分片' : 'shard'} ${activeShard.index + 1}/${totalShards} · ${isZh ? '尝试' : 'attempt'} ${activeShard.attempt}${activeShard.attemptLimit ? `/${activeShard.attemptLimit}` : ''}` : ''}</p></div>
               <div className="flex gap-2">
                 {processing && <button type="button" onClick={() => void run(() => pauseSessionCorrection(session.id))} className="inline-flex h-8 items-center gap-1.5 rounded-md border border-input px-3 text-xs"><Pause className="h-3.5 w-3.5" />{isZh ? '暂停' : 'Pause'}</button>}
                 {draft.status === 'paused' && <button type="button" onClick={() => void run(() => resumeSessionCorrection(session.id))} className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs text-primary-foreground"><Play className="h-3.5 w-3.5" />{isZh ? '继续' : 'Resume'}</button>}
-                {(draft.status === 'failed' || draft.status === 'blocked-auth') && <button type="button" onClick={() => void run(() => retrySessionCorrection(session.id))} className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs text-primary-foreground"><RotateCcw className="h-3.5 w-3.5" />{isZh ? '重试失败分片' : 'Retry failed shard'}</button>}
+                {(draft.status === 'failed' || draft.status === 'blocked-auth') && <button type="button" onClick={() => void run(() => retrySessionCorrection(session.id))} className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs text-primary-foreground"><RotateCcw className="h-3.5 w-3.5" />{draftConfigCurrent ? (isZh ? '重试失败分片' : 'Retry failed shard') : (isZh ? '使用当前配置重新检测' : 'Restart with saved configuration')}</button>}
               </div>
             </div>
             <div className="h-2 overflow-hidden rounded-full bg-muted"><div className="h-full bg-primary transition-all" style={{ width: `${percent}%` }} /></div>
-            {processing && <div className="flex items-center gap-2 text-xs text-muted-foreground"><Loader2 className="h-3.5 w-3.5 animate-spin" />{isZh ? '每个成功分片都会等待持久化完成。' : 'Every successful shard is checkpointed before continuing.'}</div>}
+            {!draftConfigCurrent && <p className="rounded-md border border-amber-300 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/20 dark:text-amber-200">{isZh ? '此任务使用的模型、端点凭据或传输方式已失效。继续时将放弃旧候选，并使用当前已保存配置从第 1 个分片重新检测。' : 'This task no longer matches the saved model, endpoint credentials, or transport. Continuing will discard old candidates and restart from shard 1.'}</p>}
+            {processing && <div className="flex items-center gap-2 text-xs text-muted-foreground"><Loader2 className="h-3.5 w-3.5 animate-spin" />{progressLabel}</div>}
+            {draft.status === 'blocked-auth' && <p className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs text-destructive">{isZh ? '当前已保存的 API Key 无法访问此端点或模型。请重新保存正确的 URL、Key 和纠错模型。' : 'The saved API key cannot access this endpoint or model. Save the correct URL, key, and correction model.'}</p>}
+            {draft.errorCode === 'timeout' && activeShard && <p className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs text-destructive">{isZh ? `第 ${activeShard.index + 1}/${totalShards} 个分片${activeShard.timeoutKind ? `发生 ${activeShard.timeoutKind} 超时` : '请求超时'}${activeShard.timeoutMs ? `，等待 ${Math.round(activeShard.timeoutMs / 1000)} 秒` : ''}，已尝试 ${activeShard.attempt}${activeShard.attemptLimit ? `/${activeShard.attemptLimit}` : ''} 次。` : `Shard ${activeShard.index + 1}/${totalShards} timed out${activeShard.timeoutKind ? ` (${activeShard.timeoutKind})` : ''}${activeShard.timeoutMs ? ` after ${Math.round(activeShard.timeoutMs / 1000)}s` : ''}, attempt ${activeShard.attempt}${activeShard.attemptLimit ? `/${activeShard.attemptLimit}` : ''}.`}</p>}
             {(draft.error || error) && <p className="flex items-start gap-2 text-xs text-destructive"><AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />{error || draft.error}</p>}
           </section>
         )}

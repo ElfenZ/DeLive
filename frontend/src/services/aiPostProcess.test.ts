@@ -4,12 +4,23 @@ import {
   parseSessionMindMapResponse,
   parseSessionQaResponse,
   isAiPostProcessConfigured,
+  invalidateAiEndpointModels,
+  reconcileAiEndpointModels,
+  resolveModelForFeature,
   resolveTranscriptArtifactSourceState,
   resolveTranscriptText,
+  extractSessionQaStreamChunk,
 } from './aiPostProcess'
 import type { TranscriptSession } from '../types'
 
 describe('aiPostProcess', () => {
+  it('ignores non-JSON SSE data frames but surfaces JSON error envelopes', () => {
+    expect(extractSessionQaStreamChunk('ping')).toBeUndefined()
+    expect(extractSessionQaStreamChunk('{"choices":[{"delta":{"content":"hello"}}]}')).toBe('hello')
+    expect(() => extractSessionQaStreamChunk('{"error":{"message":"invalid token"}}'))
+      .toThrow('invalid token')
+  })
+
   it('parses plain json responses', () => {
     const result = parseAiBriefingResponse(JSON.stringify({
       titleSuggestion: 'Weekly Sync',
@@ -90,6 +101,60 @@ describe('aiPostProcess', () => {
         modelAssignment: { briefing: 'qwen-briefing' },
       },
     })).toBe(true)
+  })
+
+  it('invalidates all endpoint-derived model state when the base URL changes', () => {
+    expect(invalidateAiEndpointModels()).toEqual({
+      availableModels: [],
+      selectedModels: [],
+      defaultModel: '',
+      model: '',
+      modelAssignment: {},
+    })
+  })
+
+  it('reconciles selections and feature assignments against a refreshed model list', () => {
+    expect(reconcileAiEndpointModels({
+      selectedModels: ['old-model', 'shared-model'],
+      defaultModel: 'old-model',
+      model: 'legacy-model',
+      modelAssignment: {
+        correction: 'old-model',
+        briefing: 'shared-model',
+      },
+    }, ['shared-model', 'new-model'])).toEqual({
+      availableModels: ['shared-model', 'new-model'],
+      selectedModels: ['shared-model'],
+      defaultModel: 'shared-model',
+      model: '',
+      modelAssignment: { briefing: 'shared-model' },
+    })
+  })
+
+  it('selects a safe default when no previous model exists on the refreshed endpoint', () => {
+    expect(reconcileAiEndpointModels({
+      selectedModels: ['old-model'],
+      defaultModel: 'old-model',
+      modelAssignment: { correction: 'old-model' },
+    }, ['new-a', 'new-b'])).toMatchObject({
+      selectedModels: ['new-a'],
+      defaultModel: 'new-a',
+      modelAssignment: {},
+    })
+  })
+
+  it('does not resolve stale assigned models when a current model list is known', () => {
+    expect(resolveModelForFeature({
+      availableModels: ['new-model'],
+      modelAssignment: { correction: 'old-model' },
+      defaultModel: 'new-model',
+    }, 'correction')).toBe('new-model')
+
+    expect(resolveModelForFeature({
+      availableModels: ['new-model'],
+      modelAssignment: { correction: 'old-model' },
+      defaultModel: 'also-old',
+    }, 'correction')).toBe('')
   })
 
   it('parses session qa responses with citations', () => {

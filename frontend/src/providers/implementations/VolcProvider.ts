@@ -109,6 +109,7 @@ export class VolcProvider extends BaseASRProvider {
   private ws: WebSocket | null = null
   private wsReady = false
   private realtimeState: VolcRealtimeState = createVolcRealtimeState()
+  private closeExpected = false
 
   async connect(config: ProviderConfig): Promise<void> {
     const appKey = config.appKey as string
@@ -122,6 +123,7 @@ export class VolcProvider extends BaseASRProvider {
     this._config = config
     this.setState('connecting')
     this.wsReady = false
+    this.closeExpected = false
     this.realtimeState = createVolcRealtimeState(Boolean(config.enableSpeakerDiarization))
 
     const params = buildVolcProxySearchParams(config)
@@ -217,6 +219,12 @@ export class VolcProvider extends BaseASRProvider {
             const message = event.reason || '连接在火山引擎就绪前关闭'
             this.emitError(this.createError('CONNECTION_CLOSED', message))
             rejectConnect(new Error(message))
+          } else if (connectSettled && !failureEmitted && !this.closeExpected) {
+            failureEmitted = true
+            this.emitError(this.createError(
+              'CONNECTION_CLOSED',
+              event.reason || `WebSocket 连接意外关闭 (${event.code})`,
+            ))
           }
           if (this.ws === ws) this.ws = null
           this.wsReady = false
@@ -234,6 +242,7 @@ export class VolcProvider extends BaseASRProvider {
 
   async disconnect(): Promise<void> {
     console.log('[VolcProvider] 断开连接...')
+    this.closeExpected = true
     
     if (this.ws && this.wsReady) {
       // 发送音频结束标记

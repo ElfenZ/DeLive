@@ -3,8 +3,10 @@ import type {
   AiPostProcessConfig,
   AppSettings,
   CorrectionConfigSnapshot,
+  CorrectionRequestStage,
   CorrectionShardPlan,
   CorrectionStructuredOutputMode,
+  CorrectionTimeoutKind,
   MeetingContextSnapshot,
   ModelCorrectionPatch,
   TranscriptSession,
@@ -16,15 +18,25 @@ import {
   parseModelCorrectionResponse,
 } from '../utils/correctionPatch'
 import { resolveModelForFeature } from './aiPostProcess'
-import { SAFE_STORAGE_PLACEHOLDER } from '../utils/secretStorage'
 import { normalizeGlossaryEntries, resolveMeetingContextSnapshot } from '../utils/meetingContext'
+import {
+  createOpenAiRequestContext,
+  extractOpenAiErrorEnvelope,
+  extractOpenAiMessageContent,
+  isOpenAiAuthError,
+  normalizeOpenAiBaseUrl,
+  safeOpenAiEndpoint,
+} from './openAiCompatible'
 
 const DEFAULT_AI_BASE_URL = 'http://127.0.0.1:11434/v1'
 const DEFAULT_PROMPT_LANGUAGE: NonNullable<AiPostProcessConfig['promptLanguage']> = 'zh'
 const CORRECTION_PROMPT_VERSION = 'patch-v2-context'
 const CORRECTION_SCHEMA_VERSION = '2'
-const DEFAULT_TIMEOUT_MS = 120_000
+const DEFAULT_FIRST_BYTE_TIMEOUT_MS = 120_000
+const DEFAULT_IDLE_TIMEOUT_MS = 60_000
+const DEFAULT_ABSOLUTE_TIMEOUT_MS = 10 * 60_000
 const DEFAULT_MAX_ATTEMPTS = 3
+const MAX_CORRECTION_RESPONSE_BYTES = 5 * 1024 * 1024
 export const MAX_CORRECTION_REFERENCE_CHARACTERS = 16_000
 
 export type CorrectionRequestErrorCode =
@@ -38,28 +50,23 @@ export type CorrectionRequestErrorCode =
   | 'parse'
 
 export class CorrectionRequestError extends Error {
+  public readonly timeoutKind?: CorrectionTimeoutKind
+  public readonly timeoutMs?: number
+  public readonly attempt?: number
+
   constructor(
     message: string,
     public readonly code: CorrectionRequestErrorCode,
     public readonly retryable: boolean,
     public readonly status?: number,
     public readonly retryAfterMs?: number,
+    details?: { timeoutKind?: CorrectionTimeoutKind; timeoutMs?: number; attempt?: number },
   ) {
     super(message)
     this.name = 'CorrectionRequestError'
-  }
-}
-
-interface ChatCompletionResponse {
-  choices?: Array<{
-    message?: {
-      content?: string | Array<{ type?: string; text?: string }>
-    }
-  }>
-  usage?: {
-    prompt_tokens?: number
-    completion_tokens?: number
-    total_tokens?: number
+    this.timeoutKind = details?.timeoutKind
+    this.timeoutMs = details?.timeoutMs
+    this.attempt = details?.attempt
   }
 }
 
@@ -76,7 +83,21 @@ export interface CorrectionShardRequest {
   apiKey?: string
   signal?: AbortSignal
   timeoutMs?: number
+  timeouts?: Partial<{
+    firstByteMs: number
+    idleMs: number
+    absoluteMs: number
+  }>
   maxAttempts?: number
+  onProgress?: (progress: CorrectionRequestProgress) => void | Promise<void>
+}
+
+export interface CorrectionRequestProgress {
+  stage: CorrectionRequestStage
+  attempt: number
+  maxAttempts: number
+  at: number
+  nextRetryAt?: number
 }
 
 export interface CorrectionShardResponse {
@@ -128,7 +149,7 @@ export function createCorrectionConfigSnapshot(
   meetingContext?: MeetingContextSnapshot,
 ): CorrectionConfigSnapshot {
   const config = getAiConfig(settings)
-  const baseUrl = config.baseUrl?.trim().replace(/\/+$/, '') || DEFAULT_AI_BASE_URL
+  const baseUrl = normalizeOpenAiBaseUrl(config.baseUrl || '', DEFAULT_AI_BASE_URL)
   const model = resolveModelForFeature(config, 'correction')
   if (!config.enabled) throw new Error('请先在设置中启用 AI 后处理')
   if (!model) throw new Error('请先配置 AI 纠错模型')
@@ -139,6 +160,16 @@ export function createCorrectionConfigSnapshot(
     config.glossary,
   )
   const useContext = context.useForAiCorrection
+  const transport = config.enableStreaming === false ? 'json' : 'sse'
+  const credentialVersion = Math.max(1, config.credentialVersion || 1)
+  const configIdentity = JSON.stringify({
+    identityVersion: 1,
+    baseUrl,
+    model,
+    credentialVersion,
+    transport,
+    structuredOutput: config.correctionStructuredOutput || 'prompt-json',
+  })
   return {
     model,
     baseUrl,
@@ -158,6 +189,24 @@ export function createCorrectionConfigSnapshot(
       ...(advanced?.safetyLimits || {}),
     },
     credentialRef: 'ai-post-process',
+    credentialVersion,
+    identityVersion: 1,
+    configIdentity,
+    transport,
+  }
+}
+
+export function isCorrectionConfigSnapshotCurrent(
+  snapshot: CorrectionConfigSnapshot,
+  settings: AppSettings,
+): boolean {
+  if (!snapshot.configIdentity || snapshot.identityVersion !== 1 || !snapshot.transport || !snapshot.credentialVersion) {
+    return false
+  }
+  try {
+    return snapshot.configIdentity === createCorrectionConfigSnapshot(settings).configIdentity
+  } catch {
+    return false
   }
 }
 
@@ -293,22 +342,13 @@ export function buildCorrectionRequestBody(request: CorrectionShardRequest): Rec
   return {
     model: request.snapshot.model,
     temperature: request.snapshot.temperature,
-    stream: false,
+    stream: request.snapshot.transport === 'sse',
     messages: [
       { role: 'system', content: buildSystemPrompt(request.snapshot.promptLanguage) },
       { role: 'user', content: buildUserPrompt(request) },
     ],
     ...(format ? { response_format: format } : {}),
   }
-}
-
-function extractTextContent(payload: ChatCompletionResponse): string {
-  const content = payload.choices?.[0]?.message?.content
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) {
-    return content.map((part) => part?.type === 'text' && typeof part.text === 'string' ? part.text : '').join('\n')
-  }
-  return ''
 }
 
 function parseRetryAfter(value: string | null): number | undefined {
@@ -328,6 +368,17 @@ function classifyHttpError(status: number, message: string, retryAfter?: number)
   return new CorrectionRequestError(message, 'protocol', false, status)
 }
 
+function classifyPayloadError(payload: unknown, status?: number): CorrectionRequestError | undefined {
+  const envelope = extractOpenAiErrorEnvelope(payload)
+  if (!envelope) return undefined
+  if (isOpenAiAuthError(envelope)) return new CorrectionRequestError(envelope.message, 'auth', false, status)
+  const type = `${envelope.type || ''} ${envelope.code || ''}`.toLowerCase()
+  if (/rate|quota/.test(type)) return new CorrectionRequestError(envelope.message, 'rate-limit', true, status)
+  if (/timeout/.test(type)) return new CorrectionRequestError(envelope.message, 'timeout', true, status)
+  if (/server|internal|overload|unavailable/.test(type)) return new CorrectionRequestError(envelope.message, 'server', true, status)
+  return new CorrectionRequestError(envelope.message, 'protocol', false, status)
+}
+
 function asRequestError(error: unknown, timedOut: boolean, externallyAborted: boolean): CorrectionRequestError {
   if (error instanceof CorrectionRequestError) return error
   if (externallyAborted) return new CorrectionRequestError('Correction request was aborted', 'aborted', false)
@@ -345,64 +396,424 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
-async function requestOnce(request: CorrectionShardRequest): Promise<Omit<CorrectionShardResponse, 'attempt'>> {
+function timeoutError(kind: CorrectionTimeoutKind, timeoutMs: number, attempt: number): CorrectionRequestError {
+  const label = kind === 'first-byte' ? 'waiting for the first response byte'
+    : kind === 'idle' ? 'waiting for response activity' : 'reaching the absolute time limit'
+  return new CorrectionRequestError(
+    `Correction request timed out while ${label} (${Math.round(timeoutMs / 1_000)}s)`,
+    'timeout',
+    true,
+    undefined,
+    undefined,
+    { timeoutKind: kind, timeoutMs, attempt },
+  )
+}
+
+function emitProgress(
+  request: CorrectionShardRequest,
+  stage: CorrectionRequestStage,
+  attempt: number,
+  maxAttempts: number,
+  nextRetryAt?: number,
+): void {
+  void request.onProgress?.({ stage, attempt, maxAttempts, at: Date.now(), nextRetryAt })
+}
+
+async function readResponseChunks(
+  response: Response,
+  request: CorrectionShardRequest,
+  controller: AbortController,
+  attempt: number,
+  maxAttempts: number,
+  idleMs: number,
+  onChunk: (chunk: string) => void,
+): Promise<void> {
+  const reader = response.body?.getReader()
+  if (!reader) {
+    const fallbackText = await response.text()
+    const bytes = new TextEncoder().encode(fallbackText)
+    if (bytes.byteLength > MAX_CORRECTION_RESPONSE_BYTES) {
+      throw new CorrectionRequestError('Correction response exceeded the 5 MB safety limit', 'protocol', false)
+    }
+    onChunk(fallbackText)
+    return
+  }
+  const decoder = new TextDecoder()
+  let totalBytes = 0
+  try {
+    while (true) {
+      let idleTimer: ReturnType<typeof setTimeout> | undefined
+      const idle = new Promise<never>((_, reject) => {
+        idleTimer = setTimeout(() => {
+          controller.abort()
+          reject(timeoutError('idle', idleMs, attempt))
+        }, idleMs)
+      })
+      let result: ReadableStreamReadResult<Uint8Array>
+      try {
+        result = await Promise.race([reader.read(), idle])
+      } finally {
+        if (idleTimer) clearTimeout(idleTimer)
+      }
+      const { done, value } = result
+      if (done) break
+      totalBytes += value.byteLength
+      if (totalBytes > MAX_CORRECTION_RESPONSE_BYTES) {
+        controller.abort()
+        throw new CorrectionRequestError('Correction response exceeded the 5 MB safety limit', 'protocol', false)
+      }
+      const chunk = decoder.decode(value, { stream: true })
+      onChunk(chunk)
+      if (/reasoning_content|thinking/i.test(chunk)) {
+        emitProgress(request, 'thinking', attempt, maxAttempts)
+      }
+      if (/"content"\s*:/.test(chunk)) {
+        emitProgress(request, 'receiving-content', attempt, maxAttempts)
+      }
+    }
+    const tail = decoder.decode()
+    if (tail) onChunk(tail)
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+async function readResponseText(
+  response: Response,
+  request: CorrectionShardRequest,
+  controller: AbortController,
+  attempt: number,
+  maxAttempts: number,
+  idleMs: number,
+): Promise<string> {
+  let text = ''
+  await readResponseChunks(response, request, controller, attempt, maxAttempts, idleMs, (chunk) => {
+    text += chunk
+  })
+  return text
+}
+
+interface ParsedCorrectionCompletion {
+  content: string
+  usage?: CorrectionUsage
+}
+
+function applySseData(completion: ParsedCorrectionCompletion, data: string): void {
+  if (!data || data === '[DONE]') return
+  let payload: unknown
+  try {
+    payload = JSON.parse(data)
+  } catch {
+    throw new CorrectionRequestError('Malformed SSE event from correction service', 'protocol', false)
+  }
+  const payloadError = classifyPayloadError(payload)
+  if (payloadError) throw payloadError
+  const record = payload && typeof payload === 'object' ? payload as Record<string, unknown> : undefined
+  const choices = Array.isArray(record?.choices) ? record.choices : []
+  for (const choice of choices) {
+    if (!choice || typeof choice !== 'object') continue
+    const delta = (choice as { delta?: unknown }).delta
+    if (!delta || typeof delta !== 'object') continue
+    const visible = (delta as { content?: unknown }).content
+    if (typeof visible === 'string') completion.content += visible
+  }
+  const rawUsage = record?.usage
+  if (rawUsage && typeof rawUsage === 'object') {
+    const item = rawUsage as Record<string, unknown>
+    completion.usage = {
+      promptTokens: typeof item.prompt_tokens === 'number' ? item.prompt_tokens : undefined,
+      completionTokens: typeof item.completion_tokens === 'number' ? item.completion_tokens : undefined,
+      totalTokens: typeof item.total_tokens === 'number' ? item.total_tokens : undefined,
+    }
+  }
+}
+
+function assertCompletionContent(completion: ParsedCorrectionCompletion): ParsedCorrectionCompletion {
+  if (!completion.content.trim()) {
+    throw new CorrectionRequestError('Correction response contained no visible content', 'protocol', false)
+  }
+  return completion
+}
+
+function parseSseCompletion(text: string): ParsedCorrectionCompletion {
+  const completion: ParsedCorrectionCompletion = { content: '' }
+  const normalized = text.replace(/\r\n/g, '\n')
+  const events = normalized.split(/\n\n+/)
+  for (const event of events) {
+    const data = event.split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).trim())
+      .join('\n')
+    applySseData(completion, data)
+  }
+  return assertCompletionContent(completion)
+}
+
+async function readSseCompletion(
+  response: Response,
+  request: CorrectionShardRequest,
+  controller: AbortController,
+  attempt: number,
+  maxAttempts: number,
+  idleMs: number,
+): Promise<ParsedCorrectionCompletion> {
+  const completion: ParsedCorrectionCompletion = { content: '' }
+  let lineBuffer = ''
+  let dataLines: string[] = []
+  const flushEvent = () => {
+    if (dataLines.length === 0) return
+    applySseData(completion, dataLines.join('\n'))
+    dataLines = []
+  }
+  const consume = (chunk: string) => {
+    lineBuffer += chunk
+    let lineEnd = lineBuffer.indexOf('\n')
+    while (lineEnd >= 0) {
+      const line = lineBuffer.slice(0, lineEnd).replace(/\r$/, '')
+      lineBuffer = lineBuffer.slice(lineEnd + 1)
+      if (!line) {
+        flushEvent()
+      } else if (line.startsWith('data:')) {
+        dataLines.push(line.slice(5).trim())
+      }
+      lineEnd = lineBuffer.indexOf('\n')
+    }
+  }
+
+  await readResponseChunks(response, request, controller, attempt, maxAttempts, idleMs, consume)
+  if (lineBuffer) consume('\n')
+  flushEvent()
+  return assertCompletionContent(completion)
+}
+
+function parseJsonCompletion(text: string): { content: string; usage?: CorrectionUsage } {
+  let payload: unknown
+  try {
+    payload = JSON.parse(text)
+  } catch {
+    throw new CorrectionRequestError('Correction service returned invalid JSON', 'protocol', false)
+  }
+  const payloadError = classifyPayloadError(payload)
+  if (payloadError) throw payloadError
+  const content = extractOpenAiMessageContent(payload)
+  if (!content.trim()) throw new CorrectionRequestError('Correction response contained no visible content', 'protocol', false)
+  const rawUsage = payload && typeof payload === 'object' ? (payload as { usage?: unknown }).usage : undefined
+  const item = rawUsage && typeof rawUsage === 'object' ? rawUsage as Record<string, unknown> : undefined
+  return {
+    content,
+    usage: item ? {
+      promptTokens: typeof item.prompt_tokens === 'number' ? item.prompt_tokens : undefined,
+      completionTokens: typeof item.completion_tokens === 'number' ? item.completion_tokens : undefined,
+      totalTokens: typeof item.total_tokens === 'number' ? item.total_tokens : undefined,
+    } : undefined,
+  }
+}
+
+function buildCorrectionShardResponseFromCompletion(
+  completion: ParsedCorrectionCompletion,
+): Omit<CorrectionShardResponse, 'attempt'> {
+  try {
+    return {
+      patches: parseModelCorrectionResponse(completion.content),
+      usage: completion.usage,
+    }
+  } catch (error) {
+    throw new CorrectionRequestError(error instanceof Error ? error.message : String(error), 'parse', false)
+  }
+}
+
+function buildCorrectionShardResponse(text: string, contentType: string): Omit<CorrectionShardResponse, 'attempt'> {
+  const completion = contentType.toLowerCase().includes('text/event-stream') || /^\s*data:/m.test(text)
+    ? parseSseCompletion(text)
+    : parseJsonCompletion(text)
+  return buildCorrectionShardResponseFromCompletion(completion)
+}
+
+async function requestOnceViaRecoverySession(
+  request: CorrectionShardRequest,
+  attempt: number,
+  maxAttempts: number,
+): Promise<Omit<CorrectionShardResponse, 'attempt'>> {
+  const recoveryFetch = typeof window !== 'undefined' ? window.electronAPI?.aiCorrectionRecoveryFetch : undefined
+  if (!recoveryFetch) throw new CorrectionRequestError('Isolated recovery transport is unavailable', 'network', true)
+  const context = createOpenAiRequestContext(request.snapshot.baseUrl, request.apiKey)
+  const firstByteMs = request.timeouts?.firstByteMs ?? request.timeoutMs ?? DEFAULT_FIRST_BYTE_TIMEOUT_MS
+  const idleMs = request.timeouts?.idleMs ?? request.timeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS
+  const absoluteMs = request.timeouts?.absoluteMs ?? Math.max(request.timeoutMs ?? 0, DEFAULT_ABSOLUTE_TIMEOUT_MS)
+  const requestId = globalThis.crypto?.randomUUID?.() || `recovery-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  emitProgress(request, 'connecting', attempt, maxAttempts)
+  console.warn('[AI Correction] Retrying through isolated Electron network session', {
+    endpoint: context.endpoint,
+    model: request.snapshot.model,
+    transport: request.snapshot.transport || 'legacy',
+    shard: request.shard.index + 1,
+    attempt,
+  })
+  emitProgress(request, 'waiting-response', attempt, maxAttempts)
+  let absoluteTimer: ReturnType<typeof setTimeout> | undefined
+  const cancelRecovery = () => window.electronAPI?.cancelAiCorrectionRecoveryFetch?.(requestId).catch(() => false)
+  let rejectAborted: ((reason: CorrectionRequestError) => void) | undefined
+  const abort = () => {
+    void cancelRecovery()
+    rejectAborted?.(new CorrectionRequestError('Correction request was aborted', 'aborted', false))
+  }
+  try {
+    const transport = recoveryFetch({
+      requestId,
+      url: context.completionUrl,
+      apiKey: context.headers.Authorization?.slice('Bearer '.length),
+      body: JSON.stringify(buildCorrectionRequestBody(request)),
+      firstByteTimeoutMs: firstByteMs,
+      idleTimeoutMs: idleMs,
+      absoluteTimeoutMs: absoluteMs,
+    })
+    const timeout = new Promise<never>((_, reject) => {
+      absoluteTimer = setTimeout(() => {
+        void cancelRecovery()
+        reject(timeoutError('absolute', absoluteMs, attempt))
+      }, absoluteMs)
+    })
+    const aborted = new Promise<never>((_, reject) => {
+      rejectAborted = reject
+      if (request.signal?.aborted) {
+        abort()
+        return
+      }
+      request.signal?.addEventListener('abort', abort, { once: true })
+    })
+    const response = await Promise.race([transport, timeout, aborted])
+    if (response.status < 200 || response.status >= 300) {
+      let safeMessage = response.body.slice(0, 500) || `AI request failed: HTTP ${response.status}`
+      try {
+        const envelope = extractOpenAiErrorEnvelope(JSON.parse(response.body))
+        if (envelope) safeMessage = envelope.message
+      } catch {
+        // Plain-text error bodies remain useful diagnostics.
+      }
+      throw classifyHttpError(response.status, safeMessage, parseRetryAfter(response.retryAfter || null))
+    }
+    return buildCorrectionShardResponse(response.body, response.contentType || '')
+  } catch (error) {
+    if (error instanceof CorrectionRequestError) throw error
+    if (request.signal?.aborted) throw new CorrectionRequestError('Correction request was aborted', 'aborted', false)
+    const message = error instanceof Error ? error.message : String(error)
+    if (message.includes('AI_RECOVERY_FIRST_BYTE_TIMEOUT')) throw timeoutError('first-byte', firstByteMs, attempt)
+    if (message.includes('AI_RECOVERY_IDLE_TIMEOUT')) throw timeoutError('idle', idleMs, attempt)
+    if (message.includes('AI_RECOVERY_RESPONSE_TOO_LARGE')) {
+      throw new CorrectionRequestError('Correction response exceeded the 5 MB safety limit', 'protocol', false)
+    }
+    throw asRequestError(error, false, false)
+  } finally {
+    if (absoluteTimer) clearTimeout(absoluteTimer)
+    request.signal?.removeEventListener('abort', abort)
+  }
+}
+
+async function requestOnce(
+  request: CorrectionShardRequest,
+  attempt: number,
+  maxAttempts: number,
+): Promise<Omit<CorrectionShardResponse, 'attempt'>> {
   const controller = new AbortController()
-  let timedOut = false
-  const timeout = setTimeout(() => {
-    timedOut = true
+  const firstByteMs = request.timeouts?.firstByteMs ?? request.timeoutMs ?? DEFAULT_FIRST_BYTE_TIMEOUT_MS
+  const idleMs = request.timeouts?.idleMs ?? request.timeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS
+  const absoluteMs = request.timeouts?.absoluteMs ?? Math.max(request.timeoutMs ?? 0, DEFAULT_ABSOLUTE_TIMEOUT_MS)
+  let timeoutKind: CorrectionTimeoutKind | undefined
+  const absoluteTimeout = setTimeout(() => {
+    timeoutKind = 'absolute'
     controller.abort()
-  }, request.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+  }, absoluteMs)
+  let firstByteTimer: ReturnType<typeof setTimeout> | undefined
   const abort = () => controller.abort()
   request.signal?.addEventListener('abort', abort, { once: true })
   try {
-    const response = await fetch(`${request.snapshot.baseUrl}/chat/completions`, {
+    emitProgress(request, 'connecting', attempt, maxAttempts)
+    const context = createOpenAiRequestContext(request.snapshot.baseUrl, request.apiKey)
+    const firstByteTimeout = new Promise<never>((_, reject) => {
+      firstByteTimer = setTimeout(() => {
+        timeoutKind = 'first-byte'
+        controller.abort()
+        reject(timeoutError('first-byte', firstByteMs, attempt))
+      }, firstByteMs)
+    })
+    console.info('[AI Correction] Request dispatch', {
+      endpoint: context.endpoint,
+      model: request.snapshot.model,
+      transport: request.snapshot.transport || 'legacy',
+      shard: request.shard.index + 1,
+      attempt,
+    })
+    const fetchRequest = fetch(context.completionUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(request.apiKey?.trim() && request.apiKey !== SAFE_STORAGE_PLACEHOLDER
-          ? { Authorization: `Bearer ${request.apiKey.trim()}` }
-          : {}),
-      },
+      headers: context.headers,
       body: JSON.stringify(buildCorrectionRequestBody(request)),
       signal: controller.signal,
     })
+    emitProgress(request, 'waiting-response', attempt, maxAttempts)
+    const response = await Promise.race([fetchRequest, firstByteTimeout])
+    if (firstByteTimer) clearTimeout(firstByteTimer)
+    console.info('[AI Correction] Response headers received', {
+      endpoint: context.endpoint,
+      model: request.snapshot.model,
+      shard: request.shard.index + 1,
+      attempt,
+      status: response.status,
+    })
     if (!response.ok) {
-      const text = await response.text().catch(() => '')
-      const safeMessage = text.slice(0, 500) || `AI request failed: HTTP ${response.status}`
+      const text = await readResponseText(response, request, controller, attempt, maxAttempts, idleMs).catch((error) => {
+        if (error instanceof CorrectionRequestError) throw error
+        return ''
+      })
+      let safeMessage = text.slice(0, 500) || `AI request failed: HTTP ${response.status}`
+      try {
+        const envelope = extractOpenAiErrorEnvelope(JSON.parse(text))
+        if (envelope) safeMessage = envelope.message
+      } catch {
+        // Plain-text error bodies remain useful diagnostics.
+      }
       throw classifyHttpError(response.status, safeMessage, parseRetryAfter(response.headers?.get('Retry-After') ?? null))
     }
-    const payload = await response.json() as ChatCompletionResponse
-    let patches: ModelCorrectionPatch[]
-    try {
-      patches = parseModelCorrectionResponse(extractTextContent(payload))
-    } catch (error) {
-      throw new CorrectionRequestError(error instanceof Error ? error.message : String(error), 'parse', false)
+    const contentType = response.headers?.get('Content-Type') || ''
+    if (contentType.toLowerCase().includes('text/event-stream')) {
+      const completion = await readSseCompletion(response, request, controller, attempt, maxAttempts, idleMs)
+      return buildCorrectionShardResponseFromCompletion(completion)
     }
-    return {
-      patches,
-      usage: payload.usage ? {
-        promptTokens: payload.usage.prompt_tokens,
-        completionTokens: payload.usage.completion_tokens,
-        totalTokens: payload.usage.total_tokens,
-      } : undefined,
-    }
+    const text = await readResponseText(response, request, controller, attempt, maxAttempts, idleMs)
+    return buildCorrectionShardResponse(text, contentType)
   } catch (error) {
-    throw asRequestError(error, timedOut, request.signal?.aborted === true)
+    if (error instanceof CorrectionRequestError) throw error
+    if (request.signal?.aborted) throw new CorrectionRequestError('Correction request was aborted', 'aborted', false)
+    if (timeoutKind) {
+      throw timeoutError(timeoutKind, timeoutKind === 'absolute' ? absoluteMs : firstByteMs, attempt)
+    }
+    throw asRequestError(error, false, false)
   } finally {
-    clearTimeout(timeout)
+    if (firstByteTimer) clearTimeout(firstByteTimer)
+    clearTimeout(absoluteTimeout)
     request.signal?.removeEventListener('abort', abort)
   }
 }
 
 async function requestCorrectionShardWithRetries(request: CorrectionShardRequest): Promise<CorrectionShardResponse> {
   const maxAttempts = Math.max(1, request.maxAttempts ?? DEFAULT_MAX_ATTEMPTS)
+  let useRecoverySession = false
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      return { ...(await requestOnce(request)), attempt }
+      const response = useRecoverySession
+        ? await requestOnceViaRecoverySession(request, attempt, maxAttempts)
+        : await requestOnce(request, attempt, maxAttempts)
+      return { ...response, attempt }
     } catch (error) {
       const typed = asRequestError(error, false, request.signal?.aborted === true)
-      if (!typed.retryable || attempt === maxAttempts) throw typed
+      const timeoutAttemptLimit = request.shard.index === 0 ? Math.min(maxAttempts, 2) : 1
+      const attemptLimit = typed.code === 'timeout' ? timeoutAttemptLimit : maxAttempts
+      if (!typed.retryable || attempt === attemptLimit) throw typed
+      useRecoverySession = typed.timeoutKind === 'first-byte'
+        && typeof window !== 'undefined'
+        && Boolean(window.electronAPI?.aiCorrectionRecoveryFetch)
       const delay = typed.retryAfterMs ?? Math.min(1_000 * 2 ** (attempt - 1), 8_000)
+      emitProgress(request, 'retry-countdown', attempt + 1, attemptLimit, Date.now() + delay)
       await sleep(delay, request.signal)
     }
   }
@@ -486,6 +897,36 @@ export function requestCorrectionShard(request: CorrectionShardRequest): Promise
 function assertSession(session: TranscriptSession, settings: AppSettings): CorrectionConfigSnapshot {
   if (!session.transcript) throw new Error('当前会话没有可用于纠错的转录内容')
   return createCorrectionConfigSnapshot(settings, session.meetingContext)
+}
+
+export async function testCorrectionConnection(
+  config: AiPostProcessConfig,
+  meetingContext?: AppSettings['meetingContext'],
+): Promise<{ endpoint: string; model: string; transport: 'json' | 'sse' }> {
+  const settings: AppSettings = {
+    apiKey: '',
+    languageHints: [],
+    aiPostProcess: { ...config, enabled: true },
+    meetingContext,
+  }
+  const snapshot = createCorrectionConfigSnapshot(settings)
+  const transcript = snapshot.promptLanguage === 'zh' ? '连接测试。' : 'Connection test.'
+  await requestCorrectionShard({
+    transcript,
+    shard: {
+      id: 'connection-test',
+      index: 0,
+      coreStart: 0,
+      coreEnd: transcript.length,
+      contextStart: 0,
+      contextEnd: transcript.length,
+    },
+    snapshot,
+    apiKey: config.apiKey,
+    maxAttempts: 1,
+    timeouts: { firstByteMs: 120_000, idleMs: 60_000, absoluteMs: 5 * 60_000 },
+  })
+  return { endpoint: safeOpenAiEndpoint(snapshot.baseUrl), model: snapshot.model, transport: snapshot.transport || 'json' }
 }
 
 export interface DetectResult {

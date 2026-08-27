@@ -1,6 +1,6 @@
 {
   "name": "delive",
-  "version": "2.5.6",
+  "version": "2.5.10",
   "description": "DeLive",
   "private": true,
   "main": "dist-electron/electron/main.js",

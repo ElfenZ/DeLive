@@ -218,6 +218,38 @@ describe('sessionSchema', () => {
     expect(normalized.correction?.status).toBe('error')
   })
 
+  it('preserves legacy correction drafts as unverified and round-trips new transport progress fields', () => {
+    const normalized = normalizeTranscriptSession({
+      id: 'legacy-valid-draft', title: 'Legacy draft', date: '2026-08-27', time: '10:00',
+      createdAt: 1, updatedAt: 2, transcript: 'content',
+      correction: {
+        status: 'detecting', mode: 'review',
+        draft: {
+          runId: 'run', revision: 1, trigger: 'manual-review', mode: 'review', status: 'queued',
+          baseTranscriptHash: 'hash', requestedAt: 1, updatedAt: 2,
+          config: {
+            model: 'm', baseUrl: 'http://localhost/v1', promptLanguage: 'zh', promptVersion: 'patch-v1', schemaVersion: '1',
+            structuredOutput: 'prompt-json', temperature: 0.1, glossary: [], background: '', correctionGuidance: '', chunkSize: 4000, contextSize: 500,
+            concurrency: 1, safetyLimits: { maxPatchTextLength: 1000, maxPatchesPerShard: 100, maxCumulativeEditRatio: 0.2, maxNetLengthChangeRatio: 0.1 },
+            credentialRef: 'ai-post-process',
+          },
+          shards: [{
+            id: 'shard-1', index: 0, coreStart: 0, coreEnd: 7, contextStart: 0, contextEnd: 7,
+            status: 'retrying', attempt: 2, draftRevision: 1, stage: 'retry-countdown', nextRetryAt: 100,
+            timeoutKind: 'idle', timeoutMs: 60_000,
+          }],
+          proposedPatches: [], rejectedPatches: [],
+        },
+      },
+    })
+    expect(normalized.correction?.draft?.config.configIdentity).toBeUndefined()
+    expect(normalized.correction?.draft?.config.transport).toBeUndefined()
+    expect(normalized.correction?.draft?.shards[0]).toMatchObject({
+      stage: 'retry-countdown', nextRetryAt: 100, timeoutKind: 'idle', timeoutMs: 60_000,
+    })
+    expect(normalizeTranscriptSession(normalized)).toEqual(normalized)
+  })
+
   it('round-trips valid automatic workflow state without creating it for old sessions', () => {
     const normalized = normalizeTranscriptSession({
       id: 'workflow-session', title: 'Workflow', date: '2026-07-18', time: '10:00',

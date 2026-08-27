@@ -1,5 +1,6 @@
 import { AudioProcessor } from '../utils/audioProcessor'
 import type { ASRAudioProfileCapabilities, ASRProviderCapabilities } from '../types/asr'
+import { recordRuntimeDiagnostic } from '../utils/runtimeDiagnostics'
 
 export interface CaptureCallbacks {
   onAudioData: (data: Blob | ArrayBuffer) => void
@@ -13,9 +14,18 @@ export interface CaptureAudioOptions {
   onMicrophoneUnavailable?: (reason: 'microphone-unavailable' | 'audio-context-unavailable') => void
 }
 
+export interface CaptureHealthSnapshot {
+  pipelineStartedAt: number
+  lastDeliveredAudioAt: number
+  deliveredAudioChunks: number
+  recorderState: RecordingState | null
+  hasAudioProcessor: boolean
+}
+
 type CapturePipelineCapabilities = Pick<ASRProviderCapabilities, 'audioInputMode' | 'audioProfile'>
 
 const RECORDER_STOP_TIMEOUT_MS = 2_000
+const CAPTURE_DIAGNOSTIC_INTERVAL_MS = 30_000
 
 function resolvePreferredMimeTypes(profile?: ASRAudioProfileCapabilities): string[] {
   if (profile?.payloadFormat === 'wav') {
@@ -66,6 +76,11 @@ export class CaptureManager {
   private sourceInvalid = false
   private pausePromise: Promise<void> | null = null
   private deviceChangeTimer: ReturnType<typeof setTimeout> | null = null
+  private deliveredAudioChunks = 0
+  private deliveredAudioBytes = 0
+  private lastDeliveredAudioAt = 0
+  private lastCaptureDiagnosticAt = 0
+  private pipelineStartedAt = 0
 
   async start(
     capabilities: CapturePipelineCapabilities,
@@ -170,12 +185,18 @@ export class CaptureManager {
   }
 
   stop(): void {
+    recordRuntimeDiagnostic('capture', 'capture-stop', this.buildDiagnosticDetails())
     this.removeDeviceListener()
     this.stopPipeline()
     this.stopStream()
     this.isCapturePaused = false
     this.sourceInvalid = false
     this.callbacks = null
+    this.deliveredAudioChunks = 0
+    this.deliveredAudioBytes = 0
+    this.lastDeliveredAudioAt = 0
+    this.lastCaptureDiagnosticAt = 0
+    this.pipelineStartedAt = 0
   }
 
   /**
@@ -319,6 +340,16 @@ export class CaptureManager {
     return this.captureMode
   }
 
+  getHealthSnapshot(): CaptureHealthSnapshot {
+    return {
+      pipelineStartedAt: this.pipelineStartedAt,
+      lastDeliveredAudioAt: this.lastDeliveredAudioAt,
+      deliveredAudioChunks: this.deliveredAudioChunks,
+      recorderState: this.mediaRecorder?.state ?? null,
+      hasAudioProcessor: this.audioProcessor !== null,
+    }
+  }
+
   private async requestDisplayAudio(audioOptions: CaptureAudioOptions): Promise<MediaStream> {
     console.log('[CaptureManager] Requesting screen share...')
     const displayStream = await navigator.mediaDevices.getDisplayMedia({
@@ -456,6 +487,14 @@ export class CaptureManager {
   ): Promise<void> {
     const { audioInputMode, audioProfile } = capabilities
     const generation = ++this.pipelineGeneration
+    this.pipelineStartedAt = Date.now()
+    recordRuntimeDiagnostic('capture', 'pipeline-start', {
+      generation,
+      audioInputMode,
+      payloadFormat: audioProfile?.payloadFormat ?? 'default',
+      preferredChunkMs: audioProfile?.preferredChunkMs ?? null,
+      ...this.buildStreamDetails(),
+    })
 
     if (audioInputMode === 'pcm16') {
       console.log('[CaptureManager] Using AudioProcessor (PCM16)')
@@ -486,6 +525,10 @@ export class CaptureManager {
     }
     recorder.onerror = (event) => {
       console.error('[CaptureManager] MediaRecorder error:', event)
+      recordRuntimeDiagnostic('capture', 'media-recorder-error', {
+        generation,
+        recorderState: recorder.state,
+      })
     }
     recorder.start(audioProfile?.preferredChunkMs ?? 100)
     console.log('[CaptureManager] MediaRecorder started')
@@ -587,7 +630,42 @@ export class CaptureManager {
 
   private deliverAudioData(generation: number, data: Blob | ArrayBuffer): void {
     if (generation === this.pipelineGeneration) {
+      const now = Date.now()
+      this.deliveredAudioChunks += 1
+      this.deliveredAudioBytes += data instanceof Blob ? data.size : data.byteLength
+      this.lastDeliveredAudioAt = now
+      if (now - this.lastCaptureDiagnosticAt >= CAPTURE_DIAGNOSTIC_INTERVAL_MS) {
+        this.lastCaptureDiagnosticAt = now
+        recordRuntimeDiagnostic('capture', 'audio-delivery', this.buildDiagnosticDetails())
+      }
       this.callbacks?.onAudioData(data)
+    }
+  }
+
+  private buildStreamDetails(): Record<string, unknown> {
+    return {
+      captureMode: this.captureMode,
+      streamAudioTracks: this.mediaStream?.getAudioTracks().map(track => ({
+        readyState: track.readyState,
+        enabled: track.enabled,
+        muted: track.muted,
+      })) ?? [],
+      mixedAudioContextState: this.mixedAudioContext?.state ?? null,
+    }
+  }
+
+  private buildDiagnosticDetails(): Record<string, unknown> {
+    return {
+      generation: this.pipelineGeneration,
+      recorderState: this.mediaRecorder?.state ?? null,
+      hasAudioProcessor: this.audioProcessor !== null,
+      deliveredAudioChunks: this.deliveredAudioChunks,
+      deliveredAudioBytes: this.deliveredAudioBytes,
+      lastDeliveredAudioAt: this.lastDeliveredAudioAt || null,
+      pipelineStartedAt: this.pipelineStartedAt || null,
+      isCapturePaused: this.isCapturePaused,
+      sourceInvalid: this.sourceInvalid,
+      ...this.buildStreamDetails(),
     }
   }
 

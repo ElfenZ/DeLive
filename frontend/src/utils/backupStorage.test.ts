@@ -6,6 +6,7 @@ import {
   upgradeBackupData,
   sanitizeSettingsForBackup,
   validateBackupData,
+  mergeImportedAiPostProcessConfig,
 } from './backupStorage'
 
 describe('backupStorage', () => {
@@ -205,5 +206,15 @@ describe('backupStorage', () => {
     expect(sanitized.openApi?.token).toBe('')
     expect(sanitized.cloudBackup?.s3?.secretAccessKey).toBe('')
     expect(sanitized.meetingContext?.background).toBe('Project facts')
+  })
+
+  it('invalidates imported AI credential identity when the local key replaces the backup key', () => {
+    const merged = mergeImportedAiPostProcessConfig(
+      { apiKey: 'local-key' },
+      { baseUrl: 'https://api.example.com/v1', apiKey: '', credentialVersion: 4 },
+    )
+
+    expect(merged.apiKey).toBe('local-key')
+    expect(merged.credentialVersion).toBe(5)
   })
 })
