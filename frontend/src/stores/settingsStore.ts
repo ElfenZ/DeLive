@@ -23,7 +23,8 @@ import {
   normalizeGlossaryEntries,
   normalizeMeetingContextConfig,
 } from '../utils/meetingContext'
-import { nextOpenAiCredentialVersion, normalizeOpenAiBaseUrl } from '../services/openAiCompatible'
+import { nextAiCredentialVersion, normalizeAiBaseUrl } from '../services/aiProtocol'
+import { invalidateAiEndpointModels } from '../services/aiPostProcess'
 import { SAFE_STORAGE_PLACEHOLDER } from '../utils/secretStorage'
 
 const defaultCaptionStyle: CaptionStyle = {
@@ -107,6 +108,14 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       aiPostProcess: {
         ...defaultSettings.aiPostProcess,
         ...(settings.aiPostProcess || {}),
+        provider: settings.aiPostProcess?.provider === 'anthropic-compatible'
+          ? 'anthropic-compatible'
+          : 'openai-compatible',
+        thinkingMode: settings.aiPostProcess?.thinkingMode === 'disabled' ? 'disabled' : 'default',
+        correctionStructuredOutput: settings.aiPostProcess?.provider === 'anthropic-compatible'
+          && settings.aiPostProcess?.correctionStructuredOutput === 'json_object'
+          ? 'prompt-json'
+          : settings.aiPostProcess?.correctionStructuredOutput,
         credentialVersion: Number.isInteger(settings.aiPostProcess?.credentialVersion)
           && (settings.aiPostProcess?.credentialVersion || 0) > 0
           ? settings.aiPostProcess!.credentialVersion
@@ -164,15 +173,33 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     const nextApiKey = config.apiKey === SAFE_STORAGE_PLACEHOLDER
       ? currentConfig.apiKey
       : config.apiKey ?? currentConfig.apiKey
-    const nextBaseUrl = normalizeOpenAiBaseUrl(config.baseUrl ?? currentConfig.baseUrl ?? '')
-    const credentialVersion = nextOpenAiCredentialVersion(currentConfig, {
+    const nextBaseUrl = normalizeAiBaseUrl(config.baseUrl ?? currentConfig.baseUrl ?? '')
+    const nextProvider = config.provider === 'anthropic-compatible'
+      ? 'anthropic-compatible'
+      : config.provider === 'openai-compatible'
+        ? 'openai-compatible'
+        : currentConfig.provider || 'openai-compatible'
+    const providerChanged = nextProvider !== (currentConfig.provider || 'openai-compatible')
+    const credentialVersion = nextAiCredentialVersion(currentConfig, {
       baseUrl: nextBaseUrl,
       apiKey: nextApiKey,
+      provider: nextProvider,
     })
     const nextConfig = enforceAiAutomationExclusivity({
       ...currentConfig,
       ...config,
+      ...(providerChanged ? invalidateAiEndpointModels() : {}),
       ...(config.baseUrl !== undefined ? { baseUrl: nextBaseUrl } : {}),
+      provider: nextProvider,
+      thinkingMode: config.thinkingMode === 'disabled'
+        ? 'disabled'
+        : config.thinkingMode === 'default'
+          ? 'default'
+          : currentConfig.thinkingMode || 'default',
+      correctionStructuredOutput: providerChanged && nextProvider === 'anthropic-compatible'
+        && (config.correctionStructuredOutput ?? currentConfig.correctionStructuredOutput) === 'json_object'
+        ? 'prompt-json'
+        : config.correctionStructuredOutput ?? currentConfig.correctionStructuredOutput,
       apiKey: nextApiKey,
       credentialVersion,
       ...(normalizedGlossary ? { glossary: normalizedGlossary.value } : {}),

@@ -17,6 +17,7 @@ import { useSessionStore } from '../../stores/sessionStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { isAiPostProcessConfigured } from '../../services/aiPostProcess'
 import { MarkdownRenderer } from './MarkdownRenderer'
+import { ActionDialog } from '../ActionDialog'
 
 interface AiSidePanelProps {
   session: TranscriptSession
@@ -24,6 +25,7 @@ interface AiSidePanelProps {
   onToggle: () => void
   selectedText?: string
   onClearSelection?: () => void
+  onContinue?: (conversationId: string) => void
 }
 
 export function AiSidePanel({
@@ -32,6 +34,7 @@ export function AiSidePanel({
   onToggle,
   selectedText,
   onClearSelection,
+  onContinue,
 }: AiSidePanelProps) {
   const { t } = useUIStore()
   const p = t.preview as Record<string, unknown>
@@ -44,6 +47,12 @@ export function AiSidePanel({
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const composingRef = useRef(false)
+  const [prefilled, setPrefilled] = useState(false)
+  const [confirmClear, setConfirmClear] = useState(false)
+  const [clearError, setClearError] = useState('')
+  const [clearing, setClearing] = useState(false)
+  const clearingRef = useRef(false)
 
   const sidePanelConversationId = useMemo(() => `side-panel-${session.id}`, [session.id])
   const askHistory = useMemo(() => session.askHistory || [], [session.askHistory])
@@ -53,7 +62,8 @@ export function AiSidePanel({
   )
 
   const aiConfigured = isAiPostProcessConfigured(settings)
-  const isPending = panelHistory.some((turn) => turn.status === 'pending')
+  const pendingTurn = askHistory.find((turn) => turn.status === 'pending')
+  const isPending = Boolean(pendingTurn)
   const hasTranscript = !!session.transcript.trim()
 
   useEffect(() => {
@@ -81,9 +91,10 @@ export function AiSidePanel({
   }, [draft, adjustTextareaHeight])
 
   const handleSend = async () => {
-    if (!draft.trim() || isPending || !aiConfigured || !hasTranscript) return
+    if (!draft.trim() || isPending || !aiConfigured || !hasTranscript || composingRef.current) return
     const question = draft.trim()
     setDraft('')
+    setPrefilled(false)
     onClearSelection?.()
     try {
       if (enableStreaming) {
@@ -107,8 +118,9 @@ export function AiSidePanel({
   }, [])
 
   const handleClearHistory = useCallback(() => {
-    deleteSessionConversation(session.id, sidePanelConversationId)
-  }, [session.id, sidePanelConversationId, deleteSessionConversation])
+    setClearError('')
+    setConfirmClear(true)
+  }, [])
 
   const quickActions = [
     (p.aiSidePanelQuickSummary as string) || 'Summarize this transcript',
@@ -192,6 +204,8 @@ export function AiSidePanel({
           {panelHistory.length > 0 && (
             <button
               onClick={handleClearHistory}
+              disabled={isPending || clearing}
+              aria-label={(p.aiSidePanelClear as string) || 'Clear history'}
               className="inline-flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
               title={(p.aiSidePanelClear as string) || 'Clear history'}
             >
@@ -209,6 +223,7 @@ export function AiSidePanel({
       </div>
 
       {/* Messages */}
+      {onContinue && <button className="shrink-0 border-b border-border px-3 py-2 text-left text-xs text-primary" onClick={() => onContinue(pendingTurn?.conversationId || (pendingTurn ? 'default' : sidePanelConversationId))}>{pendingTurn ? t.preview.locateActiveThread : t.preview.continueInChat}</button>}
       <div className="flex-1 overflow-y-auto px-4 py-3">
         {!aiConfigured && (
           <p className="text-xs text-muted-foreground mb-3">{t.preview.aiNotConfigured}</p>
@@ -230,11 +245,12 @@ export function AiSidePanel({
                 {quickActions.map((action) => (
                   <button
                     key={action}
-                    onClick={() => setDraft(action)}
+                    onClick={() => { setDraft(action); setPrefilled(true); textareaRef.current?.focus() }}
+                    aria-label={`${t.preview.fillQuestion}: ${action}`}
                     className="flex items-center gap-2 rounded-lg border border-border/40 px-3 py-2 text-xs text-foreground transition-colors hover:border-foreground/20 hover:bg-accent"
                   >
                     <ArrowUpRight className="h-3 w-3 text-muted-foreground shrink-0" />
-                    <span className="text-left">{action}</span>
+                    <span className="text-left">{t.preview.fillQuestion}: {action}</span>
                   </button>
                 ))}
               </div>
@@ -317,8 +333,11 @@ export function AiSidePanel({
           <textarea
             ref={textareaRef}
             value={draft}
-            onChange={(e) => setDraft(e.target.value)}
+            onChange={(e) => { setDraft(e.target.value); setPrefilled(false) }}
+            onCompositionStart={() => { composingRef.current = true }}
+            onCompositionEnd={() => { composingRef.current = false }}
             onKeyDown={(e) => {
+              if (composingRef.current || e.nativeEvent.isComposing || e.keyCode === 229) return
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault()
                 void handleSend()
@@ -331,6 +350,7 @@ export function AiSidePanel({
           />
           <button
             onClick={() => void handleSend()}
+            aria-label={t.preview.askSend}
             disabled={!draft.trim() || isPending || !aiConfigured || !hasTranscript}
             className={`inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md transition-all ${
               !draft.trim() || isPending || !aiConfigured || !hasTranscript
@@ -345,7 +365,19 @@ export function AiSidePanel({
             )}
           </button>
         </div>
+        {prefilled && <p role="status" className="mt-1 text-xs text-muted-foreground">{t.preview.questionNotSent}</p>}
       </div>
+      <ActionDialog open={confirmClear} title={t.preview.clearConversation} description={`${t.preview.clearConversationHint}${clearError ? `\n\n${clearError}` : ''}`} onClose={() => { if (!clearingRef.current) setConfirmClear(false) }} actions={[
+        { label: t.common.cancel, variant: 'secondary', disabled: clearing, onClick: () => setConfirmClear(false) },
+        { label: t.common.delete, variant: 'danger', disabled: clearing || isPending, onClick: () => {
+          if (clearingRef.current) return
+          clearingRef.current = true
+          setClearing(true)
+          try { deleteSessionConversation(session.id, sidePanelConversationId); setConfirmClear(false) }
+          catch (error) { setClearError(error instanceof Error ? error.message : String(error)) }
+          finally { clearingRef.current = false; setClearing(false) }
+        } },
+      ]} />
     </div>
   )
 }

@@ -1,12 +1,23 @@
-import { useCallback, useRef } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import { useFileTranscriptionStore } from '../stores/fileTranscriptionStore'
 import { useSettingsStore } from '../stores/settingsStore'
 import { useSessionStore } from '../stores/sessionStore'
+import { useTopicStore } from '../stores/topicStore'
+import { managedAudioReference, reconcileJobAudio } from '../utils/managedMediaSchema'
+import { reconcileManagedMedia } from '../utils/managedMediaReconciliation'
+import { syncSessionFiles } from '../utils/sessionFileSync'
 import { sessionRepository } from '../utils/sessionRepository'
+import { getDeletedSessionSnapshots } from '../utils/deletedSessionStorage'
 import { createDraftSession } from '../utils/sessionLifecycle'
 import { useUIStore } from '../stores/uiStore'
-import type { FileTranscriptionConfig } from '../types/fileTranscription'
+import {
+  formatFileSize,
+  getMediaInputKind,
+  type FileTranscriptionConfig,
+  type FileTranscriptionJob,
+} from '../types/fileTranscription'
 import type { TranscriptTokenData, TranscriptSegment, TranscriptSpeaker } from '../types'
+import { generateId } from '../utils/storageUtils'
 import {
   uploadFile as sonioxUploadFile,
   createTranscription as sonioxCreateTranscription,
@@ -995,125 +1006,409 @@ async function executeDeepgram(
 
 /* ─── Main hook ─────────────────────────────────────────────── */
 
+function getCurrentProviderSettings(config: FileTranscriptionConfig) {
+  const providerId = config.provider
+  const providerConfig = useSettingsStore.getState().getProviderConfig(providerId)
+  const apiKey = providerConfig?.apiKey as string | undefined
+
+  if (providerId === 'cloudflare') {
+    const apiToken = providerConfig?.apiToken as string | undefined
+    const accountId = providerConfig?.accountId as string | undefined
+    if (!apiToken || !accountId) throw new Error('Cloudflare API Token 或 Account ID 未配置')
+  } else if (providerId === 'volc') {
+    const appKey = providerConfig?.appKey as string | undefined
+    const accessKey = providerConfig?.accessKey as string | undefined
+    if (!appKey || !accessKey) throw new Error('火山引擎 APP ID 或 Access Token 未配置')
+  } else if (!apiKey) {
+    throw new Error(`${providerId} API Key not configured`)
+  }
+
+  return { providerConfig, apiKey }
+}
+
+async function assertRetryRecordAvailable(sessionId: string) {
+  if ((await getDeletedSessionSnapshots()).some(item => item.originalSessionId === sessionId)) {
+    throw new Error('This record was deleted; import again as a new task.')
+  }
+}
+
+async function executeWithCurrentProvider(
+  file: File,
+  config: FileTranscriptionConfig,
+  jobId: string,
+  updateJob: (id: string, updates: Record<string, unknown>) => void,
+  signal: AbortSignal,
+): Promise<TranscriptionResult> {
+  const providerId = config.provider
+  const { providerConfig, apiKey } = getCurrentProviderSettings(config)
+  if (providerId === 'cloudflare' && file.size > 2 * 1024 * 1024) {
+    throw new Error(`Cloudflare accepts files up to 2 MiB. The prepared audio is ${formatFileSize(file.size)}; choose another provider and retry.`)
+  }
+
+  if (providerId === 'groq') {
+    return executeGroq(file, config, apiKey!, jobId, updateJob, signal)
+  }
+  if (providerId === 'mistral') {
+    return executeMistral(file, config, apiKey!, jobId, updateJob, signal)
+  }
+  if (providerId === 'siliconflow') {
+    return executeSiliconFlow(file, config, apiKey!, jobId, updateJob, signal)
+  }
+  if (providerId === 'cloudflare') {
+    return executeCloudflare(
+      file,
+      config,
+      providerConfig?.apiToken as string,
+      providerConfig?.accountId as string,
+      jobId,
+      updateJob,
+      signal,
+    )
+  }
+  if (providerId === 'gladia') {
+    return executeGladia(file, config, apiKey!, jobId, updateJob, signal)
+  }
+  if (providerId === 'elevenlabs') {
+    return executeElevenLabs(file, config, apiKey!, jobId, updateJob, signal)
+  }
+  if (providerId === 'deepgram') {
+    return executeDeepgram(file, config, apiKey!, jobId, updateJob, signal)
+  }
+  if (providerId === 'assemblyai') {
+    return executeAssemblyAI(file, config, apiKey!, jobId, updateJob, signal)
+  }
+  if (providerId === 'volc') {
+    return executeVolc(
+      file,
+      config,
+      providerConfig?.appKey as string,
+      providerConfig?.accessKey as string,
+      jobId,
+      updateJob,
+      signal,
+    )
+  }
+  return executeSoniox(file, config, apiKey!, jobId, updateJob, signal)
+}
+
 export function useFileTranscription() {
   const abortControllers = useRef<Map<string, AbortController>>(new Map())
   const { addJob, updateJob } = useFileTranscriptionStore()
   const jobs = useFileTranscriptionStore((s) => s.jobs)
 
-  const submitFile = useCallback(async (file: File, config: FileTranscriptionConfig) => {
-    const providerId = config.provider
-    const providerConfig = useSettingsStore.getState().getProviderConfig(providerId)
-    const apiKey = providerConfig?.apiKey as string | undefined
+  const runProvider = useCallback(async (
+    jobId: string,
+    file: File,
+    config: FileTranscriptionConfig,
+    controller: AbortController,
+  ) => {
+    try {
+      if (controller.signal.aborted) return
+      const result = await executeWithCurrentProvider(
+        file,
+        config,
+        jobId,
+        (id, updates) => updateJob(id, updates as Partial<FileTranscriptionJob>),
+        controller.signal,
+      )
+      const job = useFileTranscriptionStore.getState().getJob(jobId)
+      if (!job || controller.signal.aborted) return
+      if (job.sessionId) await assertRetryRecordAvailable(job.sessionId)
 
-    if (providerId === 'cloudflare') {
-      const apiToken = providerConfig?.apiToken as string | undefined
-      const accountId = providerConfig?.accountId as string | undefined
-      if (!apiToken || !accountId) {
-        throw new Error('Cloudflare API Token 或 Account ID 未配置')
+      const now = Date.now()
+      const isVideo = job.inputKind === 'video'
+      const session = createDraftSession({
+        id: job.sessionId,
+        now: job.createdAt,
+        title: job.fileName.replace(/\.[^.]+$/, ''),
+        providerId: config.provider,
+        projectIds: job.projectIds,
+        defaultSaveProjectId: job.defaultSaveProjectId,
+        sourceMeta: isVideo
+          ? {
+              captureMode: 'file',
+              providerMode: 'unknown',
+              platform: window.electronAPI?.platform || 'unknown',
+              sourceKind: 'extracted-video-audio',
+              audioPath: job.audioPath,
+              audioFileName: job.audioFileName || 'source-audio.mp3',
+              audioMimeType: job.audioMimeType || 'audio/mpeg',
+              audioSize: job.audioSize,
+              managedAsset: job.managedAsset,
+              audioAvailable: job.audioAvailable,
+              originalFileName: job.fileName,
+              originalMimeType: job.mimeType,
+              originalFileSize: job.fileSize,
+              originalSourceId: job.originalSourceId,
+              originalSourceRevision: job.originalSourceRevision,
+              currentOriginalFileName: job.currentOriginalFileName,
+            }
+          : {
+              captureMode: 'file',
+              providerMode: 'unknown',
+              platform: window.electronAPI?.platform || 'unknown',
+              sourceKind: 'uploaded-audio',
+              audioPath: job.audioPath,
+              managedAsset: job.managedAsset,
+              audioAvailable: job.audioAvailable,
+              audioFileName: job.audioFileName,
+              audioMimeType: job.audioMimeType || file.type || 'audio/mpeg',
+              audioSize: job.audioSize ?? file.size,
+              originalFileName: job.fileName,
+              originalFileSize: job.fileSize,
+              originalMimeType: job.mimeType,
+              originalSourceId: job.originalSourceId,
+              originalSourceRevision: job.originalSourceRevision,
+              currentOriginalFileName: job.currentOriginalFileName,
+            },
+        meetingContext: config.meetingContext,
+        recognitionConfig: config.recognitionConfig,
+      })
+
+      const completedSession = {
+        ...session,
+        transcript: result.transcript,
+        tokens: result.tokens,
+        segments: result.segments,
+        speakers: result.speakers,
+        duration: result.durationMs,
+        status: 'completed' as const,
+        updatedAt: now,
       }
-    } else if (providerId === 'volc') {
-      const appKey = providerConfig?.appKey as string | undefined
-      const accessKey = providerConfig?.accessKey as string | undefined
-      if (!appKey || !accessKey) {
-        throw new Error('火山引擎 APP ID 或 Access Token 未配置')
+      const nextSessions = await sessionRepository.importCompletedSession(completedSession)
+      useSessionStore.setState({ sessions: nextSessions })
+      await syncSessionFiles(session.id)
+      void useSessionStore.getState().maybeStartAutoAiPostProcess(session.id)
+
+      updateJob(jobId, {
+        status: 'completed',
+        progress: 100,
+        provider: config.provider,
+        config,
+        sessionId: session.id,
+        completedAt: Date.now(),
+        audioDurationMs: result.durationMs,
+        error: undefined,
+        requiresSourceSelection: false,
+      })
+    } catch (error) {
+      if (controller.signal.aborted) {
+        updateJob(jobId, { status: 'cancelled', error: undefined })
+      } else {
+        updateJob(jobId, {
+          status: 'error',
+          error: error instanceof Error ? error.message : 'Unknown error',
+        })
       }
-    } else if (!apiKey) {
-      throw new Error(`${providerId} API Key not configured`)
+    } finally {
+      if (abortControllers.current.get(jobId) === controller) abortControllers.current.delete(jobId)
     }
+  }, [updateJob])
 
+  const readArchivedAudio = useCallback(async (sessionId: string, extractedVideo = false, jobId?: string): Promise<File> => {
+    const result = await window.electronAPI?.readMediaAudio(sessionId)
+    if (!result?.ok || !result.audio || !result.data) {
+      throw new Error(result?.error || 'The extracted audio file is unavailable.')
+    }
+    if (extractedVideo && (result.audio.assetKind !== 'extracted-audio' || !result.audio.fileName.toLowerCase().endsWith('.mp3') || result.audio.mimeType !== 'audio/mpeg')) {
+      throw new Error('Video retries require managed extracted MP3.')
+    }
+    if (jobId) {
+      const job = useFileTranscriptionStore.getState().getJob(jobId)
+      const patch = job && reconcileJobAudio(job, result.audio)
+      if (!patch) throw new Error('Managed audio reference changed; verify this task before retrying.')
+      updateJob(jobId, patch)
+    }
+    return new File([result.data], result.audio.fileName, { type: result.audio.mimeType })
+  }, [updateJob])
+
+  const runVideoPreparation = useCallback(async (
+    jobId: string,
+    sessionId: string,
+    sourcePath: string,
+    config: FileTranscriptionConfig,
+    controller: AbortController,
+  ) => {
+    try {
+      updateJob(jobId, { status: 'extracting', progress: 0, error: undefined })
+      const result = await window.electronAPI?.extractMediaAudio({ taskId: jobId, sessionId, sourcePath })
+      if (!result?.ok || !result.audio) {
+        if (result?.code === 'MEDIA_EXTRACTION_CANCELLED' || controller.signal.aborted) {
+          updateJob(jobId, { status: 'cancelled', error: undefined })
+          return
+        }
+        throw new Error(result?.error || 'Audio extraction failed.')
+      }
+
+      updateJob(jobId, {
+        status: 'audio-ready',
+        progress: 100,
+        audioPath: result.audio.path,
+        audioFileName: result.audio.fileName,
+        audioMimeType: result.audio.mimeType,
+        audioSize: result.audio.size,
+        managedAsset: managedAudioReference(result.audio),
+        audioDurationMs: result.audio.durationMs,
+        audioAvailable: true,
+        requiresSourceSelection: false,
+      })
+      if (controller.signal.aborted) {
+        updateJob(jobId, { status: 'cancelled' })
+        return
+      }
+      const preparedFile = await readArchivedAudio(sessionId, true, jobId)
+      if (controller.signal.aborted) return
+      await runProvider(jobId, preparedFile, config, controller)
+    } catch (error) {
+      if (controller.signal.aborted) {
+        updateJob(jobId, { status: 'cancelled', error: undefined })
+      } else {
+        updateJob(jobId, {
+          status: 'error',
+          error: error instanceof Error ? error.message : 'Audio extraction failed.',
+        })
+      }
+    }
+    finally { if (abortControllers.current.get(jobId) === controller) abortControllers.current.delete(jobId) }
+  }, [readArchivedAudio, runProvider, updateJob])
+
+  const runSelectedInput = useCallback(async (jobId: string, file: File, config: FileTranscriptionConfig, controller: AbortController) => {
+    let token: string | undefined
+    try {
+      const job = useFileTranscriptionStore.getState().getJob(jobId)
+      if (!job?.sessionId) throw new Error('Task record is unavailable')
+      await assertRetryRecordAvailable(job.sessionId)
+      if (getMediaInputKind(file) !== job.inputKind) throw new Error('Select the same input kind as the original task.')
+      const api = window.electronAPI
+      const nativePath = api?.getPathForFile(file) || undefined
+      let input = file
+      if (nativePath && api?.registerOriginalSource) {
+        const registered = await api.registerOriginalSource(nativePath, job.sessionId)
+        if (!registered.ok || !registered.source) throw new Error(registered.error || 'Original source registration failed')
+        updateJob(jobId, { originalSourceId: registered.source.id, originalSourceRevision: registered.source.revision, currentOriginalFileName: registered.source.fileName })
+        const lease = await api.acquireOriginalRead(registered.source.id, job.sessionId)
+        if (!lease.ok || !lease.token) throw new Error(lease.error || 'Original source read is unavailable')
+        token = lease.token
+        if (controller.signal.aborted) return
+        if (job.inputKind === 'audio') {
+          const result = await api.readOriginalAudio(token)
+          if (!result.ok || !result.data || !result.fileName) throw new Error(result.error || 'Original audio is unavailable')
+          input = new File([result.data as BlobPart], result.fileName, { type: file.type || 'audio/mpeg' })
+          updateJob(jobId, { audioPath: undefined, audioFileName: undefined, audioMimeType: undefined,
+            audioSize: undefined, managedAsset: undefined, audioAvailable: false })
+        }
+      } else if (api) {
+        throw new Error('Select the original through a native file input first.')
+      }
+      if (controller.signal.aborted) return
+      await assertRetryRecordAvailable(job.sessionId)
+      if (job.inputKind === 'audio') await runProvider(jobId, input, config, controller)
+      else {
+        if (!nativePath || !token || !api?.extractMediaAudio) throw new Error('Local video audio extraction requires a registered desktop original.')
+        await runVideoPreparation(jobId, job.sessionId, nativePath, config, controller)
+      }
+    } catch (error) {
+      updateJob(jobId, { status: controller.signal.aborted ? 'cancelled' : 'error', requiresSourceSelection: true,
+        error: controller.signal.aborted ? undefined : error instanceof Error ? error.message : String(error) })
+    } finally {
+      try { if (token) await window.electronAPI?.releaseOriginalRead(token) }
+      finally { if (abortControllers.current.get(jobId) === controller) abortControllers.current.delete(jobId) }
+    }
+  }, [runProvider, runVideoPreparation, updateJob])
+
+  const submitFile = useCallback(async (file: File, config: FileTranscriptionConfig) => {
+    config = structuredClone(config)
+    getCurrentProviderSettings(config)
+    const inputKind = getMediaInputKind(file)
+    const sessionId = generateId()
     const jobId = addJob({
+      projectIds: [...useTopicStore.getState().activeProjectIds],
+      defaultSaveProjectId: useTopicStore.getState().defaultSaveProjectId || undefined,
       fileName: file.name,
       fileSize: file.size,
-      mimeType: file.type || 'audio/mpeg',
+      mimeType: file.type || (inputKind === 'video' ? 'video/unknown' : 'audio/mpeg'),
       provider: config.provider,
+      inputKind,
+      config,
+      sessionId,
+      audioAvailable: false,
     })
-
     const controller = new AbortController()
     abortControllers.current.set(jobId, controller)
 
-    ;(async () => {
-      try {
-        let result: TranscriptionResult
-
-        if (providerId === 'groq') {
-          result = await executeGroq(file, config, apiKey!, jobId, updateJob, controller.signal)
-        } else if (providerId === 'mistral') {
-          result = await executeMistral(file, config, apiKey!, jobId, updateJob, controller.signal)
-        } else if (providerId === 'siliconflow') {
-          result = await executeSiliconFlow(file, config, apiKey!, jobId, updateJob, controller.signal)
-        } else if (providerId === 'cloudflare') {
-          const apiToken = providerConfig?.apiToken as string
-          const accountId = providerConfig?.accountId as string
-          result = await executeCloudflare(file, config, apiToken, accountId, jobId, updateJob, controller.signal)
-        } else if (providerId === 'gladia') {
-          result = await executeGladia(file, config, apiKey!, jobId, updateJob, controller.signal)
-        } else if (providerId === 'elevenlabs') {
-          result = await executeElevenLabs(file, config, apiKey!, jobId, updateJob, controller.signal)
-        } else if (providerId === 'deepgram') {
-          result = await executeDeepgram(file, config, apiKey!, jobId, updateJob, controller.signal)
-        } else if (providerId === 'assemblyai') {
-          result = await executeAssemblyAI(file, config, apiKey!, jobId, updateJob, controller.signal)
-        } else if (providerId === 'volc') {
-          const volcAppKey = providerConfig?.appKey as string
-          const volcAccessKey = providerConfig?.accessKey as string
-          result = await executeVolc(file, config, volcAppKey, volcAccessKey, jobId, updateJob, controller.signal)
-        } else {
-          result = await executeSoniox(file, config, apiKey!, jobId, updateJob, controller.signal)
-        }
-
-        const now = Date.now()
-        const session = createDraftSession({
-          now,
-          title: file.name.replace(/\.[^.]+$/, ''),
-          providerId,
-          sourceMeta: {
-            captureMode: 'file',
-            providerMode: 'unknown',
-            platform: (window.electronAPI?.platform as 'win32' | 'darwin' | 'linux') || 'unknown',
-            sourceKind: 'uploaded-audio',
-            audioFileName: file.name,
-            audioMimeType: file.type || 'audio/mpeg',
-            audioSize: file.size,
-          },
-          meetingContext: config.meetingContext,
-          recognitionConfig: config.recognitionConfig,
-        })
-
-        const completedSession = {
-          ...session,
-          transcript: result.transcript,
-          tokens: result.tokens,
-          segments: result.segments,
-          speakers: result.speakers,
-          duration: result.durationMs,
-          status: 'completed' as const,
-          updatedAt: now,
-        }
-
-        const currentSessions = useSessionStore.getState().sessions
-        sessionRepository.replaceAllSessions([completedSession, ...currentSessions])
-        useSessionStore.setState({ sessions: [completedSession, ...currentSessions] })
-        void useSessionStore.getState().maybeStartAutoAiPostProcess(session.id)
-
-        updateJob(jobId, {
-          status: 'completed',
-          progress: 100,
-          sessionId: session.id,
-          completedAt: Date.now(),
-          audioDurationMs: result.durationMs,
-        })
-      } catch (err) {
-        const message = err instanceof Error ? err.message : 'Unknown error'
-        if (message !== 'Transcription cancelled') {
-          updateJob(jobId, { status: 'error', error: message })
-        }
-      } finally {
-        abortControllers.current.delete(jobId)
-      }
-    })()
-
+    void runSelectedInput(jobId, file, config, controller)
     return jobId
-  }, [addJob, updateJob])
+  }, [addJob, runSelectedInput])
+
+  const retryJob = useCallback(async (jobId: string, overrideConfig?: FileTranscriptionConfig) => {
+    const job = useFileTranscriptionStore.getState().getJob(jobId)
+    if (!job?.sessionId || abortControllers.current.has(jobId)) return
+    await assertRetryRecordAvailable(job.sessionId)
+    if (abortControllers.current.has(jobId)) return
+    const config = job.config ? structuredClone({ ...job.config, ...overrideConfig, meetingContext: job.config.meetingContext }) : undefined
+    if (!config) return
+    getCurrentProviderSettings(config)
+    const controller = new AbortController()
+    abortControllers.current.set(jobId, controller)
+    updateJob(jobId, { status: 'audio-ready', provider: config.provider, config, progress: 100, error: undefined })
+    try {
+      const file = await readArchivedAudio(job.sessionId, job.inputKind === 'video', jobId)
+      if (controller.signal.aborted) return
+      void runProvider(jobId, file, config, controller)
+    } catch (error) {
+      abortControllers.current.delete(jobId)
+      updateJob(jobId, { status: controller.signal.aborted ? 'cancelled' : 'error', audioAvailable: false, requiresSourceSelection: true,
+        error: controller.signal.aborted ? undefined : error instanceof Error ? error.message : 'The original input is unavailable. Reselect it to retry.' })
+    }
+  }, [readArchivedAudio, runProvider, updateJob])
+
+  const reselectOriginal = useCallback(async (jobId: string, file: File) => {
+    const job = useFileTranscriptionStore.getState().getJob(jobId)
+    if (!job?.sessionId || !job.config || abortControllers.current.has(jobId)) return
+    await assertRetryRecordAvailable(job.sessionId)
+    if (abortControllers.current.has(jobId)) return
+    if (getMediaInputKind(file) !== job.inputKind) throw new Error('Select the same input kind as the original task.')
+    const config = structuredClone(job.config)
+    getCurrentProviderSettings(config)
+    const controller = new AbortController()
+    abortControllers.current.set(jobId, controller)
+    updateJob(jobId, { status: 'queued', progress: 0, error: undefined })
+    await runSelectedInput(jobId, file, config, controller)
+  }, [runSelectedInput, updateJob])
+
+  const revealAudio = useCallback(async (jobId: string) => {
+    const job = useFileTranscriptionStore.getState().getJob(jobId)
+    if (job?.sessionId) await window.electronAPI?.revealMediaAudio(job.sessionId)
+  }, [])
+
+  const clearSessionAudioMetadata = useCallback(async () => { await reconcileManagedMedia() }, [])
+
+  const deleteAudio = useCallback(async (jobId: string) => {
+    const job = useFileTranscriptionStore.getState().getJob(jobId)
+    if (!job?.sessionId) return false
+    const result = await window.electronAPI?.deleteMediaAudio(job.sessionId)
+    if (!result?.ok) return false
+    updateJob(jobId, {
+      audioPath: undefined,
+      audioFileName: undefined,
+      audioMimeType: undefined,
+      audioSize: undefined,
+      audioAvailable: false,
+      requiresSourceSelection: true,
+      ...(job.status === 'completed' ? {} : { status: 'error', error: 'The extracted audio was deleted. Re-import the video to transcribe it again.' }),
+    })
+    await clearSessionAudioMetadata()
+    return true
+  }, [clearSessionAudioMetadata, updateJob])
+
+  const deleteManagedAudio = useCallback(async (sessionId: string) => {
+    const job = useFileTranscriptionStore.getState().jobs.find(item => item.sessionId === sessionId)
+    if (job) return deleteAudio(job.id)
+    const result = await window.electronAPI?.deleteMediaAudio(sessionId)
+    if (!result?.ok) return false
+    await clearSessionAudioMetadata()
+    return true
+  }, [clearSessionAudioMetadata, deleteAudio])
 
   const cancelJob = useCallback((jobId: string) => {
     const controller = abortControllers.current.get(jobId)
@@ -1121,6 +1416,7 @@ export function useFileTranscription() {
       controller.abort()
       abortControllers.current.delete(jobId)
     }
+    void window.electronAPI?.cancelMediaExtraction(jobId)
     updateJob(jobId, { status: 'cancelled' })
   }, [updateJob])
 
@@ -1131,5 +1427,14 @@ export function useFileTranscription() {
     }
   }, [])
 
-  return { jobs, submitFile, cancelJob, openResult }
+  useEffect(() => window.electronAPI?.onMediaExtractionProgress((progress) => {
+    const job = useFileTranscriptionStore.getState().getJob(progress.taskId)
+    if (job?.status === 'extracting') updateJob(progress.taskId, { progress: progress.progress })
+  }), [updateJob])
+
+  useEffect(() => {
+    void reconcileManagedMedia().catch((error: unknown) => console.warn('[FileTranscription] Audio cache reconciliation failed:', error))
+  }, [])
+
+  return { jobs, submitFile, retryJob, reselectOriginal, cancelJob, openResult, revealAudio, deleteAudio, deleteManagedAudio }
 }

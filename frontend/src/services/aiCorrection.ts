@@ -5,7 +5,6 @@ import type {
   CorrectionConfigSnapshot,
   CorrectionRequestStage,
   CorrectionShardPlan,
-  CorrectionStructuredOutputMode,
   CorrectionTimeoutKind,
   MeetingContextSnapshot,
   ModelCorrectionPatch,
@@ -20,13 +19,18 @@ import {
 import { resolveModelForFeature } from './aiPostProcess'
 import { normalizeGlossaryEntries, resolveMeetingContextSnapshot } from '../utils/meetingContext'
 import {
-  createOpenAiRequestContext,
-  extractOpenAiErrorEnvelope,
-  extractOpenAiMessageContent,
-  isOpenAiAuthError,
-  normalizeOpenAiBaseUrl,
-  safeOpenAiEndpoint,
-} from './openAiCompatible'
+  buildAiCompletionBody,
+  createAiRequestContext,
+  extractAiErrorEnvelope,
+  extractAiMessageContent,
+  extractAiUsage,
+  isAiAuthError,
+  normalizeAiBaseUrl,
+  parseAiStreamData,
+  resolveAiProvider,
+  resolveAiThinkingMode,
+  safeAiEndpoint,
+} from './aiProtocol'
 
 const DEFAULT_AI_BASE_URL = 'http://127.0.0.1:11434/v1'
 const DEFAULT_PROMPT_LANGUAGE: NonNullable<AiPostProcessConfig['promptLanguage']> = 'zh'
@@ -110,6 +114,7 @@ function getAiConfig(settings: AppSettings): AiPostProcessConfig {
   return {
     enabled: false,
     provider: 'openai-compatible',
+    thinkingMode: 'default',
     baseUrl: DEFAULT_AI_BASE_URL,
     model: '',
     apiKey: '',
@@ -149,7 +154,9 @@ export function createCorrectionConfigSnapshot(
   meetingContext?: MeetingContextSnapshot,
 ): CorrectionConfigSnapshot {
   const config = getAiConfig(settings)
-  const baseUrl = normalizeOpenAiBaseUrl(config.baseUrl || '', DEFAULT_AI_BASE_URL)
+  const baseUrl = normalizeAiBaseUrl(config.baseUrl || '', DEFAULT_AI_BASE_URL)
+  const provider = resolveAiProvider(config.provider)
+  const thinkingMode = resolveAiThinkingMode(config.thinkingMode)
   const model = resolveModelForFeature(config, 'correction')
   if (!config.enabled) throw new Error('请先在设置中启用 AI 后处理')
   if (!model) throw new Error('请先配置 AI 纠错模型')
@@ -162,21 +169,28 @@ export function createCorrectionConfigSnapshot(
   const useContext = context.useForAiCorrection
   const transport = config.enableStreaming === false ? 'json' : 'sse'
   const credentialVersion = Math.max(1, config.credentialVersion || 1)
+  const structuredOutput = provider === 'anthropic-compatible' && config.correctionStructuredOutput === 'json_object'
+    ? 'prompt-json'
+    : config.correctionStructuredOutput || 'prompt-json'
   const configIdentity = JSON.stringify({
-    identityVersion: 1,
+    identityVersion: 2,
+    provider,
+    thinkingMode,
     baseUrl,
     model,
     credentialVersion,
     transport,
-    structuredOutput: config.correctionStructuredOutput || 'prompt-json',
+    structuredOutput,
   })
   return {
     model,
     baseUrl,
+    provider,
+    thinkingMode,
     promptLanguage: config.promptLanguage || DEFAULT_PROMPT_LANGUAGE,
     promptVersion: CORRECTION_PROMPT_VERSION,
     schemaVersion: CORRECTION_SCHEMA_VERSION,
-    structuredOutput: config.correctionStructuredOutput || 'prompt-json',
+    structuredOutput,
     temperature: 0.1,
     glossary: useContext ? normalizeAiCorrectionGlossary(context.glossary) : [],
     background: useContext ? context.background : '',
@@ -190,7 +204,7 @@ export function createCorrectionConfigSnapshot(
     },
     credentialRef: 'ai-post-process',
     credentialVersion,
-    identityVersion: 1,
+    identityVersion: 2,
     configIdentity,
     transport,
   }
@@ -200,7 +214,7 @@ export function isCorrectionConfigSnapshotCurrent(
   snapshot: CorrectionConfigSnapshot,
   settings: AppSettings,
 ): boolean {
-  if (!snapshot.configIdentity || snapshot.identityVersion !== 1 || !snapshot.transport || !snapshot.credentialVersion) {
+  if (!snapshot.configIdentity || snapshot.identityVersion !== 2 || !snapshot.transport || !snapshot.credentialVersion) {
     return false
   }
   try {
@@ -298,38 +312,29 @@ function buildUserPrompt(request: CorrectionShardRequest): string {
   ].filter(Boolean).join('\n')
 }
 
-function responseFormat(mode: CorrectionStructuredOutputMode): Record<string, unknown> | undefined {
-  if (mode === 'prompt-json') return undefined
-  if (mode === 'json_object') return { type: 'json_object' }
+function correctionJsonSchema(): Record<string, unknown> {
   return {
-    type: 'json_schema',
-    json_schema: {
-      name: 'correction_patches',
-      strict: true,
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['patches'],
-        properties: {
-          patches: {
-            type: 'array',
-            items: {
-              type: 'object',
-              additionalProperties: false,
-              required: ['op', 'oldText', 'replacement', 'before', 'after', 'category', 'reason'],
-              properties: {
-                op: { type: 'string', enum: ['replace', 'insert', 'delete'] },
-                oldText: { type: 'string' },
-                replacement: { type: 'string' },
-                before: { type: 'string' },
-                after: { type: 'string' },
-                category: {
-                  type: 'string',
-                  enum: ['homophone', 'proper-noun', 'punctuation', 'asr-substitution', 'asr-omission', 'asr-duplication'],
-                },
-                reason: { type: 'string' },
-              },
+    type: 'object',
+    additionalProperties: false,
+    required: ['patches'],
+    properties: {
+      patches: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['op', 'oldText', 'replacement', 'before', 'after', 'category', 'reason'],
+          properties: {
+            op: { type: 'string', enum: ['replace', 'insert', 'delete'] },
+            oldText: { type: 'string' },
+            replacement: { type: 'string' },
+            before: { type: 'string' },
+            after: { type: 'string' },
+            category: {
+              type: 'string',
+              enum: ['homophone', 'proper-noun', 'punctuation', 'asr-substitution', 'asr-omission', 'asr-duplication'],
             },
+            reason: { type: 'string' },
           },
         },
       },
@@ -338,17 +343,18 @@ function responseFormat(mode: CorrectionStructuredOutputMode): Record<string, un
 }
 
 export function buildCorrectionRequestBody(request: CorrectionShardRequest): Record<string, unknown> {
-  const format = responseFormat(request.snapshot.structuredOutput)
-  return {
+  return buildAiCompletionBody({
+    provider: request.snapshot.provider,
+    thinkingMode: request.snapshot.thinkingMode,
     model: request.snapshot.model,
     temperature: request.snapshot.temperature,
     stream: request.snapshot.transport === 'sse',
-    messages: [
-      { role: 'system', content: buildSystemPrompt(request.snapshot.promptLanguage) },
-      { role: 'user', content: buildUserPrompt(request) },
-    ],
-    ...(format ? { response_format: format } : {}),
-  }
+    system: buildSystemPrompt(request.snapshot.promptLanguage),
+    user: buildUserPrompt(request),
+    structuredOutput: request.snapshot.structuredOutput,
+    jsonSchema: request.snapshot.structuredOutput === 'json_schema' ? correctionJsonSchema() : undefined,
+    schemaName: 'correction_patches',
+  })
 }
 
 function parseRetryAfter(value: string | null): number | undefined {
@@ -369,9 +375,9 @@ function classifyHttpError(status: number, message: string, retryAfter?: number)
 }
 
 function classifyPayloadError(payload: unknown, status?: number): CorrectionRequestError | undefined {
-  const envelope = extractOpenAiErrorEnvelope(payload)
+  const envelope = extractAiErrorEnvelope(payload)
   if (!envelope) return undefined
-  if (isOpenAiAuthError(envelope)) return new CorrectionRequestError(envelope.message, 'auth', false, status)
+  if (isAiAuthError(envelope)) return new CorrectionRequestError(envelope.message, 'auth', false, status)
   const type = `${envelope.type || ''} ${envelope.code || ''}`.toLowerCase()
   if (/rate|quota/.test(type)) return new CorrectionRequestError(envelope.message, 'rate-limit', true, status)
   if (/timeout/.test(type)) return new CorrectionRequestError(envelope.message, 'timeout', true, status)
@@ -467,7 +473,10 @@ async function readResponseChunks(
       if (/reasoning_content|thinking/i.test(chunk)) {
         emitProgress(request, 'thinking', attempt, maxAttempts)
       }
-      if (/"content"\s*:/.test(chunk)) {
+      const containsVisibleContent = resolveAiProvider(request.snapshot.provider) === 'anthropic-compatible'
+        ? /"type"\s*:\s*"text_delta"/.test(chunk)
+        : /"content"\s*:/.test(chunk)
+      if (containsVisibleContent) {
         emitProgress(request, 'receiving-content', attempt, maxAttempts)
       }
     }
@@ -498,7 +507,11 @@ interface ParsedCorrectionCompletion {
   usage?: CorrectionUsage
 }
 
-function applySseData(completion: ParsedCorrectionCompletion, data: string): void {
+function applySseData(
+  completion: ParsedCorrectionCompletion,
+  data: string,
+  provider: CorrectionConfigSnapshot['provider'],
+): void {
   if (!data || data === '[DONE]') return
   let payload: unknown
   try {
@@ -508,22 +521,17 @@ function applySseData(completion: ParsedCorrectionCompletion, data: string): voi
   }
   const payloadError = classifyPayloadError(payload)
   if (payloadError) throw payloadError
-  const record = payload && typeof payload === 'object' ? payload as Record<string, unknown> : undefined
-  const choices = Array.isArray(record?.choices) ? record.choices : []
-  for (const choice of choices) {
-    if (!choice || typeof choice !== 'object') continue
-    const delta = (choice as { delta?: unknown }).delta
-    if (!delta || typeof delta !== 'object') continue
-    const visible = (delta as { content?: unknown }).content
-    if (typeof visible === 'string') completion.content += visible
-  }
-  const rawUsage = record?.usage
-  if (rawUsage && typeof rawUsage === 'object') {
-    const item = rawUsage as Record<string, unknown>
+  const delta = parseAiStreamData(data, provider)
+  if (delta.text) completion.content += delta.text
+  if (delta.usage) {
+    const promptTokens = delta.usage.promptTokens ?? completion.usage?.promptTokens
+    const completionTokens = delta.usage.completionTokens ?? completion.usage?.completionTokens
     completion.usage = {
-      promptTokens: typeof item.prompt_tokens === 'number' ? item.prompt_tokens : undefined,
-      completionTokens: typeof item.completion_tokens === 'number' ? item.completion_tokens : undefined,
-      totalTokens: typeof item.total_tokens === 'number' ? item.total_tokens : undefined,
+      promptTokens,
+      completionTokens,
+      totalTokens: promptTokens !== undefined && completionTokens !== undefined
+        ? promptTokens + completionTokens
+        : delta.usage.totalTokens ?? completion.usage?.totalTokens,
     }
   }
 }
@@ -535,7 +543,7 @@ function assertCompletionContent(completion: ParsedCorrectionCompletion): Parsed
   return completion
 }
 
-function parseSseCompletion(text: string): ParsedCorrectionCompletion {
+function parseSseCompletion(text: string, provider: CorrectionConfigSnapshot['provider']): ParsedCorrectionCompletion {
   const completion: ParsedCorrectionCompletion = { content: '' }
   const normalized = text.replace(/\r\n/g, '\n')
   const events = normalized.split(/\n\n+/)
@@ -545,7 +553,7 @@ function parseSseCompletion(text: string): ParsedCorrectionCompletion {
       .filter((line) => line.startsWith('data:'))
       .map((line) => line.slice(5).trim())
       .join('\n')
-    applySseData(completion, data)
+    applySseData(completion, data, provider)
   }
   return assertCompletionContent(completion)
 }
@@ -563,7 +571,7 @@ async function readSseCompletion(
   let dataLines: string[] = []
   const flushEvent = () => {
     if (dataLines.length === 0) return
-    applySseData(completion, dataLines.join('\n'))
+    applySseData(completion, dataLines.join('\n'), request.snapshot.provider)
     dataLines = []
   }
   const consume = (chunk: string) => {
@@ -587,7 +595,10 @@ async function readSseCompletion(
   return assertCompletionContent(completion)
 }
 
-function parseJsonCompletion(text: string): { content: string; usage?: CorrectionUsage } {
+function parseJsonCompletion(
+  text: string,
+  provider: CorrectionConfigSnapshot['provider'],
+): { content: string; usage?: CorrectionUsage } {
   let payload: unknown
   try {
     payload = JSON.parse(text)
@@ -596,17 +607,11 @@ function parseJsonCompletion(text: string): { content: string; usage?: Correctio
   }
   const payloadError = classifyPayloadError(payload)
   if (payloadError) throw payloadError
-  const content = extractOpenAiMessageContent(payload)
+  const content = extractAiMessageContent(payload, provider)
   if (!content.trim()) throw new CorrectionRequestError('Correction response contained no visible content', 'protocol', false)
-  const rawUsage = payload && typeof payload === 'object' ? (payload as { usage?: unknown }).usage : undefined
-  const item = rawUsage && typeof rawUsage === 'object' ? rawUsage as Record<string, unknown> : undefined
   return {
     content,
-    usage: item ? {
-      promptTokens: typeof item.prompt_tokens === 'number' ? item.prompt_tokens : undefined,
-      completionTokens: typeof item.completion_tokens === 'number' ? item.completion_tokens : undefined,
-      totalTokens: typeof item.total_tokens === 'number' ? item.total_tokens : undefined,
-    } : undefined,
+    usage: extractAiUsage(payload, provider),
   }
 }
 
@@ -623,10 +628,14 @@ function buildCorrectionShardResponseFromCompletion(
   }
 }
 
-function buildCorrectionShardResponse(text: string, contentType: string): Omit<CorrectionShardResponse, 'attempt'> {
+function buildCorrectionShardResponse(
+  text: string,
+  contentType: string,
+  provider: CorrectionConfigSnapshot['provider'],
+): Omit<CorrectionShardResponse, 'attempt'> {
   const completion = contentType.toLowerCase().includes('text/event-stream') || /^\s*data:/m.test(text)
-    ? parseSseCompletion(text)
-    : parseJsonCompletion(text)
+    ? parseSseCompletion(text, provider)
+    : parseJsonCompletion(text, provider)
   return buildCorrectionShardResponseFromCompletion(completion)
 }
 
@@ -637,7 +646,7 @@ async function requestOnceViaRecoverySession(
 ): Promise<Omit<CorrectionShardResponse, 'attempt'>> {
   const recoveryFetch = typeof window !== 'undefined' ? window.electronAPI?.aiCorrectionRecoveryFetch : undefined
   if (!recoveryFetch) throw new CorrectionRequestError('Isolated recovery transport is unavailable', 'network', true)
-  const context = createOpenAiRequestContext(request.snapshot.baseUrl, request.apiKey)
+  const context = createAiRequestContext(request.snapshot.provider, request.snapshot.baseUrl, request.apiKey)
   const firstByteMs = request.timeouts?.firstByteMs ?? request.timeoutMs ?? DEFAULT_FIRST_BYTE_TIMEOUT_MS
   const idleMs = request.timeouts?.idleMs ?? request.timeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS
   const absoluteMs = request.timeouts?.absoluteMs ?? Math.max(request.timeoutMs ?? 0, DEFAULT_ABSOLUTE_TIMEOUT_MS)
@@ -662,7 +671,8 @@ async function requestOnceViaRecoverySession(
     const transport = recoveryFetch({
       requestId,
       url: context.completionUrl,
-      apiKey: context.headers.Authorization?.slice('Bearer '.length),
+      provider: context.provider,
+      apiKey: request.apiKey,
       body: JSON.stringify(buildCorrectionRequestBody(request)),
       firstByteTimeoutMs: firstByteMs,
       idleTimeoutMs: idleMs,
@@ -686,14 +696,14 @@ async function requestOnceViaRecoverySession(
     if (response.status < 200 || response.status >= 300) {
       let safeMessage = response.body.slice(0, 500) || `AI request failed: HTTP ${response.status}`
       try {
-        const envelope = extractOpenAiErrorEnvelope(JSON.parse(response.body))
+        const envelope = extractAiErrorEnvelope(JSON.parse(response.body))
         if (envelope) safeMessage = envelope.message
       } catch {
         // Plain-text error bodies remain useful diagnostics.
       }
       throw classifyHttpError(response.status, safeMessage, parseRetryAfter(response.retryAfter || null))
     }
-    return buildCorrectionShardResponse(response.body, response.contentType || '')
+    return buildCorrectionShardResponse(response.body, response.contentType || '', request.snapshot.provider)
   } catch (error) {
     if (error instanceof CorrectionRequestError) throw error
     if (request.signal?.aborted) throw new CorrectionRequestError('Correction request was aborted', 'aborted', false)
@@ -729,7 +739,7 @@ async function requestOnce(
   request.signal?.addEventListener('abort', abort, { once: true })
   try {
     emitProgress(request, 'connecting', attempt, maxAttempts)
-    const context = createOpenAiRequestContext(request.snapshot.baseUrl, request.apiKey)
+    const context = createAiRequestContext(request.snapshot.provider, request.snapshot.baseUrl, request.apiKey)
     const firstByteTimeout = new Promise<never>((_, reject) => {
       firstByteTimer = setTimeout(() => {
         timeoutKind = 'first-byte'
@@ -767,7 +777,7 @@ async function requestOnce(
       })
       let safeMessage = text.slice(0, 500) || `AI request failed: HTTP ${response.status}`
       try {
-        const envelope = extractOpenAiErrorEnvelope(JSON.parse(text))
+        const envelope = extractAiErrorEnvelope(JSON.parse(text))
         if (envelope) safeMessage = envelope.message
       } catch {
         // Plain-text error bodies remain useful diagnostics.
@@ -780,7 +790,7 @@ async function requestOnce(
       return buildCorrectionShardResponseFromCompletion(completion)
     }
     const text = await readResponseText(response, request, controller, attempt, maxAttempts, idleMs)
-    return buildCorrectionShardResponse(text, contentType)
+    return buildCorrectionShardResponse(text, contentType, request.snapshot.provider)
   } catch (error) {
     if (error instanceof CorrectionRequestError) throw error
     if (request.signal?.aborted) throw new CorrectionRequestError('Correction request was aborted', 'aborted', false)
@@ -926,7 +936,7 @@ export async function testCorrectionConnection(
     maxAttempts: 1,
     timeouts: { firstByteMs: 120_000, idleMs: 60_000, absoluteMs: 5 * 60_000 },
   })
-  return { endpoint: safeOpenAiEndpoint(snapshot.baseUrl), model: snapshot.model, transport: snapshot.transport || 'json' }
+  return { endpoint: safeAiEndpoint(snapshot.baseUrl), model: snapshot.model, transport: snapshot.transport || 'json' }
 }
 
 export interface DetectResult {

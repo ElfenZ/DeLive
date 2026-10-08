@@ -1,4 +1,6 @@
 import type { RecordingState } from './recordingState'
+import type { OriginalSourceInfo, OriginalSourceResult } from './originalSources'
+import type { StorageOperationResult, StorageDirectoryTarget, TranscriptDirectorySelection, ManagedAssetReference, ManagedAssetKind, MediaMigrationResult, LocalFileChange, SessionFileContext, ManagedNamingState, CorrectedMarkdownSaveRequest, CorrectedMarkdownFileState } from './fileStorage'
 
 export interface DesktopSource {
   id: string
@@ -228,6 +230,7 @@ export interface SessionDetail {
 export interface AiCorrectionRecoveryRequest {
   requestId: string
   url: string
+  provider: 'openai-compatible' | 'anthropic-compatible'
   apiKey?: string
   body: string
   firstByteTimeoutMs: number
@@ -317,6 +320,7 @@ export interface RecordingArchiveSaveResult {
   mimeType?: string
   fileName?: string
   error?: string
+  managedAsset?: ManagedAssetReference
 }
 
 export interface RecordingArchiveBeginRequest {
@@ -338,7 +342,7 @@ export interface RecordingArchiveFinalizeRequest {
 
 export interface RecordingArchiveRecoverySkippedItem {
   sessionId: string
-  reason: 'missing-pcm' | 'missing-metadata' | 'empty-audio' | 'finalize-failed'
+  reason: 'missing-pcm' | 'missing-metadata' | 'invalid-metadata' | 'active-recording' | 'empty-audio' | 'finalize-failed'
   error?: string
 }
 
@@ -347,11 +351,102 @@ export interface RecordingArchiveRecoverResult {
   recovered: RecordingArchiveSaveResult[]
   skipped?: RecordingArchiveRecoverySkippedItem[]
   error?: string
+  notices?: import('./fileStorage').RecordingRecoveryNotice[]
+  ignoredCount?: number
+}
+
+export type MediaProcessingErrorCode =
+  | 'MEDIA_TOOLS_UNAVAILABLE'
+  | 'MEDIA_SOURCE_INVALID'
+  | 'MEDIA_NO_AUDIO'
+  | 'MEDIA_EXTRACTION_CANCELLED'
+  | 'MEDIA_EXTRACTION_FAILED'
+  | 'MEDIA_AUDIO_MISSING'
+  | 'MEDIA_FILE_BUSY'
+  | 'MEDIA_FILE_CONFLICT'
+  | 'MEDIA_ROOT_UNAVAILABLE'
+
+export interface MediaExtractAudioRequest {
+  taskId: string
+  sessionId: string
+  sourcePath: string
+}
+
+export interface MediaArchivedAudio {
+  sessionId: string
+  path: string
+  fileName: string
+  mimeType: string
+  assetKind?: ManagedAssetKind
+  revision?: number
+  sha256?: string
+  size: number
+  durationMs?: number
+}
+
+export interface MediaOperationResult {
+  ok: boolean
+  audio?: MediaArchivedAudio
+  error?: string
+  code?: MediaProcessingErrorCode
+}
+
+export interface MediaReadAudioResult extends MediaOperationResult {
+  data?: ArrayBuffer
+}
+
+export interface MediaListAudioResult extends MediaOperationResult {
+  audios?: MediaArchivedAudio[]
+  errors?: Array<{ sessionId: string; error: string }>
+  configurationRevision?: number
+  changeSequence?: number
+  deleted?: ManagedAssetReference[]
+  naming?: Array<{ sessionId: string; state: ManagedNamingState }>
+}
+
+export interface MediaExtractionProgress {
+  taskId: string
+  sessionId: string
+  progress: number
+  processedMs: number
+  durationMs?: number
 }
 
 // ─── Core types ───
 
 export interface ElectronAPI {
+  manualExportFile: (request: { filename: string; content: string; defaultSaveProjectId?: string }) => Promise<{ ok: boolean; cancelled?: boolean; error?: string }>
+  getFileStorageStatus: () => Promise<StorageOperationResult>
+  chooseMediaDirectory: () => Promise<StorageOperationResult | null>
+  setPerformanceDiagnostics: (enabled: boolean) => Promise<{ ok: boolean }>
+  getPerformanceDiagnostics: () => Promise<{ records: import('./performanceDiagnostics').PerformanceDiagnostic[] }>
+  clearPerformanceDiagnostics: () => Promise<{ ok: boolean }>
+  chooseTranscriptDirectory: (selection: TranscriptDirectorySelection) => Promise<StorageOperationResult | null>
+  openStorageDirectory: (target: StorageDirectoryTarget) => Promise<{ ok: boolean; error?: string }>
+  chooseMediaMigration: () => Promise<MediaMigrationResult | null>
+  applyMediaMigration: (token: string) => Promise<MediaMigrationResult | null>
+  resumeMediaMigration: (id: string) => Promise<MediaMigrationResult>
+  cleanupMediaMigration: (id: string) => Promise<MediaMigrationResult | null>
+  abandonMediaMigration: (id: string) => Promise<MediaMigrationResult | null>
+  onFileStorageChanged: (callback: (event: LocalFileChange) => void) => () => void
+  registerSessionFiles: (context: SessionFileContext, nameFiles?: boolean) => Promise<{ ok: boolean; naming?: ManagedNamingState; error?: string }>
+  previewManagedNames: (contexts: SessionFileContext[]) => Promise<{ ok: boolean; token?: string; items?: Array<{ sessionId: string; oldName: string; newName: string; revision: number }>; error?: string }>
+  applyManagedNames: (token: string) => Promise<{ ok: boolean; error?: string } | null>
+  markFileRecordDeletion: (sessionId: string, phase: 'prepare' | 'commit' | 'cancel') => Promise<{ ok: boolean; error?: string }>
+  reconcileFileRecordBindings: (contexts: SessionFileContext[], deletedIds: string[]) => Promise<{ ok: boolean; error?: string }>
+  registerOriginalSource: (filePath: string, sessionId: string) => Promise<OriginalSourceResult>
+  acquireOriginalRead: (sourceId: string, sessionId: string) => Promise<{ ok: boolean; token?: string; error?: string }>
+  releaseOriginalRead: (token: string) => Promise<void>
+  readOriginalAudio: (token: string) => Promise<{ ok: boolean; data?: Uint8Array; fileName?: string; error?: string }>
+  previewOriginalRename: (sourceId: string, sessionId: string) => Promise<OriginalSourceResult>
+  previewOriginalUndo: (sourceId: string, sessionId: string) => Promise<OriginalSourceResult>
+  commitOriginalRename: (token: string) => Promise<OriginalSourceResult | null>
+  onOriginalSourceChanged: (callback: (source: OriginalSourceInfo) => void) => () => void
+  listOriginalSources: () => Promise<{ ok: boolean; sources?: OriginalSourceInfo[]; error?: string }>
+  savePublishedMarkdown: (request: CorrectedMarkdownSaveRequest) => Promise<{ ok: boolean; file?: CorrectedMarkdownFileState; error?: string }>
+  relocatePublishedMarkdown: (sessionId: string) => Promise<{ ok: boolean; file?: CorrectedMarkdownFileState; error?: string } | null>
+  locatePublishedMarkdown: (sessionId: string) => Promise<{ ok: boolean; file?: CorrectedMarkdownFileState; error?: string } | null>
+  adoptLegacyPublishedMarkdown: (request: CorrectedMarkdownSaveRequest) => Promise<{ ok: boolean; file?: CorrectedMarkdownFileState; error?: string } | null>
   getAppVersion: () => Promise<string>
   getProxyPort: () => Promise<number>
   aiCorrectionRecoveryFetch: (request: AiCorrectionRecoveryRequest) => Promise<AiCorrectionRecoveryResponse>
@@ -364,6 +459,7 @@ export interface ElectronAPI {
   getAutoLaunch: () => Promise<boolean>
   setAutoLaunch: (enable: boolean) => Promise<boolean>
   pickFilePath: (options?: FilePickerOptions) => Promise<string | null>
+  getPathForFile: (file: File) => string
   pickDirectoryPath: () => Promise<string | null>
   pathExists: (targetPath: string) => Promise<boolean>
   writeAutoExportFile: (request: AutoExportFileRequest) => Promise<AutoExportFileResult>
@@ -373,8 +469,18 @@ export interface ElectronAPI {
   appendRecordingArchive: (request: RecordingArchiveAppendRequest) => Promise<RecordingArchiveSaveResult>
   finalizeRecordingArchive: (request: RecordingArchiveFinalizeRequest) => Promise<RecordingArchiveSaveResult>
   abortRecordingArchive: (request: { sessionId: string }) => Promise<{ ok: boolean; error?: string }>
-  recoverRecordingArchives: () => Promise<RecordingArchiveRecoverResult>
+  recoverRecordingArchives: (activeSessionIds?: string[]) => Promise<RecordingArchiveRecoverResult>
+  listRecordingRecoveryNotices: (activeSessionIds: string[]) => Promise<{ ok: boolean; items?: import('./fileStorage').RecordingRecoveryNotice[]; error?: string }>
+  acknowledgeRecordingRecovery: (request: { key: string; evidence: string; activeSessionIds: string[] }) => Promise<{ ok: boolean; error?: string }>
   revealRecordingArchive: (targetPath: string) => Promise<{ ok: boolean; error?: string }>
+  extractMediaAudio: (request: MediaExtractAudioRequest) => Promise<MediaOperationResult>
+  cancelMediaExtraction: (taskId: string) => Promise<boolean>
+  getMediaAudio: (sessionId: string) => Promise<MediaOperationResult>
+  listMediaAudio: () => Promise<MediaListAudioResult>
+  readMediaAudio: (sessionId: string) => Promise<MediaReadAudioResult>
+  revealMediaAudio: (sessionId: string) => Promise<MediaOperationResult>
+  deleteMediaAudio: (sessionId: string) => Promise<MediaOperationResult>
+  onMediaExtractionProgress: (callback: (progress: MediaExtractionProgress) => void) => () => void
   localRuntimeGetStatus: (runtimeId: string, options?: LocalRuntimeLaunchOptions) => Promise<LocalRuntimeSnapshot>
   localRuntimeOpenModelsPath: (runtimeId: string) => Promise<PathOperationResult>
   localRuntimeListModels: (runtimeId: string) => Promise<string[]>
@@ -430,18 +536,18 @@ export interface ElectronAPI {
   apiNotifySessionStart: (sessionId: string) => void
   apiNotifySessionEnd: (sessionId: string) => void
 
-  onApiGetSessions: (callback: (event: unknown) => void) => () => void
-  apiRespondSessions: (sessions: SessionSummary[]) => void
-  onApiGetSessionDetail: (callback: (event: unknown, sessionId: string) => void) => () => void
-  apiRespondSessionDetail: (session: SessionDetail | null) => void
-  onApiSearchSessions: (callback: (event: unknown, query: string) => void) => () => void
-  apiRespondSearchSessions: (sessions: SessionSummary[]) => void
-  onApiGetTopics: (callback: (event: unknown) => void) => () => void
-  apiRespondTopics: (topics: ApiTopicData[]) => void
-  onApiGetTags: (callback: (event: unknown) => void) => () => void
-  apiRespondTags: (tags: ApiTagData[]) => void
-  onApiGetRecordingStatus: (callback: (event: unknown) => void) => () => void
-  apiRespondRecordingStatus: (status: ApiRecordingStatus) => void
+  onApiGetSessions: (callback: (event: unknown, requestId: string, filter?: import('./apiTypes').ApiSessionFilter) => void) => () => void
+  apiRespondSessions: (sessions: SessionSummary[], requestId: string) => void
+  onApiGetSessionDetail: (callback: (event: unknown, sessionId: string, requestId: string) => void) => () => void
+  apiRespondSessionDetail: (session: SessionDetail | null, requestId: string) => void
+  onApiSearchSessions: (callback: (event: unknown, query: string, requestId: string, filter?: import('./apiTypes').ApiSessionFilter) => void) => () => void
+  apiRespondSearchSessions: (sessions: SessionSummary[], requestId: string) => void
+  onApiGetTopics: (callback: (event: unknown, requestId: string) => void) => () => void
+  apiRespondTopics: (topics: ApiTopicData[], requestId: string) => void
+  onApiGetTags: (callback: (event: unknown, requestId: string) => void) => () => void
+  apiRespondTags: (tags: ApiTagData[], requestId: string) => void
+  onApiGetRecordingStatus: (callback: (event: unknown, requestId: string) => void) => () => void
+  apiRespondRecordingStatus: (status: ApiRecordingStatus, requestId: string) => void
 
   apiUpdateOpenApiConfig: (config: { enabled: boolean; token: string }) => void
 

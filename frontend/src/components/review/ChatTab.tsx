@@ -22,6 +22,7 @@ import { isAiPostProcessConfigured } from '../../services/aiPostProcess'
 import { generateId } from '../../utils/storage'
 import { TextSourceBanner } from './TextSourceBanner'
 import { MarkdownRenderer } from './MarkdownRenderer'
+import { ActionDialog } from '../ActionDialog'
 
 interface ChatTabProps {
   session: TranscriptSession
@@ -79,6 +80,12 @@ export function ChatTab({ session }: ChatTabProps) {
   const messagesContainerRef = useRef<HTMLDivElement>(null)
   const askMessagesEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const composingRef = useRef(false)
+  const [prefilled, setPrefilled] = useState(false)
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
+  const [deleteError, setDeleteError] = useState('')
+  const [deleting, setDeleting] = useState(false)
+  const deletingRef = useRef(false)
 
   const askHistory = useMemo(() => session.askHistory || [], [session.askHistory])
   const aiConfigured = isAiPostProcessConfigured(settings)
@@ -86,7 +93,9 @@ export function ChatTab({ session }: ChatTabProps) {
 
   useEffect(() => {
     setQuestionDraft('')
-    setActiveConversationId('default')
+    const chosen = useUIStore.getState().reviewConversation
+    const current = useSessionStore.getState().sessions.find((item) => item.id === session.id)
+    setActiveConversationId(chosen?.sessionId === session.id ? chosen.conversationId : current?.askHistory?.find((turn) => turn.status === 'pending')?.conversationId || 'default')
     setIsNewThread(false)
   }, [session.id])
 
@@ -163,9 +172,10 @@ export function ChatTab({ session }: ChatTabProps) {
   }, [questionDraft, adjustTextareaHeight])
 
   const handleAskQuestion = async () => {
-    if (!session || askPending || !questionDraft.trim()) return
+    if (!session || askPending || !questionDraft.trim() || !aiConfigured || !session.transcript.trim() || composingRef.current) return
     const question = questionDraft
     setQuestionDraft('')
+    setPrefilled(false)
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
     try {
       if (enableStreaming) {
@@ -185,23 +195,22 @@ export function ChatTab({ session }: ChatTabProps) {
   const handleStartNewConversation = () => {
     const newId = generateId()
     setActiveConversationId(newId)
+    useUIStore.getState().setReviewConversation(session.id, newId)
     setIsNewThread(true)
     setQuestionDraft('')
   }
 
   const handleSelectConversation = useCallback((id: string) => {
     setActiveConversationId(id)
+    useUIStore.getState().setReviewConversation(session.id, id)
     setIsNewThread(false)
-  }, [])
+  }, [session.id])
 
   const handleDeleteConversation = useCallback((e: React.MouseEvent, conversationId: string) => {
     e.stopPropagation()
-    deleteSessionConversation(session.id, conversationId)
-    if (activeConversationId === conversationId) {
-      setActiveConversationId('default')
-      setIsNewThread(false)
-    }
-  }, [session.id, activeConversationId, deleteSessionConversation])
+    setDeleteError('')
+    setPendingDeleteId(conversationId)
+  }, [])
 
   const handleCopyMessage = useCallback((messageId: string, text: string) => {
     void navigator.clipboard.writeText(text)
@@ -268,7 +277,9 @@ export function ChatTab({ session }: ChatTabProps) {
               </button>
               <button
                 onClick={(e) => handleDeleteConversation(e, conversation.id)}
-                className="ml-0.5 hidden h-4 w-4 shrink-0 items-center justify-center rounded-full text-muted-foreground/60 transition-colors hover:bg-destructive/10 hover:text-destructive group-hover/thread:inline-flex"
+                disabled={askPending || deleting}
+                aria-label={`${t.common.delete}: ${getConversationLabel(conversation.id, conversation.firstTurn?.question, index)}`}
+                className="ml-0.5 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-muted-foreground/60 transition-colors hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
                 title={t.common.delete}
               >
                 <Trash2 className="h-2.5 w-2.5" />
@@ -296,6 +307,7 @@ export function ChatTab({ session }: ChatTabProps) {
       </div>
 
       {/* Messages area */}
+      {askPending && <button className="shrink-0 border-b border-border px-4 py-2 text-left text-xs text-primary" onClick={() => handleSelectConversation(askHistory.find((turn) => turn.status === 'pending')?.conversationId || 'default')}>{t.preview.locateActiveThread}</button>}
       <div
         ref={messagesContainerRef}
         onScroll={handleScroll}
@@ -438,11 +450,12 @@ export function ChatTab({ session }: ChatTabProps) {
                   {askSuggestions.map((suggestion) => (
                     <button
                       key={suggestion}
-                      onClick={() => setQuestionDraft(suggestion)}
+                      onClick={() => { setQuestionDraft(suggestion); setPrefilled(true); textareaRef.current?.focus() }}
+                      aria-label={`${t.preview.fillQuestion}: ${suggestion}`}
                       className="inline-flex items-center gap-1.5 rounded-xl border border-border/40 bg-card px-3.5 py-2 text-xs font-medium text-foreground shadow-sm transition-all hover:border-foreground/20 hover:bg-accent hover:shadow-md active:scale-[0.98]"
                     >
                       <ArrowUpRight className="h-3 w-3 text-muted-foreground" />
-                      {suggestion}
+                      {t.preview.fillQuestion}: {suggestion}
                     </button>
                   ))}
                 </div>
@@ -470,8 +483,11 @@ export function ChatTab({ session }: ChatTabProps) {
             <textarea
               ref={textareaRef}
               value={questionDraft}
-              onChange={(event) => setQuestionDraft(event.target.value)}
+              onChange={(event) => { setQuestionDraft(event.target.value); setPrefilled(false) }}
+              onCompositionStart={() => { composingRef.current = true }}
+              onCompositionEnd={() => { composingRef.current = false }}
               onKeyDown={(event) => {
+                if (composingRef.current || event.nativeEvent.isComposing || event.keyCode === 229) return
                 if (event.key === 'Enter' && !event.shiftKey) {
                   event.preventDefault()
                   void handleAskQuestion()
@@ -499,11 +515,26 @@ export function ChatTab({ session }: ChatTabProps) {
               )}
             </button>
           </div>
+          {prefilled && <p role="status" className="mt-1 text-xs text-muted-foreground">{t.preview.questionNotSent}</p>}
           <p className="mt-1.5 text-center text-[10px] text-muted-foreground/70">
             Enter {t.preview.askSend} · Shift+Enter {'\u2191'}
           </p>
         </div>
       </div>
+      <ActionDialog open={Boolean(pendingDeleteId)} title={t.preview.clearConversation} description={`${t.preview.clearConversationHint}${deleteError ? `\n\n${deleteError}` : ''}`} onClose={() => { if (!deletingRef.current) setPendingDeleteId(null) }} actions={[
+        { label: t.common.cancel, variant: 'secondary', disabled: deleting, onClick: () => setPendingDeleteId(null) },
+        { label: t.common.delete, variant: 'danger', disabled: deleting || askPending, onClick: () => {
+          if (!pendingDeleteId || deletingRef.current) return
+          deletingRef.current = true
+          setDeleting(true)
+          try {
+            deleteSessionConversation(session.id, pendingDeleteId)
+            if (activeConversationId === pendingDeleteId) { setActiveConversationId('default'); setIsNewThread(false) }
+            setPendingDeleteId(null)
+          } catch (error) { setDeleteError(error instanceof Error ? error.message : String(error)) }
+          finally { deletingRef.current = false; setDeleting(false) }
+        } },
+      ]} />
     </div>
   )
 }

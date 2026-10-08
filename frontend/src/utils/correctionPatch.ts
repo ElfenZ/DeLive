@@ -3,6 +3,7 @@ import type {
   CorrectionPatchSafetyLimits,
   CorrectionShardPlan,
   ModelCorrectionPatch,
+  ManualCorrectionEdit,
   ResolvedCorrectionPatch,
 } from '../types'
 
@@ -172,12 +173,27 @@ function rejectedPatch(
     sourceStart: shard.coreStart,
     sourceEnd: shard.coreStart,
     sourceText: '',
-    replacement: patch.replacement,
+    replacement: patch.replacement.slice(0, DEFAULT_CORRECTION_PATCH_LIMITS.maxPatchTextLength),
     sourceTextHash: sourceHash,
     category: patch.category,
-    reason: patch.reason,
+    reason: patch.reason.slice(0, DEFAULT_CORRECTION_PATCH_LIMITS.maxPatchTextLength),
     state: 'rejected',
     rejectionReason: reason,
+    origin: 'ai',
+    locationVerified: false,
+    modelIntent: boundedModelIntent(patch),
+  }
+}
+
+function boundedModelIntent(patch: ModelCorrectionPatch): ModelCorrectionPatch {
+  const limit = DEFAULT_CORRECTION_PATCH_LIMITS.maxPatchTextLength
+  return {
+    ...patch,
+    oldText: patch.oldText.slice(0, limit),
+    replacement: patch.replacement.slice(0, limit),
+    before: patch.before.slice(0, limit),
+    after: patch.after.slice(0, limit),
+    reason: patch.reason.slice(0, limit),
   }
 }
 
@@ -229,10 +245,13 @@ function resolveOnePatch(
     category: patch.category,
     reason: patch.reason,
     state: 'proposed',
+    origin: 'ai',
+    locationVerified: true,
+    modelIntent: boundedModelIntent(patch),
   }
 }
 
-function patchesConflict(left: ResolvedCorrectionPatch, right: ResolvedCorrectionPatch): boolean {
+export function patchesConflict(left: ResolvedCorrectionPatch, right: ResolvedCorrectionPatch): boolean {
   if (left.state === 'rejected' || right.state === 'rejected') return false
   if (left.sourceStart === left.sourceEnd && right.sourceStart === right.sourceEnd) {
     return left.sourceStart === right.sourceStart
@@ -304,8 +323,10 @@ function validateResolvedPatchWithBoundaries(
   limits: CorrectionPatchSafetyLimits,
   boundaries: Set<number>,
 ): string | null {
+  if (patch.state === 'rejected') return 'rejected-patch-requires-manual-recovery'
   if (patch.sourceTextHash !== expectedSourceHash) return 'source-hash-mismatch'
-  if (patch.sourceStart < 0 || patch.sourceEnd < patch.sourceStart || patch.sourceEnd > transcript.length) return 'invalid-source-range'
+  if (!Number.isInteger(patch.sourceStart) || !Number.isInteger(patch.sourceEnd)
+    || patch.sourceStart < 0 || patch.sourceEnd < patch.sourceStart || patch.sourceEnd > transcript.length) return 'invalid-source-range'
   if (!boundaries.has(patch.sourceStart) || !boundaries.has(patch.sourceEnd)) return 'invalid-unicode-boundary'
   if (transcript.slice(patch.sourceStart, patch.sourceEnd) !== patch.sourceText) return 'source-mismatch'
   if (Math.max(patch.sourceText.length, patch.replacement.length) > limits.maxPatchTextLength) return 'patch-text-limit'
@@ -337,6 +358,7 @@ export function updateCorrectionPatchReplacement(
   expectedSourceHash: string,
   limits: CorrectionPatchSafetyLimits = DEFAULT_CORRECTION_PATCH_LIMITS,
 ): { patch?: ResolvedCorrectionPatch; error?: string } {
+  if (patch.state === 'rejected') return { error: 'rejected-patch-requires-manual-recovery' }
   const op = patch.sourceText
     ? replacement ? 'replace' as const : 'delete' as const
     : 'insert' as const
@@ -354,6 +376,88 @@ export function updateCorrectionPatchReplacement(
     limits,
   )
   return error ? { error } : { patch: nextPatch }
+}
+
+export function findCorrectionSourceMatches(transcript: string, sourceText: string): number[] {
+  const boundaries = graphemeBoundarySet(transcript)
+  return allIndices(transcript, sourceText).filter((start) => boundaries.has(start) && boundaries.has(start + sourceText.length))
+}
+
+export class CorrectionConflictError extends Error {
+  constructor(public readonly conflicts: ResolvedCorrectionPatch[]) {
+    super('patch-conflict-confirmation-required')
+    this.name = 'CorrectionConflictError'
+  }
+}
+
+export function applyManualCorrectionEdit(
+  transcript: string,
+  patches: ResolvedCorrectionPatch[],
+  edit: ManualCorrectionEdit,
+  sourceHash: string,
+  newPatchId: string,
+  state: 'proposed' | 'applied',
+  limits: CorrectionPatchSafetyLimits = DEFAULT_CORRECTION_PATCH_LIMITS,
+): ResolvedCorrectionPatch[] {
+  const current = edit.patchId ? patches.find((patch) => patch.id === edit.patchId) : undefined
+  if (edit.patchId && (!current || current.state === 'rejected')) throw new Error('patch-not-editable')
+  if (current) {
+    if (current.sourceTextHash !== sourceHash) throw new Error('source-hash-mismatch')
+    if (transcript.slice(current.sourceStart, current.sourceEnd) !== current.sourceText) throw new Error('source-mismatch')
+  }
+  const rejected = edit.recoveredFromPatchId ? patches.find((patch) => patch.id === edit.recoveredFromPatchId) : undefined
+  if (edit.recoveredFromPatchId && (!rejected || rejected.state !== 'rejected')) throw new Error('rejected-patch-not-found')
+  if (rejected && patches.some((patch) => patch.recoveredFromPatchId === rejected.id && patch.id !== edit.patchId)) {
+    throw new Error('rejected-patch-already-recovered')
+  }
+  if (rejected?.locationVerified && rejected.sourceStart === edit.sourceStart && rejected.sourceEnd === edit.sourceEnd) {
+    if (rejected.sourceTextHash !== sourceHash) throw new Error('source-hash-mismatch')
+    if (transcript.slice(rejected.sourceStart, rejected.sourceEnd) !== rejected.sourceText) throw new Error('source-mismatch')
+  }
+  // Same canonical range edits update one item rather than stacking effective patches.
+  const sameRange = current || patches.find((patch) => patch.state !== 'rejected'
+    && patch.sourceStart === edit.sourceStart && patch.sourceEnd === edit.sourceEnd)
+  const patch: ResolvedCorrectionPatch = {
+    ...sameRange,
+    id: sameRange?.id || newPatchId,
+    shardId: sameRange?.shardId || 'manual',
+    op: edit.sourceText ? edit.replacement ? 'replace' : 'delete' : 'insert',
+    sourceStart: edit.sourceStart,
+    sourceEnd: edit.sourceEnd,
+    sourceText: edit.sourceText,
+    replacement: edit.replacement,
+    sourceTextHash: sourceHash,
+    category: sameRange?.category || rejected?.category || 'asr-substitution',
+    reason: sameRange?.reason || rejected?.reason || 'Manual correction',
+    state,
+    origin: 'manual',
+    locationVerified: true,
+    rejectionReason: undefined,
+    recoveredFromPatchId: rejected?.id || sameRange?.recoveredFromPatchId,
+  }
+  const error = validateResolvedCorrectionPatch(transcript, patch, sourceHash, limits)
+  if (error) throw new Error(error)
+  const conflicts = patches.filter((item) => item.id !== patch.id
+    && (item.state === 'applied' || item.state === 'proposed') && patchesConflict(item, patch))
+  const confirmed = new Set(edit.confirmedConflictIds || [])
+  const conflictIds = new Set(conflicts.map((item) => item.id))
+  const next = patches.filter((item) => item.id !== patch.id).map((item) => conflictIds.has(item.id)
+    ? { ...item, state: 'reverted' as const } : item)
+  next.push(patch)
+  const active = next.filter((item) => item.state === 'proposed' || item.state === 'applied')
+  const shardCounts = new Map<string, number>()
+  for (const item of active) {
+    const count = (shardCounts.get(item.shardId) || 0) + 1
+    if (count > limits.maxPatchesPerShard) throw new Error('patch-count-limit')
+    shardCounts.set(item.shardId, count)
+    const validationError = validateResolvedCorrectionPatch(transcript, item, sourceHash, limits)
+    if (validationError) throw new Error(validationError)
+  }
+  if (partitionCorrectionPatchConflicts(active).rejected.length) throw new Error('patch-conflict')
+  const safetyError = validateCorrectionPatchSet(transcript, next, limits)
+  if (safetyError) throw new Error(safetyError)
+  if (conflicts.some((item) => !confirmed.has(item.id))) throw new CorrectionConflictError(conflicts)
+  return next
 }
 
 export function validateCorrectionPatchSet(

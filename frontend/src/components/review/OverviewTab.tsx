@@ -4,12 +4,12 @@ import {
   Check,
   X,
   FolderOpen,
-  ArrowRight,
 } from 'lucide-react'
 import type { TranscriptSession, TranscriptSpeaker } from '../../types'
 import { useUIStore } from '../../stores/uiStore'
 import { useSessionStore } from '../../stores/sessionStore'
-import { useTopicStore } from '../../stores/topicStore'
+import { SessionProjectLinks } from '../SessionProjectLinks'
+import { OriginalSourcePanel } from './OriginalSourcePanel'
 
 const OVERVIEW_SPEAKER_COLORS = [
   { bg: 'bg-blue-500', text: 'text-white' },
@@ -27,9 +27,6 @@ interface OverviewTabProps {
 export function OverviewTab({ session }: OverviewTabProps) {
   const { t } = useUIStore()
   const updateSessionSpeakers = useSessionStore((state) => state.updateSessionSpeakers)
-  const topics = useTopicStore((state) => state.topics)
-  const updateSessionTopic = useSessionStore((state) => state.updateSessionTopic)
-  const [showTopicMenu, setShowTopicMenu] = useState(false)
   const [editingSpeakerId, setEditingSpeakerId] = useState<string | null>(null)
   const [speakerDraftName, setSpeakerDraftName] = useState('')
 
@@ -144,52 +141,8 @@ export function OverviewTab({ session }: OverviewTabProps) {
             {t.topics.title}
           </div>
         </div>
-        {(() => {
-          const currentTopic = session.topicId ? topics.find((tp) => tp.id === session.topicId) : null
-          return (
-            <div className="relative">
-              {currentTopic ? (
-                <div className="flex items-center gap-3">
-                  <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-base">{currentTopic.emoji}</span>
-                  <span className="text-sm font-medium text-foreground">{currentTopic.name}</span>
-                  <button
-                    onClick={() => updateSessionTopic(session.id, undefined)}
-                    className="ml-auto inline-flex items-center gap-1 rounded-md border border-border/30 px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                  >
-                    <X className="h-3 w-3" />
-                    {t.topics.removeFromTopic}
-                  </button>
-                </div>
-              ) : (
-                <button
-                  onClick={() => setShowTopicMenu(!showTopicMenu)}
-                  className="inline-flex items-center gap-2 rounded-lg border border-dashed border-border px-4 py-2.5 text-sm text-muted-foreground transition-colors hover:border-primary/30 hover:bg-primary/5 hover:text-foreground"
-                >
-                  <ArrowRight className="h-3.5 w-3.5" />
-                  {t.topics.moveToTopic}
-                </button>
-              )}
-
-              {showTopicMenu && !currentTopic && topics.length > 0 && (
-                <div className="absolute left-0 top-full z-10 mt-1 min-w-[200px] rounded-lg border border-border bg-popover py-1 shadow-lg">
-                  {topics.map((tp) => (
-                    <button
-                      key={tp.id}
-                      onClick={() => {
-                        updateSessionTopic(session.id, tp.id)
-                        setShowTopicMenu(false)
-                      }}
-                      className="flex w-full items-center gap-2.5 px-3 py-2 text-sm text-foreground transition-colors hover:bg-accent"
-                    >
-                      <span>{tp.emoji}</span>
-                      <span className="truncate">{tp.name}</span>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-          )
-        })()}
+        <SessionProjectLinks session={session} />
+        <OriginalSourcePanel session={session} />
       </div>
     </div>
   )

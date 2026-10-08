@@ -84,7 +84,7 @@ export function SpeakerCorrectionResult({ projection, speakers, isZh }: SpeakerC
                   {context && <span className="font-mono text-[10px] tabular-nums text-muted-foreground">{context}</span>}
                 </div>
                 {item.diff.length > 0
-                  ? <p className="m-0 whitespace-pre-wrap text-sm leading-relaxed text-foreground/90">{item.diff.map((part, partIndex) => <span key={`${part.patchId || 'text'}-${partIndex}`} className={diffClass(part.type)}>{part.text}</span>)}</p>
+                  ? <p className="m-0 whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground/90">{item.diff.map((part, partIndex) => <span key={`${part.patchId || 'text'}-${partIndex}`} className={diffClass(part.type)}>{part.text}</span>)}</p>
                   : <p className="m-0 text-xs text-muted-foreground">{isZh ? '跨说话人删除，删除内容保留在原说话人段中。' : 'Cross-speaker deletion; removed text remains under its original speakers.'}</p>}
               </div>
             </div>
@@ -116,7 +116,7 @@ export function SpeakerCorrectionResult({ projection, speakers, isZh }: SpeakerC
                 </div>
               )}
               {sameSpeaker && time !== undefined && <span className="mb-0.5 inline-flex items-center gap-1 font-mono text-[10px] tabular-nums text-muted-foreground/60"><Play className="h-2.5 w-2.5" />{time}</span>}
-              <p className="m-0 whitespace-pre-wrap text-sm leading-relaxed text-foreground/90">
+              <p className="m-0 whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground/90">
                 {item.diff.map((part, partIndex) => <span key={`${part.patchId || 'text'}-${partIndex}`} className={diffClass(part.type)}>{part.text}</span>)}
               </p>
             </div>

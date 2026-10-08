@@ -7,8 +7,12 @@ import { useTagStore } from './stores/tagStore'
 import { useTopicStore } from './stores/topicStore'
 import { useASR } from './hooks/useASR'
 import { useApiIpcResponder } from './hooks/useApiIpcResponder'
-import { useSidebarState } from './hooks/useSidebarState'
+import { useSidebarState, getSidebarWidth } from './hooks/useSidebarState'
 import { useCaptionToggle } from './hooks/useCaptionToggle'
+import { useManagedMediaReconciliation } from './hooks/useManagedMediaReconciliation'
+import { usePublishedMarkdownCoordinator } from './hooks/usePublishedMarkdownCoordinator'
+import { usePerformanceDiagnostics } from './hooks/usePerformanceDiagnostics'
+import { reconcileFileRecordBindings } from './utils/fileRecordBindings'
 import { buildProviderConnectConfig, isProviderConfigured } from './utils/providerConfig'
 import { getWhatsNewForVersion, getAllWhatsNew } from './utils/whatsNew'
 import { 
@@ -26,7 +30,6 @@ import { CommandPalette } from './components/CommandPalette'
 import { UpdateNotification } from './components/UpdateNotification'
 import { WhatsNewDialog } from './components/WhatsNewDialog'
 import { ReviewDeskView } from './components/ReviewDeskView'
-import { TopicsView } from './components/TopicsView'
 import { TopicPicker } from './components/TopicPicker'
 import { FileTranscriptionView } from './components/FileTranscriptionView'
 import { initStorage } from './utils/storage'
@@ -69,6 +72,9 @@ function App() {
   }, [addToast])
 
   useApiIpcResponder()
+  useManagedMediaReconciliation(isInitialized)
+  usePublishedMarkdownCoordinator(isInitialized)
+  usePerformanceDiagnostics()
 
   // ASR — lifted to App so global shortcut can reach it
   const {
@@ -131,6 +137,12 @@ function App() {
       loadTags()
       loadTopics()
       const recoverySummary = await loadSessions()
+      await reconcileFileRecordBindings().catch((error: unknown) => addToast('error', error instanceof Error ? error.message : String(error)))
+      try {
+        await useTopicStore.getState().resumePendingDeletion()
+      } catch (error) {
+        addToast('error', error instanceof Error ? error.message : String(error))
+      }
 
       if (!cancelled) {
         if (recoverySummary?.linkedCount) {
@@ -141,12 +153,13 @@ function App() {
               : `Recovered ${recoverySummary.linkedCount} recording audio file${recoverySummary.linkedCount > 1 ? 's' : ''}`,
           )
         }
-        if (recoverySummary && (recoverySummary.unlinkedCount > 0 || recoverySummary.skippedCount > 0)) {
+        const recoveryIssues = recoverySummary?.unresolvedCount ?? ((recoverySummary?.unlinkedCount || 0) + (recoverySummary?.skippedCount || 0))
+        if (recoveryIssues > 0) {
           addToast(
             'warning',
             language === 'zh'
-              ? `有 ${recoverySummary.unlinkedCount + recoverySummary.skippedCount} 个录音音频恢复项未能自动关联，请检查本机媒体目录`
-              : `${recoverySummary.unlinkedCount + recoverySummary.skippedCount} recovered recording item${recoverySummary.unlinkedCount + recoverySummary.skippedCount > 1 ? 's' : ''} could not be linked automatically. Check the local media folder.`,
+              ? `有 ${recoveryIssues} 个录音恢复项待确认，请在设置 → 数据管理查看；已手动迁移的项目可标记不再提醒`
+              : `${recoveryIssues} recording recovery item${recoveryIssues > 1 ? 's' : ''} need review in Settings → Data Management. Acknowledge items you moved manually to stop reminders.`,
           )
         }
         setIsInitialized(true)
@@ -231,7 +244,7 @@ function App() {
 
   const isElectron = !!window.electronAPI?.isElectron
 
-  const sidebarWidth = sidebarCollapsed ? 56 : 224
+  const sidebarWidth = getSidebarWidth(sidebarCollapsed)
 
   return (
     <div className="flex h-screen bg-background text-foreground transition-colors duration-300">
@@ -258,7 +271,7 @@ function App() {
 
       {/* Main content area */}
       <div
-        className="flex-1 flex flex-col min-w-0 overflow-hidden"
+        className="flex-1 flex flex-col min-w-0 overflow-hidden transition-[margin-left] duration-200 ease-in-out"
         style={{
           marginLeft: sidebarWidth,
           marginTop: isElectron ? 32 : 0,
@@ -277,16 +290,9 @@ function App() {
         )}
 
         {/* Review */}
-        {currentView === 'review' && (
+        {(currentView === 'review' || currentView === 'topics') && (
           <div className="flex-1 overflow-hidden animate-view-enter">
-            <ReviewDeskView />
-          </div>
-        )}
-
-        {/* Topics */}
-        {currentView === 'topics' && (
-          <div className="flex-1 overflow-hidden animate-view-enter">
-            <TopicsView />
+            <ReviewDeskView ready={isInitialized} />
           </div>
         )}
 

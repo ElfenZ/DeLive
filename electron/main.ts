@@ -20,6 +20,11 @@ import { registerCloudBackupIpc } from './cloudBackup/cloudBackupIpc'
 import { refreshElectronLang, getElectronStrings } from './i18n'
 import { isAutoUpdateSupported } from './updaterSupport'
 import type { AiCorrectionRecoveryRequest, AiCorrectionRecoveryResponse } from '../shared/electronApi'
+import { buildAiCorrectionRecoveryHeaders } from './aiCorrectionRecovery'
+import { registerMediaIpc, type MediaIpcController } from './mediaIpc'
+import { registerFileStorageIpc } from './fileStorageIpc'
+import { registerOriginalSourceIpc } from './originalSourceIpc'
+import { registerManualExportIpc } from './manualExportIpc'
 
 installLogInterceptor()
 
@@ -39,6 +44,7 @@ let apiServerAttachment: ApiServerAttachment | null = null
 let aiCorrectionRecoveryQueue: Promise<void> = Promise.resolve()
 const aiCorrectionRecoveryControllers = new Map<string, AbortController>()
 let aiCorrectionRecoveryPending = 0
+let mediaIpcController: MediaIpcController | null = null
 const MAX_AI_CORRECTION_RECOVERY_QUEUE = 4
 const MAX_AI_CORRECTION_RECOVERY_RESPONSE_BYTES = 5 * 1024 * 1024
 
@@ -228,6 +234,7 @@ app.on('before-quit', () => {
   isQuitting = true
   captionController.dispose()
   globalShortcut.unregisterAll()
+  mediaIpcController?.dispose()
   void localRuntimeController.stopAll()
   const apiAttachment = apiServerAttachment
   apiServerAttachment = null
@@ -250,6 +257,9 @@ ipcMain.handle('ai-correction-recovery-fetch', async (event, request: AiCorrecti
   const parsed = new URL(request.url)
   if (typeof request.requestId !== 'string' || !/^[a-zA-Z0-9-]{8,100}$/.test(request.requestId)) {
     throw new Error('Invalid AI recovery request id')
+  }
+  if (request.provider !== 'openai-compatible' && request.provider !== 'anthropic-compatible') {
+    throw new Error('Invalid AI recovery provider protocol')
   }
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') throw new Error('Unsupported AI recovery URL protocol')
   if (typeof request.body !== 'string' || request.body.length > 1_000_000) throw new Error('Invalid AI recovery request body')
@@ -287,10 +297,7 @@ ipcMain.handle('ai-correction-recovery-fetch', async (event, request: AiCorrecti
       try {
         response = await recoverySession.fetch(parsed.toString(), {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(request.apiKey?.trim() ? { Authorization: `Bearer ${request.apiKey.trim()}` } : {}),
-          },
+          headers: buildAiCorrectionRecoveryHeaders(request),
           body: request.body,
           signal: controller.signal,
         })
@@ -371,6 +378,15 @@ registerAppIpc({
   onWindowClose: () => {
     captionController.debug('ipc.window-close')
   },
+})
+
+registerFileStorageIpc({ ipcMain, getMainWindow: () => mainWindow })
+registerOriginalSourceIpc({ ipcMain, getMainWindow: () => mainWindow })
+registerManualExportIpc({ ipcMain, getMainWindow: () => mainWindow })
+
+mediaIpcController = registerMediaIpc({
+  ipcMain,
+  getMainWindow: () => mainWindow,
 })
 
 registerUpdaterIpc({

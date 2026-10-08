@@ -1,8 +1,10 @@
 import { create } from 'zustand'
 import type {
   CorrectionIssue,
+  CorrectionEditExpectation,
   CorrectionShardProgress,
   MeetingContextSnapshot,
+  ManualCorrectionEdit,
   RecognitionConfigSnapshot,
   ResolvedCorrectionPatch,
   RecordingState,
@@ -33,6 +35,8 @@ import {
 } from '../services/aiCorrection'
 import {
   createCorrectionShards,
+  applyManualCorrectionEdit,
+  DEFAULT_CORRECTION_PATCH_LIMITS,
   materializeCorrection,
   partitionCorrectionPatchConflicts,
   resolveCorrectionPatches,
@@ -41,9 +45,12 @@ import {
   revertAllCorrectionPatches,
   validateCorrectionPatchSet,
   validateResolvedCorrectionPatch,
-  updateCorrectionPatchReplacement,
 } from '../utils/correctionPatch'
 import { sessionRepository } from '../utils/sessionRepository'
+import { getDirectProjectIds, normalizeProjectIds } from '../utils/projectSchema'
+import { projectRepository } from '../utils/projectRepository'
+import { syncSessionFiles } from '../utils/sessionFileSync'
+import { isPublishedCorrectionAutoSaveEnabled, savePublishedMarkdown } from '../utils/publishedMarkdownCoordinator'
 import { formatTime } from '../utils/storage'
 import {
   buildRuntimeStateFromSession,
@@ -73,8 +80,6 @@ import {
 import { useSettingsStore } from './settingsStore'
 import { useUIStore } from './uiStore'
 import {
-  buildCorrectedTranscriptMarkdown,
-  buildSessionExportFilename,
   generateId,
 } from '../utils/storageUtils'
 import {
@@ -111,6 +116,7 @@ class CorrectionRunError extends Error {
 }
 
 export interface RecordingArchiveRecoverySummary {
+  unresolvedCount?: number
   recoveredCount: number
   linkedCount: number
   unlinkedCount: number
@@ -162,6 +168,8 @@ export interface SessionState {
   currentCaptureMode: NonNullable<TranscriptSession['sourceMeta']>['captureMode']
   setCurrentCaptureMode: (captureMode: NonNullable<TranscriptSession['sourceMeta']>['captureMode']) => void
   startNewSession: (options?: {
+    projectIds?: string[]
+    defaultSaveProjectId?: string
     captureMode?: NonNullable<TranscriptSession['sourceMeta']>['captureMode']
     providerId?: string
     meetingContext?: MeetingContextSnapshot
@@ -176,7 +184,7 @@ export interface SessionState {
 
   sessions: TranscriptSession[]
   loadSessions: () => Promise<RecordingArchiveRecoverySummary | undefined>
-  updateSessionTitle: (id: string, title: string) => void
+  updateSessionTitle: (id: string, title: string, expectedRevision?: number) => Promise<boolean>
   updateSessionSpeakers: (sessionId: string, speakers: TranscriptSpeaker[]) => void
   updateSessionPostProcess: (sessionId: string, patch: Partial<TranscriptPostProcess>) => void
   updateSessionMindMap: (sessionId: string, patch: Partial<TranscriptMindMap>) => void
@@ -195,10 +203,13 @@ export interface SessionState {
     sessionId: string,
     options?: { overwrite?: boolean },
   ) => Promise<TranscriptPostProcess>
-  deleteSession: (id: string) => void
+  deleteSession: (id: string) => Promise<void>
   deleteSessionConversation: (sessionId: string, conversationId: string) => void
   updateSessionTags: (sessionId: string, tagIds: string[]) => void
   updateSessionTopic: (sessionId: string, topicId: string | undefined) => void
+  updateSessionProjects: (sessionId: string, projectIds: string[]) => Promise<void>
+  setSessionProjectAssociation: (sessionId: string, projectId: string, associated: boolean) => Promise<void>
+  updateSessionDefaultSaveProject: (sessionId: string, projectId: string | undefined) => Promise<void>
   replaceAllSessions: (sessions: TranscriptSession[]) => TranscriptSession[]
 
   updateSessionCorrection: (sessionId: string, patch: Partial<TranscriptCorrection>) => void
@@ -224,8 +235,10 @@ export interface SessionState {
   resumeSessionCorrection: (sessionId: string) => Promise<void>
   retrySessionCorrection: (sessionId: string) => Promise<void>
   abandonSessionCorrection: (sessionId: string) => Promise<void>
-  applySessionCorrectionReview: (sessionId: string, patchIds: string[]) => Promise<string>
-  updateSessionCorrectionDraftPatch: (sessionId: string, patchId: string, replacement: string) => Promise<void>
+  applySessionCorrectionReview: (sessionId: string, patchIds: string[], expected?: CorrectionEditExpectation) => Promise<string>
+  updateSessionCorrectionDraftPatch: (sessionId: string, patchId: string, replacement: string, expected?: CorrectionEditExpectation) => Promise<void>
+  saveSessionManualCorrection: (sessionId: string, edit: ManualCorrectionEdit, expected: CorrectionEditExpectation) => Promise<void>
+  changeSessionCorrectionPatchState: (sessionId: string, patchId: string, state: 'applied' | 'reverted', expected: CorrectionEditExpectation, confirmedConflictIds?: string[]) => Promise<void>
   restoreSessionLegacyCorrection: (sessionId: string) => Promise<void>
   setSessionCorrectionPatchState: (sessionId: string, patchId: string, state: 'applied' | 'reverted') => Promise<void>
   revertAllSessionCorrectionPatches: (sessionId: string) => Promise<void>
@@ -394,18 +407,20 @@ export const useSessionStore = create<SessionState>((set, get) => {
     set({ correctionInFlight: next })
   }
 
-  const checkpointCorrection = async (sessionId: string, correction: TranscriptCorrection) => {
+  const checkpointCorrection = async (sessionId: string, correction: Parameters<typeof sessionRepository.checkpointCorrection>[1]) => {
     const sessions = await sessionRepository.checkpointCorrection(sessionId, correction)
+    const committed = sessions.find((session) => session.id === sessionId)?.correction
     const recoverySession = get().recoverySession
     set({
       sessions,
-      recoverySession: recoverySession?.id === sessionId ? { ...recoverySession, correction } : recoverySession,
+      recoverySession: recoverySession?.id === sessionId ? { ...recoverySession, correction: committed } : recoverySession,
     })
+    if (committed?.published) void savePublishedMarkdown(sessionId)
   }
 
   const enqueueCorrectionMutation = <T>(sessionId: string, operation: () => Promise<T>): Promise<T> => {
     const previous = correctionMutationQueues.get(sessionId) || Promise.resolve()
-    const current = previous.then(operation)
+    const current = previous.catch(() => undefined).then(operation)
     correctionMutationQueues.set(sessionId, current)
     void current.finally(() => {
       if (correctionMutationQueues.get(sessionId) === current) correctionMutationQueues.delete(sessionId)
@@ -445,6 +460,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
         model,
         completedAt,
         error: undefined,
+        legacy: undefined,
         published: {
           id: generateId(),
           formatVersion: 1 as const,
@@ -455,6 +471,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
           patches: finalPatches,
           model,
           completedAt,
+          safetyLimits: correction.draft?.config.safetyLimits || correction.published?.safetyLimits || DEFAULT_CORRECTION_PATCH_LIMITS,
           stats: {
             applied: finalPatches.filter((patch) => patch.state === 'applied').length,
             reverted: finalPatches.filter((patch) => patch.state === 'reverted').length,
@@ -476,6 +493,54 @@ export const useSessionStore = create<SessionState>((set, get) => {
     const result = await buildPublishedCorrection(session, correction, patches, model, baseTranscriptHash)
     await checkpointCorrection(session.id, result.correction)
     return result.correctedText
+  }
+
+  const mutateManualCorrection = async (
+    sessionId: string,
+    expected: CorrectionEditExpectation,
+    mutation: (session: TranscriptSession, patches: ResolvedCorrectionPatch[], sourceHash: string) => ResolvedCorrectionPatch[],
+  ): Promise<void> => {
+    await enqueueCorrectionMutation(sessionId, async () => {
+      await checkpointCorrection(sessionId, async (session) => {
+        if (session.status === 'recording' || session.status === 'interrupted'
+          || get().correctionInFlight[sessionId] || correctionStartReservations.has(sessionId)) {
+          throw new Error('correction-busy')
+        }
+        const correction = session.correction
+        const draft = correction?.draft
+        const published = correction?.published
+        const sourceHash = await sha256Utf8(session.transcript)
+        if (get().correctionInFlight[sessionId] || correctionStartReservations.has(sessionId)) throw new Error('correction-busy')
+        if (sourceHash !== expected.baseTranscriptHash) throw new Error('source-hash-mismatch')
+        if (expected.target === 'draft') {
+          if (!draft || draft.status !== 'ready-for-review' || draft.runId !== expected.id
+            || draft.revision !== expected.revision || draft.baseTranscriptHash !== sourceHash) throw new Error('correction-revision-mismatch')
+        } else if (draft || correction?.legacy && !published
+          || (expected.target === 'published' && (!published || published.id !== expected.id
+            || published.revision !== expected.revision || published.baseTranscriptHash !== sourceHash))
+          || (expected.target === 'new' && (published || expected.revision !== 0 || expected.id))) {
+          throw new Error('correction-revision-mismatch')
+        }
+        const patches = mutation(session, expected.target === 'draft'
+          ? [...draft!.proposedPatches, ...draft!.rejectedPatches] : published?.patches || [], sourceHash)
+        if (expected.target === 'draft') {
+          return {
+            ...correction!,
+            draft: {
+              ...draft!, revision: draft!.revision + 1, updatedAt: Date.now(),
+              proposedPatches: patches.filter((patch) => patch.state !== 'rejected'),
+              rejectedPatches: patches.filter((patch) => patch.state === 'rejected'),
+              shards: draft!.shards.map((shard) => ({
+                ...shard,
+                patches: shard.patches?.map((patch) => patches.find((item) => item.id === patch.id) || patch),
+              })),
+            },
+          }
+        }
+        return (await buildPublishedCorrection(session, correction || { status: 'done', mode: 'quick' }, patches,
+          published?.model || 'manual', sourceHash)).correction
+      })
+    })
   }
 
   const runCorrectionDraft = async (
@@ -777,44 +842,47 @@ export const useSessionStore = create<SessionState>((set, get) => {
     if (correctionStartReservations.has(sessionId)) throw new Error('纠错任务正在启动')
     correctionStartReservations.add(sessionId)
     try {
-      const settings = useSettingsStore.getState().settings
-      const config = createCorrectionConfigSnapshot(settings, session.meetingContext)
-      const baseTranscriptHash = await sha256Utf8(session.transcript)
-      const now = Date.now()
-      const draft = {
-        runId: generateId(),
-        revision: 1,
-        trigger,
-        mode,
-        status: 'queued' as const,
-        baseTranscriptHash,
-        config,
-        shards: createCorrectionShards(session.transcript, config.chunkSize, config.contextSize).map((shard) => ({
-          ...shard,
-          status: 'pending' as const,
-          attempt: 0,
-          draftRevision: 1,
-        })),
-        proposedPatches: [],
-        rejectedPatches: [],
-        requestedAt: now,
-        updatedAt: now,
-      }
-      const correction: TranscriptCorrection = {
-        status: 'detecting',
-        mode,
-        correctedText: session.correction?.correctedText,
-        published: session.correction?.published,
-        legacy: session.correction?.legacy,
-        model: config.model,
-        requestedAt: now,
-        draft,
-      }
-      await checkpointCorrection(sessionId, correction)
-      return await runCorrectionDraft(sessionId, {
-        apiKey: settings.aiPostProcess?.apiKey,
-        configIdentity: config.configIdentity,
+      let lockedCredential: { apiKey?: string; configIdentity?: string } | undefined
+      await enqueueCorrectionMutation(sessionId, async () => {
+        const session = get().sessions.find((item) => item.id === sessionId)
+        if (!session || session.correction?.draft) throw new Error('当前会话已有未完成的纠错任务')
+        const settings = useSettingsStore.getState().settings
+        const config = createCorrectionConfigSnapshot(settings, session.meetingContext)
+        lockedCredential = { apiKey: settings.aiPostProcess?.apiKey, configIdentity: config.configIdentity }
+        const baseTranscriptHash = await sha256Utf8(session.transcript)
+        const now = Date.now()
+        const draft = {
+          runId: generateId(),
+          revision: 1,
+          trigger,
+          mode,
+          status: 'queued' as const,
+          baseTranscriptHash,
+          config,
+          shards: createCorrectionShards(session.transcript, config.chunkSize, config.contextSize).map((shard) => ({
+            ...shard,
+            status: 'pending' as const,
+            attempt: 0,
+            draftRevision: 1,
+          })),
+          proposedPatches: [],
+          rejectedPatches: [],
+          requestedAt: now,
+          updatedAt: now,
+        }
+        const correction: TranscriptCorrection = {
+          status: 'detecting',
+          mode,
+          correctedText: session.correction?.correctedText,
+          published: session.correction?.published,
+          legacy: session.correction?.legacy,
+          model: config.model,
+          requestedAt: now,
+          draft,
+        }
+        await checkpointCorrection(sessionId, correction)
       })
+      return await runCorrectionDraft(sessionId, lockedCredential)
     } finally {
       correctionStartReservations.delete(sessionId)
     }
@@ -874,12 +942,10 @@ export const useSessionStore = create<SessionState>((set, get) => {
       return
     }
 
-    if (session.title === workflow.titleAtStart) {
-      get().updateSessionTitle(sessionId, titleSuggestion)
+    if (workflow.titleRevisionAtStart !== undefined && (session.titleRevision || 0) === workflow.titleRevisionAtStart) {
+      await get().updateSessionTitle(sessionId, titleSuggestion, workflow.titleRevisionAtStart)
     }
-    const autoExportEnabled = Boolean(
-      useSettingsStore.getState().settings.aiPostProcess?.autoExportCorrectedMarkdown,
-    )
+    const autoExportEnabled = isPublishedCorrectionAutoSaveEnabled(useSettingsStore.getState().settings)
     updateAutoPostProcessWorkflow(sessionId, autoExportEnabled
       ? { status: 'queued', step: 'export', error: undefined }
       : { status: 'completed', step: 'title', completedAt: Date.now(), error: undefined })
@@ -889,37 +955,14 @@ export const useSessionStore = create<SessionState>((set, get) => {
     const session = get().sessions.find((item) => item.id === sessionId)
     const workflow = session?.autoPostProcessWorkflow
     if (!session || !workflow || workflow.step !== 'export') return
-    if (workflow.exportPath) {
-      updateAutoPostProcessWorkflow(sessionId, {
-        status: 'completed',
-        completedAt: workflow.completedAt || Date.now(),
-        error: undefined,
-      })
-      return
-    }
-
-    const electronApi = window.electronAPI
-    const directory = useSettingsStore.getState().settings.aiPostProcess?.autoExportDirectory?.trim()
-    if (!electronApi?.writeAutoExportFile) throw new Error('当前环境不支持自动导出')
-    if (!directory) throw new Error('请先选择纠错稿自动导出目录')
-
-    const language = useUIStore.getState().language
-    const correctedLabel = useUIStore.getState().t.preview.correctionCorrected
-    const content = buildCorrectedTranscriptMarkdown(session, correctedLabel, language)
-    if (!content) throw new Error('当前会话没有可导出的纠错稿')
-    const result = await electronApi.writeAutoExportFile({
-      directory,
-      fileName: buildSessionExportFilename(session, 'md', 'corrected'),
-      content,
-    })
-    if (!result.ok || !result.path) throw new Error(result.error || '自动导出纠错稿失败')
+    const file = await savePublishedMarkdown(sessionId)
+    if (!get().sessions.some((item) => item.id === sessionId)) return
 
     const now = Date.now()
     updateAutoPostProcessWorkflow(sessionId, {
       status: 'completed',
       step: 'export',
-      exportPath: result.path,
-      exportedAt: now,
+      ...(file?.status === 'saved' ? { exportPath: file.path, exportedAt: now } : {}),
       completedAt: now,
       error: undefined,
     })
@@ -1104,8 +1147,12 @@ export const useSessionStore = create<SessionState>((set, get) => {
       const { t } = useUIStore.getState()
       const { settings } = useSettingsStore.getState()
       const providerId = options?.providerId || settings.currentVendor
+      const projects = options?.projectIds?.length ? projectRepository.read() : []
+      const projectIds = options?.projectIds?.filter((id) => projects.some((project) => project.id === id) && !projectRepository.isDeleting(id))
 
       const session = createDraftSession({
+        projectIds,
+        defaultSaveProjectId: options?.defaultSaveProjectId,
         now,
         title: t.session.defaultTitle(formatTime(now)),
         providerId,
@@ -1140,6 +1187,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
       if (currentSessionId && hasContent) {
         const sessions = sessionRepository.completeSession(currentSessionId, snapshot)
         set({ sessions })
+        void syncSessionFiles(currentSessionId).catch((error: unknown) => console.warn('[Files] Initial media naming failed:', error))
         void get().maybeStartAutoAiPostProcess(currentSessionId)
         console.log('[SessionStore] 会话已保存, 文本长度:', snapshot.transcript.length)
         set({ currentSessionId: null, currentCaptureMode: 'system-audio' })
@@ -1227,7 +1275,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
       if (!window.electronAPI?.recoverRecordingArchives) return undefined
 
       try {
-        const result = await window.electronAPI.recoverRecordingArchives()
+        const result = await window.electronAPI.recoverRecordingArchives(get().sessions.map((session) => session.id))
         if (!result.ok) {
           console.warn('[SessionStore] 录音源音频恢复失败:', result.error)
           return {
@@ -1246,25 +1294,25 @@ export const useSessionStore = create<SessionState>((set, get) => {
             continue
           }
           const session = get().sessions.find((item) => item.id === archive.sessionId)
-          if (!session || session.sourceMeta?.audioPath) {
+          if (!session) {
             unlinkedCount += 1
             continue
           }
 
           const sourceMeta = {
-            ...(session.sourceMeta || {}),
             sourceKind: 'recording-audio' as const,
             audioPath: archive.path,
             audioMimeType: archive.mimeType || 'audio/wav',
             audioFileName: archive.fileName || 'source-audio.wav',
             audioSize: archive.size,
+            managedAsset: archive.managedAsset,
           }
-          const nextSessions = sessionRepository.updateMetadata(session.id, { sourceMeta })
+          const nextSessions = await sessionRepository.updateMetadataDurable(session.id, (current) => ({ sourceMeta: { ...current.sourceMeta, ...sourceMeta } }))
           const currentRecoverySession = get().recoverySession
           set({
             sessions: nextSessions,
             recoverySession: currentRecoverySession?.id === session.id
-              ? { ...currentRecoverySession, sourceMeta }
+              ? nextSessions.find((item) => item.id === session.id) || currentRecoverySession
               : currentRecoverySession,
           })
           linkedCount += 1
@@ -1272,11 +1320,12 @@ export const useSessionStore = create<SessionState>((set, get) => {
 
         const summary = {
           recoveredCount: result.recovered.length,
+          unresolvedCount: result.notices?.filter((item) => !item.acknowledged).length,
           linkedCount,
           unlinkedCount,
           skippedCount: result.skipped?.length || 0,
         }
-        return summary.recoveredCount > 0 || summary.skippedCount > 0 ? summary : undefined
+        return summary.recoveredCount > 0 || summary.skippedCount > 0 || summary.unresolvedCount ? summary : undefined
       } catch (error) {
         console.warn('[SessionStore] 录音源音频恢复失败:', error)
         return {
@@ -1287,24 +1336,21 @@ export const useSessionStore = create<SessionState>((set, get) => {
         }
       }
     },
-    updateSessionTitle: (id, title) => {
-      const { sessions, recoverySession, currentSessionId, currentSpeakers, currentPostProcess } = get()
-      const nextSessions = sessionRepository.updateMetadata(id, { title })
-      const nextState = applySessionMetadataUpdate(
-        sessions,
-        id,
-        { title },
-        {
-          currentSessionId,
-          recoverySession,
-          currentSpeakers,
-          currentPostProcess,
-        },
-      )
-      set({
-        sessions: nextSessions,
-        recoverySession: nextState.recoverySession,
+    updateSessionTitle: async (id, title, expectedRevision) => {
+      const value = title.trim()
+      if (!value) throw new Error('Title cannot be empty')
+      let applied = false
+      const durable = await sessionRepository.updateMetadataDurable(id, (current) => {
+        if (expectedRevision !== undefined && (current.titleRevision || 0) !== expectedRevision) return {}
+        applied = true
+        return { title: value, titleRevision: (current.titleRevision || 0) + (current.title === value ? 0 : 1) }
       })
+      const recoverySession = get().recoverySession
+      set({ sessions: durable, recoverySession: recoverySession?.id === id ? durable.find((session) => session.id === id) || null : recoverySession })
+      if (!applied) return false
+      try { await syncSessionFiles(id); await savePublishedMarkdown(id) }
+      catch (error) { console.warn('[Title] Title is durable; file synchronization remains retryable:', error) }
+      return true
     },
     updateSessionSpeakers: (sessionId, speakers) => {
       const { currentSessionId, currentSpeakers, recoverySession } = get()
@@ -1412,6 +1458,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
       }
 
       const conversationId = options?.conversationId?.trim() || 'default'
+      if (session.askHistory?.some((turn) => turn.status === 'pending')) throw new Error('此会话已有问答正在进行')
       const pendingTurn: TranscriptAskTurn = {
         id: generateId(),
         conversationId,
@@ -1475,6 +1522,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
       if (!session) throw new Error('未找到要提问的会话')
 
       const conversationId = options?.conversationId?.trim() || 'default'
+      if (session.askHistory?.some((turn) => turn.status === 'pending')) throw new Error('此会话已有问答正在进行')
       const pendingTurn: TranscriptAskTurn = {
         id: generateId(),
         conversationId,
@@ -1579,10 +1627,17 @@ export const useSessionStore = create<SessionState>((set, get) => {
         throw error
       }
     },
-    deleteSession: (id) => {
-      const { sessions: currentSessions, recoverySession } = get()
-      const nextState = applySessionDeletion(currentSessions, id, recoverySession)
-      const sessions = sessionRepository.deleteSession(id)
+    deleteSession: async (id) => {
+      if (get().currentSessionId === id) throw new Error('Stop recording before deleting this record')
+      const api = window.electronAPI
+      const prepared = await api?.markFileRecordDeletion?.(id, 'prepare')
+      if (prepared && !prepared.ok) throw new Error(prepared.error)
+      let sessions: TranscriptSession[]
+      try { sessions = await sessionRepository.deleteSessionWithResults(id) }
+      catch (error) { await api?.markFileRecordDeletion?.(id, 'cancel'); throw error }
+      const committed = await api?.markFileRecordDeletion?.(id, 'commit')
+      if (committed && !committed.ok) console.error('[RecordDeletion] Physical callbacks remain fenced pending reconciliation:', committed.error)
+      const nextState = applySessionDeletion(get().sessions, id, get().recoverySession)
       set({
         sessions,
         recoverySession: nextState.recoverySession,
@@ -1591,6 +1646,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
     deleteSessionConversation: (sessionId, conversationId) => {
       const session = get().sessions.find((s) => s.id === sessionId)
       if (!session) return
+      if (session.askHistory?.some((turn) => turn.status === 'pending' && (turn.conversationId || 'default') === conversationId)) throw new Error('请等待此对话完成后再删除')
       const nextHistory = (session.askHistory || []).filter(
         (turn) => (turn.conversationId || 'default') !== conversationId,
       )
@@ -1617,10 +1673,12 @@ export const useSessionStore = create<SessionState>((set, get) => {
     },
     updateSessionTopic: (sessionId, topicId) => {
       const { sessions, recoverySession, currentSessionId, currentSpeakers, currentPostProcess } = get()
+      const existing = sessions.find((session) => session.id === sessionId)
+      if (topicId && !getDirectProjectIds(existing || { projectIds: [] }).includes(topicId) && (!projectRepository.read().some((project) => project.id === topicId && !project.archivedAt) || projectRepository.isDeleting(topicId))) throw new Error('Project is unavailable')
       const nextState = applySessionMetadataUpdate(
         sessions,
         sessionId,
-        { topicId },
+        { projectIds: topicId ? [topicId] : [], topicId },
         {
           currentSessionId,
           recoverySession,
@@ -1628,11 +1686,42 @@ export const useSessionStore = create<SessionState>((set, get) => {
           currentPostProcess,
         },
       )
-      const nextSessions = sessionRepository.updateMetadata(sessionId, { topicId })
+      const nextSessions = sessionRepository.updateMetadata(sessionId, { projectIds: topicId ? [topicId] : [], topicId })
       set({
         sessions: nextSessions,
         recoverySession: nextState.recoverySession,
       })
+    },
+    updateSessionProjects: async (sessionId, ids) => {
+      const projectIds = normalizeProjectIds(ids)
+      const session = get().sessions.find((item) => item.id === sessionId)
+      if (!session) throw new Error('Record does not exist')
+      const previousIds = getDirectProjectIds(session)
+      if (JSON.stringify(previousIds) === JSON.stringify(projectIds)) return
+      const sessions = await sessionRepository.updateMetadataDurable(sessionId, (current) => {
+        const existing = getDirectProjectIds(current)
+        const projects = projectRepository.read()
+        if (projectIds.some((id) => !existing.includes(id) && (!projects.some((project) => project.id === id && !project.archivedAt) || projectRepository.isDeleting(id)))) throw new Error('Project is unavailable')
+        return { projectIds, topicId: projectIds[0] }
+      })
+      const recoverySession = get().recoverySession
+      set({ sessions, recoverySession: recoverySession?.id === sessionId ? sessions.find((item) => item.id === sessionId) || null : recoverySession })
+    },
+    updateSessionDefaultSaveProject: async (sessionId, projectId) => {
+      const session = get().sessions.find((item) => item.id === sessionId)
+      if (!session || (projectId && !getDirectProjectIds(session).includes(projectId))) throw new Error('Save project must be a direct association')
+      const sessions = await sessionRepository.updateMetadataDurable(sessionId, { defaultSaveProjectId: projectId })
+      set({ sessions })
+    },
+    setSessionProjectAssociation: async (sessionId, projectId, associated) => {
+      const sessions = await sessionRepository.updateMetadataDurable(sessionId, (session) => {
+        const currentIds = getDirectProjectIds(session)
+        if (associated && !currentIds.includes(projectId) && (!projectRepository.read().some((project) => project.id === projectId && !project.archivedAt) || projectRepository.isDeleting(projectId))) throw new Error('Project is unavailable')
+        const projectIds = associated ? normalizeProjectIds([...currentIds, projectId]) : currentIds.filter((id) => id !== projectId)
+        return { projectIds, topicId: projectIds[0] }
+      })
+      const recoverySession = get().recoverySession
+      set({ sessions, recoverySession: recoverySession?.id === sessionId ? sessions.find((item) => item.id === sessionId) || null : recoverySession })
     },
     replaceAllSessions: (sessions) => {
       const persisted = sessionRepository.replaceAllSessions(sessions)
@@ -1690,6 +1779,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
         step: 'correction',
         correctionMode: aiConfig.correctionMode || 'quick',
         titleAtStart: session.title,
+        titleRevisionAtStart: session.titleRevision || 0,
         startedAt: now,
         updatedAt: now,
       }
@@ -1701,10 +1791,6 @@ export const useSessionStore = create<SessionState>((set, get) => {
           ? '请先配置 AI 纠错模型'
           : !resolveModelForFeature(aiConfig, 'briefing')
             ? '请先配置 AI 摘要模型'
-            : aiConfig.autoExportCorrectedMarkdown && !window.electronAPI?.writeAutoExportFile
-              ? '当前环境不支持自动导出纠错稿'
-              : aiConfig.autoExportCorrectedMarkdown && !aiConfig.autoExportDirectory?.trim()
-                ? '请先选择纠错稿自动导出目录'
             : ''
       if (configurationError) {
         failAutoPostProcessWorkflow(sessionId, configurationError)
@@ -1715,12 +1801,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
     },
 
     retrySessionAutoExport: async (sessionId) => {
-      const workflow = get().sessions.find((item) => item.id === sessionId)?.autoPostProcessWorkflow
-      if (!workflow || workflow.status !== 'error' || workflow.step !== 'export') {
-        throw new Error('当前自动后处理任务不在可重试的导出步骤')
-      }
-      updateAutoPostProcessWorkflow(sessionId, { status: 'queued', error: undefined })
-      await runAutoAiPostProcessWorkflow(sessionId)
+      await savePublishedMarkdown(sessionId, { retry: true })
     },
 
     maybeAutoDetectSessionCorrection: async (sessionId) => {
@@ -1915,12 +1996,18 @@ export const useSessionStore = create<SessionState>((set, get) => {
         failAutoPostProcessWorkflow(sessionId, 'AI 纠错任务已放弃', 'correction')
       }
     },
-    applySessionCorrectionReview: async (sessionId, patchIds) => {
+    applySessionCorrectionReview: async (sessionId, patchIds, expected) => {
+      const requestedDraft = get().sessions.find((item) => item.id === sessionId)?.correction?.draft
+      const requested = expected || (requestedDraft ? {
+        target: 'draft', id: requestedDraft.runId, revision: requestedDraft.revision, baseTranscriptHash: requestedDraft.baseTranscriptHash,
+      } : undefined)
       let output = ''
       await enqueueCorrectionMutation(sessionId, async () => {
         const session = get().sessions.find((item) => item.id === sessionId)
         const draft = session?.correction?.draft
         if (!session || !draft || draft.status !== 'ready-for-review') throw new Error('没有可应用的 Review 候选')
+        if (!requested || requested.target !== 'draft' || requested.id !== draft.runId || requested.revision !== draft.revision
+          || requested.baseTranscriptHash !== draft.baseTranscriptHash) throw new Error('correction-revision-mismatch')
         if (await sha256Utf8(session.transcript) !== draft.baseTranscriptHash) throw new Error('原始转录已变化，无法应用 Review')
         const selected = new Set(patchIds)
         const patches = draft.proposedPatches.map((patch) => ({ ...patch, state: selected.has(patch.id) ? 'applied' as const : 'reverted' as const }))
@@ -1937,31 +2024,36 @@ export const useSessionStore = create<SessionState>((set, get) => {
       void continueAutoPostProcessAfterCorrection(sessionId)
       return output
     },
-    updateSessionCorrectionDraftPatch: async (sessionId, patchId, replacement) => {
-      await enqueueCorrectionMutation(sessionId, async () => {
-        const session = get().sessions.find((item) => item.id === sessionId)
-        const draft = session?.correction?.draft
-        if (!session || !draft || draft.status !== 'ready-for-review') throw new Error('没有可编辑的 Review 候选')
-        const current = draft.proposedPatches.find((patch) => patch.id === patchId)
-        if (!current) throw new Error('未找到要编辑的 Patch')
-        const edited = updateCorrectionPatchReplacement(session.transcript, current, replacement, draft.baseTranscriptHash, draft.config.safetyLimits)
-        if (!edited.patch) throw new Error(`建议文本不合法: ${edited.error}`)
-        const proposedPatches = draft.proposedPatches.map((patch) => patch.id === patchId ? edited.patch! : patch)
-        if (partitionCorrectionPatchConflicts(proposedPatches).rejected.length > 0) throw new Error('编辑后的 Patch 与其他候选冲突')
-        const safetyError = validateCorrectionPatchSet(session.transcript, proposedPatches, draft.config.safetyLimits)
-        if (safetyError) throw new Error(`编辑后的 Patch 超过安全限制: ${safetyError}`)
-        const revision = draft.revision + 1
-        const nextDraft = {
-          ...draft,
-          revision,
-          updatedAt: Date.now(),
-          proposedPatches,
-          shards: draft.shards.map((shard) => ({
-            ...shard,
-            patches: shard.patches?.map((patch) => patch.id === patchId ? edited.patch! : patch),
-          })),
+    updateSessionCorrectionDraftPatch: async (sessionId, patchId, replacement, expected) => {
+      const draft = get().sessions.find((item) => item.id === sessionId)?.correction?.draft
+      if (!draft || draft.status !== 'ready-for-review') throw new Error('没有可编辑的 Review 候选')
+      const current = draft.proposedPatches.find((patch) => patch.id === patchId)
+      if (!current) throw new Error('未找到要编辑的 Patch')
+      await get().saveSessionManualCorrection(sessionId, {
+        patchId, sourceStart: current.sourceStart, sourceEnd: current.sourceEnd, sourceText: current.sourceText, replacement,
+      }, expected || { target: 'draft', id: draft.runId, revision: draft.revision, baseTranscriptHash: draft.baseTranscriptHash })
+    },
+    saveSessionManualCorrection: async (sessionId, edit, expected) => {
+      await mutateManualCorrection(sessionId, expected, (session, patches, sourceHash) => applyManualCorrectionEdit(
+        session.transcript, patches, edit, sourceHash, generateId(), expected.target === 'draft' ? 'proposed' : 'applied',
+        expected.target === 'draft' ? session.correction!.draft!.config.safetyLimits
+          : session.correction?.published?.safetyLimits || DEFAULT_CORRECTION_PATCH_LIMITS,
+      ))
+    },
+    changeSessionCorrectionPatchState: async (sessionId, patchId, state, expected, confirmedConflictIds) => {
+      await mutateManualCorrection(sessionId, expected, (session, patches, sourceHash) => {
+        const current = patches.find((patch) => patch.id === patchId)
+        if (!current || current.state === 'rejected') throw new Error('patch-not-editable')
+        if (state === 'applied') {
+          const next = applyManualCorrectionEdit(session.transcript, patches, {
+            patchId, sourceStart: current.sourceStart, sourceEnd: current.sourceEnd, sourceText: current.sourceText,
+            replacement: current.replacement, confirmedConflictIds,
+          }, sourceHash, current.id, expected.target === 'draft' ? 'proposed' : 'applied',
+          expected.target === 'draft' ? session.correction!.draft!.config.safetyLimits
+            : session.correction?.published?.safetyLimits || DEFAULT_CORRECTION_PATCH_LIMITS)
+          return next.map((patch) => patch.id === patchId ? { ...patch, origin: current.origin } : patch)
         }
-        await checkpointCorrection(sessionId, { ...session.correction!, draft: nextDraft })
+        return setCorrectionPatchState(patches, patchId, 'reverted')
       })
     },
     restoreSessionLegacyCorrection: async (sessionId) => {
@@ -1978,38 +2070,17 @@ export const useSessionStore = create<SessionState>((set, get) => {
       })
     },
     setSessionCorrectionPatchState: async (sessionId, patchId, state) => {
-      await enqueueCorrectionMutation(sessionId, async () => {
-        const session = get().sessions.find((item) => item.id === sessionId)
-        const published = session?.correction?.published
-        if (!session || !published) return
-        if (await sha256Utf8(session.transcript) !== published.baseTranscriptHash) throw new Error('原始转录已变化，无法修改已发布 Patch')
-        const patches = setCorrectionPatchState(published.patches, patchId, state)
-        const active = patches.filter((patch) => patch.state === 'applied')
-        for (const patch of active) {
-          const maxPatchTextLength = Math.max(1_000, patch.sourceText.length, patch.replacement.length)
-          const validationError = validateResolvedCorrectionPatch(session.transcript, patch, published.baseTranscriptHash, {
-            maxPatchTextLength,
-            maxPatchesPerShard: Number.MAX_SAFE_INTEGER,
-            maxCumulativeEditRatio: Number.MAX_SAFE_INTEGER,
-            maxNetLengthChangeRatio: Number.MAX_SAFE_INTEGER,
-          })
-          if (validationError) throw new Error(`已发布 Patch 校验失败: ${validationError}`)
-        }
-        if (partitionCorrectionPatchConflicts(active).rejected.length > 0) throw new Error('已发布 Patch 状态产生冲突')
-        const correctedText = materializeCorrection(session.transcript, patches)
-        const nextPublished = { ...published, revision: published.revision + 1, patches, correctedText, outputTextHash: await sha256Utf8(correctedText), stats: { ...published.stats, applied: patches.filter((patch) => patch.state === 'applied').length, reverted: patches.filter((patch) => patch.state === 'reverted').length } }
-        await checkpointCorrection(sessionId, { ...session.correction!, correctedText, published: nextPublished })
+      const published = get().sessions.find((item) => item.id === sessionId)?.correction?.published
+      if (!published) return
+      await get().changeSessionCorrectionPatchState(sessionId, patchId, state, {
+        target: 'published', id: published.id, revision: published.revision, baseTranscriptHash: published.baseTranscriptHash,
       })
     },
     revertAllSessionCorrectionPatches: async (sessionId) => {
-      await enqueueCorrectionMutation(sessionId, async () => {
-        const session = get().sessions.find((item) => item.id === sessionId)
-        const published = session?.correction?.published
-        if (!session || !published) return
-        const patches = revertAllCorrectionPatches(published.patches)
-        const outputTextHash = await sha256Utf8(session.transcript)
-        await checkpointCorrection(sessionId, { ...session.correction!, correctedText: session.transcript, published: { ...published, revision: published.revision + 1, patches, correctedText: session.transcript, outputTextHash, stats: { ...published.stats, applied: 0, reverted: patches.filter((patch) => patch.state === 'reverted').length } } })
-      })
+      const published = get().sessions.find((item) => item.id === sessionId)?.correction?.published
+      if (!published) return
+      await mutateManualCorrection(sessionId, { target: 'published', id: published.id, revision: published.revision,
+        baseTranscriptHash: published.baseTranscriptHash }, (_session, patches) => revertAllCorrectionPatches(patches))
     },
   }
 })

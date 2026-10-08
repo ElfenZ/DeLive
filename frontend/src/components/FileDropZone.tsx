@@ -1,6 +1,6 @@
 import { useCallback, useState, useRef } from 'react'
 import { Upload, FileAudio, X, Info, Clock } from 'lucide-react'
-import { isAcceptedAudioFile, formatFileSize, ACCEPTED_AUDIO_EXTENSIONS } from '../types/fileTranscription'
+import { isAcceptedAudioFile, formatFileSize, getMediaInputKind } from '../types/fileTranscription'
 import { useUIStore } from '../stores/uiStore'
 
 function estimateDuration(sizeBytes: number): string {
@@ -26,7 +26,7 @@ export function FileDropZone({ onFilesSelected, disabled }: FileDropZoneProps) {
 
   const formatGroups = [
     { label: t.file?.formatAudio || 'Audio', formats: ['MP3', 'WAV', 'M4A', 'FLAC', 'OGG', 'AAC', 'WMA', 'Opus'] },
-    { label: t.file?.formatVideo || 'Video', formats: ['MP4', 'WebM', 'MPEG'] },
+    { label: t.file?.formatVideo || 'Video', formats: ['MP4', 'WebM', 'MOV', 'MKV', 'MPEG', 'AVI'] },
   ]
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -72,8 +72,6 @@ export function FileDropZone({ onFilesSelected, disabled }: FileDropZoneProps) {
     }
   }, [selectedFiles, onFilesSelected])
 
-  const acceptAttr = ACCEPTED_AUDIO_EXTENSIONS.join(',')
-
   return (
     <div className="space-y-4">
       <div
@@ -112,7 +110,6 @@ export function FileDropZone({ onFilesSelected, disabled }: FileDropZoneProps) {
         <input
           ref={inputRef}
           type="file"
-          accept={acceptAttr}
           multiple
           onChange={handleInputChange}
           className="hidden"
@@ -135,10 +132,14 @@ export function FileDropZone({ onFilesSelected, disabled }: FileDropZoneProps) {
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
                   <span>{formatFileSize(file.size)}</span>
                   <span className="opacity-40">·</span>
-                  <span className="inline-flex items-center gap-1">
-                    <Clock className="h-3 w-3" />
-                    {estimateDuration(file.size)}
-                  </span>
+                  {getMediaInputKind(file) === 'audio' ? (
+                    <span className="inline-flex items-center gap-1">
+                      <Clock className="h-3 w-3" />
+                      {estimateDuration(file.size)}
+                    </span>
+                  ) : (
+                    <span>{t.file?.videoWillExtract || 'Audio will be extracted locally'}</span>
+                  )}
                 </div>
               </div>
               <button
@@ -152,7 +153,9 @@ export function FileDropZone({ onFilesSelected, disabled }: FileDropZoneProps) {
           <div className="flex items-center gap-2 rounded-lg bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
             <Info className="h-3.5 w-3.5 shrink-0" />
             <span>
-              {t.file?.totalSizeAndDuration?.(formatFileSize(selectedFiles.reduce((s, f) => s + f.size, 0)), estimateDuration(selectedFiles.reduce((s, f) => s + f.size, 0)))}
+              {selectedFiles.some(file => getMediaInputKind(file) === 'video')
+                ? t.file?.totalSizeOnly?.(formatFileSize(selectedFiles.reduce((s, f) => s + f.size, 0)))
+                : t.file?.totalSizeAndDuration?.(formatFileSize(selectedFiles.reduce((s, f) => s + f.size, 0)), estimateDuration(selectedFiles.reduce((s, f) => s + f.size, 0)))}
             </span>
           </div>
           <button

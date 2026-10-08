@@ -1,4 +1,6 @@
-import type { BrowserWindow, IpcMain } from 'electron'
+import type { BrowserWindow, IpcMain, IpcMainEvent, WebContents } from 'electron'
+import { randomUUID } from 'node:crypto'
+import type { ApiSessionFilter } from '../shared/apiTypes'
 import type {
   ApiRecordingStatus,
   ApiTagData,
@@ -13,138 +15,108 @@ interface RegisterApiIpcOptions {
   getMainWindow: () => BrowserWindow | null
 }
 
-type PendingResolver<T> = {
-  resolve: (value: T) => void
+type PendingResolver = {
+  channel: string
+  sender: WebContents
+  resolve: (value: unknown) => void
   timer: ReturnType<typeof setTimeout>
 }
 
-let pendingSessionsReq: PendingResolver<SessionSummary[]> | null = null
-let pendingSessionDetailReq: PendingResolver<SessionDetail | null> | null = null
-let pendingSearchReq: PendingResolver<SessionSummary[]> | null = null
-let pendingTopicsReq: PendingResolver<ApiTopicData[]> | null = null
-let pendingTagsReq: PendingResolver<ApiTagData[]> | null = null
-let pendingRecordingStatusReq: PendingResolver<ApiRecordingStatus> | null = null
+const pendingRequests = new Map<string, PendingResolver>()
 
 let _getMainWindow: () => BrowserWindow | null = () => null
 
 const IPC_TIMEOUT_MS = 5000
 
-function createPending<T>(fallback: T): { promise: Promise<T>; pending: PendingResolver<T> } {
-  let pending!: PendingResolver<T>
-  const promise = new Promise<T>((resolve) => {
+function requestRenderer<T>(channel: string, fallback: T, args: unknown[] = [], filter?: ApiSessionFilter): Promise<T> {
+  const win = _getMainWindow()
+  if (!win || win.isDestroyed()) return Promise.resolve(fallback)
+  const requestId = randomUUID()
+  return new Promise<T>((resolve) => {
     const timer = setTimeout(() => {
+      pendingRequests.delete(requestId)
       resolve(fallback)
     }, IPC_TIMEOUT_MS)
-    pending = { resolve, timer }
+    pendingRequests.set(requestId, { channel, sender: win.webContents, resolve: value => resolve(value as T), timer })
+    try {
+      win.webContents.send(channel, ...args, requestId, ...(filter ? [filter] : []))
+    } catch {
+      clearTimeout(timer)
+      pendingRequests.delete(requestId)
+      resolve(fallback)
+    }
   })
-  return { promise, pending }
 }
 
-function resolvePending<T>(slot: PendingResolver<T> | null, value: T): void {
-  if (!slot) return
-  clearTimeout(slot.timer)
-  slot.resolve(value)
-}
-
-export function requestSessions(): Promise<SessionSummary[]> {
+function resolvePending(channel: string, event: IpcMainEvent, requestId: string, value: unknown): void {
+  const pending = pendingRequests.get(requestId)
   const win = _getMainWindow()
-  if (!win || win.isDestroyed()) return Promise.resolve([])
+  if (!pending || pending.channel !== channel || pending.sender !== event.sender
+    || !win || win.isDestroyed() || win.webContents !== event.sender) return
+  clearTimeout(pending.timer)
+  pendingRequests.delete(requestId)
+  pending.resolve(value)
+}
 
-  const { promise, pending } = createPending<SessionSummary[]>([])
-  pendingSessionsReq = pending
-  win.webContents.send('api-get-sessions')
-  return promise
+export function requestSessions(filter?: ApiSessionFilter): Promise<SessionSummary[]> {
+  return requestRenderer('api-get-sessions', [], [], filter)
 }
 
 export function requestSessionDetail(sessionId: string): Promise<SessionDetail | null> {
-  const win = _getMainWindow()
-  if (!win || win.isDestroyed()) return Promise.resolve(null)
-
-  const { promise, pending } = createPending<SessionDetail | null>(null)
-  pendingSessionDetailReq = pending
-  win.webContents.send('api-get-session-detail', sessionId)
-  return promise
+  return requestRenderer('api-get-session-detail', null, [sessionId])
 }
 
-export function requestSearchSessions(query: string): Promise<SessionSummary[]> {
-  const win = _getMainWindow()
-  if (!win || win.isDestroyed()) return Promise.resolve([])
-
-  const { promise, pending } = createPending<SessionSummary[]>([])
-  pendingSearchReq = pending
-  win.webContents.send('api-search-sessions', query)
-  return promise
+export function requestSearchSessions(query: string, filter?: ApiSessionFilter): Promise<SessionSummary[]> {
+  return requestRenderer('api-search-sessions', [], [query], filter)
 }
 
 export function requestTopics(): Promise<ApiTopicData[]> {
-  const win = _getMainWindow()
-  if (!win || win.isDestroyed()) return Promise.resolve([])
-
-  const { promise, pending } = createPending<ApiTopicData[]>([])
-  pendingTopicsReq = pending
-  win.webContents.send('api-get-topics')
-  return promise
+  return requestRenderer('api-get-topics', [])
 }
 
 export function requestTags(): Promise<ApiTagData[]> {
-  const win = _getMainWindow()
-  if (!win || win.isDestroyed()) return Promise.resolve([])
-
-  const { promise, pending } = createPending<ApiTagData[]>([])
-  pendingTagsReq = pending
-  win.webContents.send('api-get-tags')
-  return promise
+  return requestRenderer('api-get-tags', [])
 }
 
 export function requestRecordingStatus(): Promise<ApiRecordingStatus> {
-  const win = _getMainWindow()
   const fallback: ApiRecordingStatus = { isRecording: false, currentSessionId: null, recordingState: 'idle' }
-  if (!win || win.isDestroyed()) return Promise.resolve(fallback)
-
-  const { promise, pending } = createPending<ApiRecordingStatus>(fallback)
-  pendingRecordingStatusReq = pending
-  win.webContents.send('api-get-recording-status')
-  return promise
+  return requestRenderer('api-get-recording-status', fallback)
 }
 
 export function registerApiIpc({ ipcMain, getMainWindow }: RegisterApiIpcOptions): void {
   _getMainWindow = getMainWindow
 
-  ipcMain.on('api-notify-session-start', (_event, sessionId: string) => {
+  ipcMain.on('api-notify-session-start', (event, sessionId: string) => {
+    if (event.sender !== getMainWindow()?.webContents) return
     broadcastSessionEvent('session-start', sessionId)
   })
 
-  ipcMain.on('api-notify-session-end', (_event, sessionId: string) => {
+  ipcMain.on('api-notify-session-end', (event, sessionId: string) => {
+    if (event.sender !== getMainWindow()?.webContents) return
     broadcastSessionEvent('session-end', sessionId)
   })
 
-  ipcMain.on('api-respond-sessions', (_event, sessions: SessionSummary[]) => {
-    resolvePending(pendingSessionsReq, sessions)
-    pendingSessionsReq = null
+  ipcMain.on('api-respond-sessions', (event, sessions: SessionSummary[], requestId: string) => {
+    resolvePending('api-get-sessions', event, requestId, sessions)
   })
 
-  ipcMain.on('api-respond-session-detail', (_event, session: SessionDetail | null) => {
-    resolvePending(pendingSessionDetailReq, session)
-    pendingSessionDetailReq = null
+  ipcMain.on('api-respond-session-detail', (event, session: SessionDetail | null, requestId: string) => {
+    resolvePending('api-get-session-detail', event, requestId, session)
   })
 
-  ipcMain.on('api-respond-search-sessions', (_event, sessions: SessionSummary[]) => {
-    resolvePending(pendingSearchReq, sessions)
-    pendingSearchReq = null
+  ipcMain.on('api-respond-search-sessions', (event, sessions: SessionSummary[], requestId: string) => {
+    resolvePending('api-search-sessions', event, requestId, sessions)
   })
 
-  ipcMain.on('api-respond-topics', (_event, topics: ApiTopicData[]) => {
-    resolvePending(pendingTopicsReq, topics)
-    pendingTopicsReq = null
+  ipcMain.on('api-respond-topics', (event, topics: ApiTopicData[], requestId: string) => {
+    resolvePending('api-get-topics', event, requestId, topics)
   })
 
-  ipcMain.on('api-respond-tags', (_event, tags: ApiTagData[]) => {
-    resolvePending(pendingTagsReq, tags)
-    pendingTagsReq = null
+  ipcMain.on('api-respond-tags', (event, tags: ApiTagData[], requestId: string) => {
+    resolvePending('api-get-tags', event, requestId, tags)
   })
 
-  ipcMain.on('api-respond-recording-status', (_event, status: ApiRecordingStatus) => {
-    resolvePending(pendingRecordingStatusReq, status)
-    pendingRecordingStatusReq = null
+  ipcMain.on('api-respond-recording-status', (event, status: ApiRecordingStatus, requestId: string) => {
+    resolvePending('api-get-recording-status', event, requestId, status)
   })
 }

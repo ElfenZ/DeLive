@@ -1,7 +1,8 @@
-import { Mic, FileText, FolderOpen, FileAudio, Monitor, Settings, PanelLeftClose, PanelLeft } from 'lucide-react'
+import { Mic, FileText, FileAudio, Monitor, Settings, PanelLeftClose, PanelLeft } from 'lucide-react'
 import { AnimatedThemeToggler } from './AnimatedThemeToggler'
 import { useUIStore, type WorkspaceView } from '../stores/uiStore'
 import type { RecordingState } from '../types'
+import { getSidebarWidth } from '../hooks/useSidebarState'
 
 interface SidebarProps {
   collapsed: boolean
@@ -24,7 +25,6 @@ const NAV_MAIN: NavItem[] = [
   { id: 'live', icon: Mic, isPage: true },
   { id: 'file', icon: FileAudio, isPage: true },
   { id: 'review', icon: FileText, isPage: true },
-  { id: 'topics', icon: FolderOpen, isPage: true },
 ]
 
 const NAV_AUX: NavItem[] = [
@@ -93,7 +93,8 @@ export function Sidebar({
           }
           ${collapsed ? 'justify-center px-0' : ''}
         `}
-        title={collapsed ? label : undefined}
+        title={label}
+        aria-label={label}
         aria-current={item.isPage && active ? 'page' : undefined}
       >
         {active && item.isPage && (
@@ -125,9 +126,8 @@ export function Sidebar({
         fixed left-0 top-0 z-40 flex h-full flex-col
         border-r border-border/40 bg-background/95 backdrop-blur
         transition-all duration-200
-        ${collapsed ? 'w-14' : 'w-56'}
       `}
-      style={isElectron && platform === 'darwin' ? { paddingTop: 32 } : undefined}
+      style={{ width: getSidebarWidth(collapsed), ...(isElectron && platform === 'darwin' ? { paddingTop: 32 } : {}) }}
     >
       {/* macOS traffic light spacer (non-macOS gets TitleBar height via marginTop in parent) */}
       {isElectron && platform !== 'darwin' && <div className="h-8 shrink-0" />}

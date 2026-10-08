@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState, useCallback } from 'react'
-import { FileText, Languages, Play } from 'lucide-react'
+import { FileText, Languages } from 'lucide-react'
 import type { TranscriptSession } from '../../types'
 import { useUIStore } from '../../stores/uiStore'
 
@@ -47,7 +47,7 @@ export function TranscriptTab({ session }: TranscriptTabProps) {
   const contentRef = useRef<HTMLDivElement>(null)
   const translatedText = session.translatedTranscript?.text?.trim() || ''
   const speakerSegments = useMemo(
-    () => (session.segments || []).filter((segment) => segment.speakerId && segment.text.trim()),
+    () => (session.segments || []).filter((segment) => segment.text.trim()),
     [session.segments],
   )
   const sessionSpeakers = useMemo(
@@ -73,7 +73,7 @@ export function TranscriptTab({ session }: TranscriptTabProps) {
     setHoveredIndex(index)
   }, [])
 
-  if (!session.transcript && !translatedText) {
+  if (!session.transcript && !translatedText && !speakerSegments.length) {
     return (
       <div className="flex h-full flex-col items-center justify-center text-muted-foreground py-12">
         <div className="bg-muted w-16 h-16 rounded-full flex items-center justify-center mb-4">
@@ -91,7 +91,7 @@ export function TranscriptTab({ session }: TranscriptTabProps) {
           <div className="space-y-0.5">
             {speakerSegments.map((segment, index) => {
               const prevSegment = index > 0 ? speakerSegments[index - 1] : null
-              const isSameSpeaker = prevSegment?.speakerId === segment.speakerId
+              const isSameSpeaker = Boolean(prevSegment) && prevSegment?.speakerId === segment.speakerId
               const isHovered = hoveredIndex === index
               const colors = segment.speakerId
                 ? getSpeakerBadgeColor(segment.speakerId, speakerIds)
@@ -119,32 +119,26 @@ export function TranscriptTab({ session }: TranscriptTabProps) {
 
                   {/* Speaker name + timestamp header */}
                   <div className="min-w-0 flex-1">
-                    {!isSameSpeaker && segment.speakerId && (
+                    {!isSameSpeaker && (
                       <div className="flex items-center gap-2 mb-1">
                         <span className={`text-xs font-semibold ${colors.label}`}>
-                          {getSpeakerLabel(segment.speakerId, speakerNameMap)}
+                          {segment.speakerId ? getSpeakerLabel(segment.speakerId, speakerNameMap) : t.preview.unknownSpeaker}
                         </span>
                         {segment.startMs != null && (
-                          <button
-                            className="inline-flex items-center gap-1 text-[10px] font-mono tabular-nums text-muted-foreground/60 hover:text-primary transition-colors"
-                            title={t.preview.jumpToTimestamp || 'Jump to timestamp'}
-                          >
-                            <Play className="h-2.5 w-2.5" />
+                          <span className="text-[10px] font-mono tabular-nums text-muted-foreground/60">
                             {formatMs(segment.startMs)}
-                          </button>
+                          </span>
                         )}
                       </div>
                     )}
                     {isSameSpeaker && segment.startMs != null && (
-                      <button
+                      <span
                         className={`mb-0.5 inline-flex items-center gap-1 text-[10px] font-mono tabular-nums transition-colors ${
                           isHovered ? 'text-muted-foreground' : 'text-muted-foreground/30'
-                        } hover:text-primary`}
-                        title={t.preview.jumpToTimestamp || 'Jump to timestamp'}
+                        }`}
                       >
-                        <Play className="h-2.5 w-2.5" />
                         {formatMs(segment.startMs)}
-                      </button>
+                      </span>
                     )}
                     <p className="text-sm leading-relaxed whitespace-pre-wrap text-foreground/90 m-0">
                       {segment.text}

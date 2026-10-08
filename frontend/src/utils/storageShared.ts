@@ -9,12 +9,13 @@ export const STORAGE_KEYS = {
 } as const
 
 export const DB_NAME = 'delive-app'
-export const DB_VERSION = 3
+export const DB_VERSION = 4
 export const SESSION_STORE = 'sessions'
 export const SESSION_UPDATED_AT_INDEX = 'updatedAt'
 export const META_STORE = 'meta'
 export const SETTINGS_STORE = 'settings'
 export const TAGS_STORE = 'tags'
+export const DELETED_SESSION_STORE = 'deletedSessionSnapshots'
 export const META_KEY_SESSIONS_MIGRATED = 'sessions_migrated'
 export const META_KEY_SETTINGS_MIGRATED = 'settings_tags_migrated'
 export const SETTINGS_SINGLETON_KEY = 'app_settings'
@@ -100,6 +101,9 @@ export function openAppDatabase(): Promise<IDBDatabase> {
         if (!db.objectStoreNames.contains(TAGS_STORE)) {
           db.createObjectStore(TAGS_STORE, { keyPath: 'id' })
         }
+        if (!db.objectStoreNames.contains(DELETED_SESSION_STORE)) {
+          db.createObjectStore(DELETED_SESSION_STORE, { keyPath: 'id' })
+        }
       }
     })
   }
@@ -120,9 +124,20 @@ export function createTransaction<T>(
   return new Promise((resolve, reject) => {
     const transaction = db.transaction(storeName, mode)
     const store = transaction.objectStore(storeName)
-
+    let result: T
+    let hasResult = false
     transaction.onerror = () => reject(transaction.error ?? new Error(`IndexedDB transaction failed for ${storeName}`))
-    executor(store, resolve, reject)
+    transaction.onabort = () => reject(transaction.error ?? new Error(`IndexedDB transaction aborted for ${storeName}`))
+    transaction.oncomplete = () => hasResult ? resolve(result) : reject(new Error(`Missing transaction result for ${storeName}`))
+    try {
+      executor(store, (value) => { result = value; hasResult = true }, (error) => {
+        reject(error)
+        transaction.abort()
+      })
+    } catch (error) {
+      reject(error)
+      transaction.abort()
+    }
   })
 }
 
@@ -159,6 +174,7 @@ export function getDefaultSettings(): AppSettings {
     aiPostProcess: {
       enabled: false,
       provider: 'openai-compatible',
+      thinkingMode: 'default',
       baseUrl: 'http://127.0.0.1:11434/v1',
       model: '',
       apiKey: '',

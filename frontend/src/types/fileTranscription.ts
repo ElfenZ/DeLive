@@ -1,8 +1,11 @@
 import type { ASRVendor } from './asr/common'
 import type { MeetingContextSnapshot, RecognitionConfigSnapshot } from './index'
+import type { ManagedAssetReference } from '../../../shared/fileStorage'
 
 export type FileTranscriptionJobStatus =
   | 'queued'
+  | 'extracting'
+  | 'audio-ready'
   | 'uploading'
   | 'transcribing'
   | 'completed'
@@ -17,6 +20,8 @@ export interface FileTranscriptionJob {
   status: FileTranscriptionJobStatus
   progress: number
   provider: ASRVendor
+  inputKind: 'audio' | 'video'
+  config?: FileTranscriptionConfig
   /** Soniox-specific remote file ID */
   sonioxFileId?: string
   /** Soniox-specific remote transcription ID */
@@ -26,6 +31,18 @@ export interface FileTranscriptionJob {
   /** Gladia-specific remote transcription job ID */
   gladiaTranscriptionId?: string
   sessionId?: string
+  projectIds?: string[]
+  defaultSaveProjectId?: string
+  managedAsset?: ManagedAssetReference
+  originalSourceId?: string
+  originalSourceRevision?: number
+  currentOriginalFileName?: string
+  audioPath?: string
+  audioFileName?: string
+  audioMimeType?: string
+  audioSize?: number
+  audioAvailable?: boolean
+  requiresSourceSelection?: boolean
   error?: string
   createdAt: number
   completedAt?: number
@@ -45,8 +62,18 @@ export interface FileTranscriptionConfig {
 }
 
 export const ACCEPTED_AUDIO_EXTENSIONS = [
-  '.mp3', '.wav', '.m4a', '.flac', '.ogg', '.webm', '.opus',
-  '.mp4', '.mpeg', '.mpga', '.aac', '.wma',
+  '.mp3', '.wav', '.m4a', '.flac', '.ogg', '.opus',
+  '.mpga', '.aac', '.wma',
+] as const
+
+export const CANDIDATE_VIDEO_EXTENSIONS = [
+  '.mp4', '.webm', '.mov', '.mkv', '.mpeg', '.mpg', '.m4v',
+  '.avi', '.wmv', '.flv', '.ts', '.mts', '.m2ts', '.3gp', '.ogv',
+] as const
+
+export const ACCEPTED_MEDIA_EXTENSIONS = [
+  ...ACCEPTED_AUDIO_EXTENSIONS,
+  ...CANDIDATE_VIDEO_EXTENSIONS,
 ] as const
 
 export const ACCEPTED_AUDIO_MIME_TYPES = [
@@ -54,15 +81,38 @@ export const ACCEPTED_AUDIO_MIME_TYPES = [
   'audio/mp4', 'audio/x-m4a', 'audio/m4a', 'audio/flac',
   'audio/ogg', 'audio/webm', 'audio/opus', 'audio/aac',
   'audio/x-aac', 'audio/wma', 'audio/x-ms-wma',
-  'video/mp4', 'video/mpeg', 'video/webm',
 ] as const
 
+export const CANDIDATE_VIDEO_MIME_TYPES = [
+  'video/mp4', 'video/mpeg', 'video/webm', 'video/quicktime',
+  'video/x-matroska', 'video/x-msvideo', 'video/x-ms-wmv',
+] as const
+
+function getFileExtension(fileName: string): string {
+  const dotIndex = fileName.lastIndexOf('.')
+  return dotIndex >= 0 ? fileName.slice(dotIndex).toLowerCase() : ''
+}
+
+export function getMediaInputKind(file: Pick<File, 'name' | 'type'>): 'audio' | 'video' {
+  const extension = getFileExtension(file.name)
+  if (file.type.startsWith('audio/')) return 'audio'
+  if (file.type.startsWith('video/')) return 'video'
+  if (ACCEPTED_AUDIO_EXTENSIONS.includes(extension as typeof ACCEPTED_AUDIO_EXTENSIONS[number])) return 'audio'
+  return 'video'
+}
+
 export function isAcceptedAudioFile(file: File): boolean {
+  if (!file.name || file.size <= 0) return false
   if (ACCEPTED_AUDIO_MIME_TYPES.includes(file.type as typeof ACCEPTED_AUDIO_MIME_TYPES[number])) {
     return true
   }
-  const ext = '.' + file.name.split('.').pop()?.toLowerCase()
-  return ACCEPTED_AUDIO_EXTENSIONS.includes(ext as typeof ACCEPTED_AUDIO_EXTENSIONS[number])
+  if (CANDIDATE_VIDEO_MIME_TYPES.includes(file.type as typeof CANDIDATE_VIDEO_MIME_TYPES[number])) {
+    return true
+  }
+  const extension = getFileExtension(file.name)
+  if (ACCEPTED_MEDIA_EXTENSIONS.includes(extension as typeof ACCEPTED_MEDIA_EXTENSIONS[number])) return true
+  // The desktop app lets FFmpeg make the final format decision for uncommon containers.
+  return typeof window !== 'undefined' && Boolean(window.electronAPI?.getPathForFile)
 }
 
 export function formatFileSize(bytes: number): string {

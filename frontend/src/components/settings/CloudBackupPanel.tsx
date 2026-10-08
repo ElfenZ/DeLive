@@ -22,16 +22,9 @@ import {
   validateBackupData,
   upgradeBackupData,
   importDataOverwrite,
-  type BackupData,
 } from '../../utils/storage'
-import { getSessions } from '../../utils/sessionStorage'
-import { getSettings, getTags, getTopics } from '../../utils/settingsStorage'
-import { normalizeTranscriptSessions } from '../../utils/sessionSchema'
-import {
-  CURRENT_BACKUP_VERSION,
-  CURRENT_BACKUP_SCHEMA_VERSION,
-  sanitizeSettingsForBackup,
-} from '../../utils/backupStorage'
+import { buildBackupData } from '../../utils/backupStorage'
+import { assertBackupRestoreIdle } from '../../utils/backupRestoreGuard'
 
 interface CloudBackupPanelProps {
   t: Translations
@@ -61,20 +54,7 @@ function buildIpcConfig(config: CloudBackupConfig): CloudBackupIpcConfig {
 }
 
 async function buildBackupJson(): Promise<string> {
-  const sessions = normalizeTranscriptSessions(await getSessions())
-  const tags = getTags()
-  const settings = sanitizeSettingsForBackup(getSettings())
-  const topics = getTopics()
-  const data: BackupData = {
-    version: CURRENT_BACKUP_VERSION,
-    schemaVersion: CURRENT_BACKUP_SCHEMA_VERSION,
-    exportedAt: new Date().toISOString(),
-    sessions,
-    tags,
-    settings,
-    topics,
-  }
-  return JSON.stringify(data, null, 2)
+  return JSON.stringify(await buildBackupData(), null, 2)
 }
 
 function formatFileSize(bytes: number): string {
@@ -170,6 +150,10 @@ export function CloudBackupPanel({
 
   const handleRestore = useCallback(async (key: string) => {
     if (!window.electronAPI) return
+    try { assertBackupRestoreIdle() } catch (error) {
+      alert(`${ts.cloudBackupRestoreFailed}: ${error instanceof Error ? error.message : String(error)}`)
+      return
+    }
     if (!confirm(ts.cloudBackupRestoreConfirm)) return
 
     setRestoreStatus(key)

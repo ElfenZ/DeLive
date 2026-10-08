@@ -1,0 +1,141 @@
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
+import fs from 'fs'
+import path from 'path'
+import os from 'os'
+import { FileStorageService } from '../../electron/fileStorageService'
+
+describe('saved title naming and deleted-record fences', () => {
+  let root: string
+  let service: FileStorageService
+  beforeEach(async () => { root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'kilo', 'delive-naming-')); service = new FileStorageService(path.join(root, 'userdata')); await service.getConfiguration() })
+  afterEach(async () => { vi.restoreAllMocks(); await fs.promises.rm(root, { recursive: true, force: true }) })
+  it('uses the newest queued title after a producer lease, then only updates managed basename/revision', async () => {
+    const directory = await service.sessionDirectory('record1', true)
+    await fs.promises.writeFile(path.join(directory, 'source-audio.wav'), 'content')
+    const before = await service.resolveAsset('record1')
+    const lease = service.acquireUsage('record1', 'recording')
+    await service.registerSessionContext({ sessionId: 'record1', title: 'Old', createdAt: 1000, titleRevision: 1 }, true)
+    await service.registerSessionContext({ sessionId: 'record1', title: '最新标题', createdAt: 1000, titleRevision: 2 }, true)
+    expect((await service.getSessionContext('record1')).title).toBe('最新标题')
+    service.releaseUsage(lease)
+    await service.drainManagedNaming('record1')
+    const named = await service.resolveAsset('record1')
+    expect(named.fileName).toContain('最新标题')
+    expect(named.revision).toBeGreaterThan(before.revision)
+    expect(await fs.promises.readFile(named.path, 'utf8')).toBe('content')
+    expect(fs.existsSync(before.path)).toBe(false)
+    await expect(service.registerSessionContext({ sessionId: 'record1', title: 'Old', createdAt: 1000, titleRevision: 1 }, true)).rejects.toThrow(/stale/)
+  })
+
+  it('does no registry writes or change notifications for already-current context/names or repeated startup bindings', async () => {
+    const context = { sessionId: 'current-record', title: 'Current', titleRevision: 1, createdAt: 1000 }
+    await service.registerSessionContext(context, true)
+    const statePath = path.join(service.userData, 'local-file-storage', 'state.json')
+    const before = await fs.promises.readFile(statePath, 'utf8')
+    const changes = vi.fn(), stop = service.subscribe(changes)
+    const rename = vi.spyOn(fs.promises, 'rename')
+    await service.registerSessionContext(context, true)
+    await service.registerSessionContext(context, false)
+    await service.reconcileRecordBindings([context], [])
+    expect(changes).not.toHaveBeenCalled()
+    expect(rename).not.toHaveBeenCalled()
+    expect(await fs.promises.readFile(statePath, 'utf8')).toBe(before)
+    stop()
+  })
+
+  it('still names newly published assets even when their unchanged logical title was previously synchronized', async () => {
+    const context = { sessionId: 'new-asset', title: 'Current', titleRevision: 1, createdAt: 1000 }
+    await service.registerSessionContext(context, true)
+    const directory = await service.sessionDirectory(context.sessionId, true)
+    await fs.promises.writeFile(path.join(directory, 'new.tmp.wav'), 'audio')
+    await service.withSessionLock(context.sessionId, () => service.publishAsset(context.sessionId, 'recording-audio', 'new.tmp.wav', 'source-audio.wav'))
+    await service.registerSessionContext(context, true)
+    expect((await service.resolveAsset(context.sessionId)).fileName).toContain('Current')
+  })
+  it('permits explicit audio-only regeneration at a newer revision, but never after record deletion', async () => {
+    const directory = await service.sessionDirectory('record1', true)
+    await fs.promises.writeFile(path.join(directory, 'source-audio.wav'), 'first')
+    const before = await service.resolveAsset('record1')
+    await service.deleteAsset('record1')
+    await fs.promises.writeFile(path.join(directory, 'new.tmp.wav'), 'new')
+    const regenerated = await service.withSessionLock('record1', () => service.publishAsset('record1', 'recording-audio', 'new.tmp.wav', 'source-audio.wav'))
+    expect(regenerated.revision).toBeGreaterThan(before.revision)
+    await service.recordDeletion('record1', 'prepare')
+    await service.recordDeletion('record1', 'commit')
+    await service.recordDeletion('record1', 'cancel')
+    await fs.promises.writeFile(path.join(directory, 'late.tmp.wav'), 'late')
+    await expect(service.withSessionLock('record1', () => service.publishAsset('record1', 'recording-audio', 'late.tmp.wav', 'late.wav'))).rejects.toThrow(/deleted/)
+    expect(fs.existsSync(path.join(directory, 'late.wav'))).toBe(false)
+    expect(await fs.promises.readFile(regenerated.path, 'utf8')).toBe('new')
+  }, 30000)
+  it('reconciles a crash between deletion prepare and durable record deletion using verified local records', async () => {
+    const context = { sessionId: 'record1', title: 'Title', createdAt: 1000, titleRevision: 2 }
+    await service.registerSessionContext(context)
+    await service.recordDeletion(context.sessionId, 'prepare')
+    await expect(service.getSessionContext(context.sessionId)).rejects.toThrow(/deleted/)
+    await service.reconcileRecordBindings([context], [])
+    expect(await service.getSessionContext(context.sessionId)).toEqual(context)
+    await service.reconcileRecordBindings([], [context.sessionId])
+    await expect(service.getSessionContext(context.sessionId)).rejects.toThrow(/deleted/)
+    await expect(service.reconcileRecordBindings([context], [context.sessionId])).rejects.toThrow(/conflicts/)
+    await expect(service.getSessionContext(context.sessionId)).rejects.toThrow(/deleted/)
+  })
+  it.runIf(process.platform === 'win32')('keeps one readable audio file and its digest after a case-only title change', async () => {
+    const directory = await service.sessionDirectory('record1', true)
+    await fs.promises.writeFile(path.join(directory, 'source-audio.wav'), 'unique audio')
+    await service.resolveAsset('record1')
+    await service.registerSessionContext({ sessionId: 'record1', title: 'Foo', createdAt: 1000, titleRevision: 0 }, true)
+    const before = await service.resolveAsset('record1')
+    const naming = await service.registerSessionContext({ sessionId: 'record1', title: 'foo', createdAt: 1000, titleRevision: 1 }, true)
+    expect(naming).toMatchObject({ status: 'saved', titleRevision: 1 })
+    const after = await service.resolveAsset('record1')
+    expect(after.fileName).toContain('_foo.wav')
+    expect(after.sha256).toBe(before.sha256)
+    expect(after.revision).toBe(before.revision + 1)
+    expect(await fs.promises.readFile(after.path, 'utf8')).toBe('unique audio')
+    expect(await fs.promises.readdir(directory)).toEqual([after.fileName])
+    expect((await service.readAsset('record1')).data.toString()).toBe('unique audio')
+  }, 30000)
+  it.runIf(process.platform === 'win32')('replays an interrupted case-only intermediate after restart without deleting its only copy', async () => {
+    const directory = await service.sessionDirectory('record1', true)
+    await fs.promises.writeFile(path.join(directory, 'source-audio.wav'), 'unique audio')
+    await service.resolveAsset('record1')
+    await service.registerSessionContext({ sessionId: 'record1', title: 'Foo', createdAt: 1000, titleRevision: 0 }, true)
+    const before = await service.resolveAsset('record1')
+    const adapter = await import('../../electron/windowsFileHandle')
+    const native = adapter.protectedWindowsFileOperation
+    vi.spyOn(adapter, 'protectedWindowsFileOperation').mockImplementation(async (request) => {
+      if (request.action === 'move' && request.target?.endsWith('_foo.wav')) throw new Error('crash before second case move')
+      return native(request)
+    })
+    await service.registerSessionContext({ sessionId: 'record1', title: 'foo', createdAt: 1000, titleRevision: 1 }, true)
+    const names = await fs.promises.readdir(directory)
+    expect(names).toHaveLength(1)
+    expect(names[0]).toMatch(/^\.delive-case-/)
+    vi.restoreAllMocks()
+    const restarted = new FileStorageService(service.userData)
+    await restarted.reconcileRecordBindings([{ sessionId: 'record1', title: 'foo', createdAt: 1000, titleRevision: 1 }], [])
+    const after = await restarted.resolveAsset('record1')
+    expect(after.sha256).toBe(before.sha256)
+    expect(after.fileName).toContain('_foo.wav')
+    expect(await fs.promises.readdir(directory)).toEqual([after.fileName])
+    expect((await restarted.status()).pendingOperationCount).toBe(0)
+  }, 30000)
+  it('preserves and executes the latest deferred intent at startup, without renaming unrelated legacy records', async () => {
+    const directory = await service.sessionDirectory('record1', true)
+    await fs.promises.writeFile(path.join(directory, 'source-audio.wav'), 'deferred audio')
+    await service.resolveAsset('record1')
+    const untouched = await service.sessionDirectory('legacy2', true)
+    await fs.promises.writeFile(path.join(untouched, 'source-audio.wav'), 'legacy unchanged')
+    service.acquireUsage('record1', 'recording')
+    await service.registerSessionContext({ sessionId: 'record1', title: 'Before', createdAt: 1000, titleRevision: 1 }, true)
+    await service.registerSessionContext({ sessionId: 'record1', title: 'Latest', createdAt: 1000, titleRevision: 2 }, true)
+    const restarted = new FileStorageService(service.userData)
+    await restarted.reconcileRecordBindings([
+      { sessionId: 'record1', title: 'Newest durable title', createdAt: 1000, titleRevision: 3 },
+      { sessionId: 'legacy2', title: 'Never request naming', createdAt: 1000, titleRevision: 0 },
+    ], [])
+    expect((await restarted.resolveAsset('record1')).fileName).toContain('_Newest durable title.wav')
+    expect(await fs.promises.readdir(untouched)).toEqual(['source-audio.wav'])
+  })
+})

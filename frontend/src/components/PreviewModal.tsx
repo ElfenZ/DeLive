@@ -11,6 +11,7 @@ import {
 } from './review'
 import type { ReviewTab } from './review'
 import { AiSidePanel } from './review/AiSidePanel'
+import { useUIStore } from '../stores/uiStore'
 
 interface PreviewModalProps {
   session: TranscriptSession | null
@@ -18,6 +19,7 @@ interface PreviewModalProps {
   mode?: 'modal' | 'view'
   sidebarCollapsed?: boolean
   onToggleSidebar?: () => void
+  closeLabel?: string
 }
 
 export function PreviewModal({
@@ -26,17 +28,19 @@ export function PreviewModal({
   mode = 'modal',
   sidebarCollapsed,
   onToggleSidebar,
+  closeLabel,
 }: PreviewModalProps) {
   const isViewMode = mode === 'view'
-  const [activeTab, setActiveTab] = useState<ReviewTab>('transcript')
+  const [activeTab, setActiveTab] = useState<ReviewTab>('summary')
   const [aiPanelOpen, setAiPanelOpen] = useState(false)
   const [selectedText, setSelectedText] = useState<string | undefined>()
   const [floatingBtn, setFloatingBtn] = useState<{ x: number; y: number; text: string } | null>(null)
   const tabPanelRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    setActiveTab('transcript')
+    setActiveTab('summary')
     setAiPanelOpen(false)
+    setSelectedText(undefined)
     setFloatingBtn(null)
   }, [session?.id])
 
@@ -47,6 +51,12 @@ export function PreviewModal({
   const handleClearSelection = useCallback(() => {
     setSelectedText(undefined)
   }, [])
+  const continueInChat = (conversationId: string) => {
+    if (!session) return
+    useUIStore.getState().setReviewConversation(session.id, conversationId)
+    setActiveTab('chat')
+    setAiPanelOpen(false)
+  }
 
   const handleAskAiFromSelection = useCallback(() => {
     if (!floatingBtn) return
@@ -97,6 +107,7 @@ export function PreviewModal({
     if (!session) return undefined
 
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || document.querySelector('[aria-modal="true"]') && isViewMode) return
       if (event.key === 'Escape') {
         onClose()
       }
@@ -112,7 +123,7 @@ export function PreviewModal({
 
     document.addEventListener('keydown', handleKeyDown)
     return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [onClose, session])
+  }, [onClose, session, isViewMode])
 
   if (!session) return null
 
@@ -143,6 +154,7 @@ export function PreviewModal({
         onClose={onClose}
         sidebarCollapsed={sidebarCollapsed}
         onToggleSidebar={onToggleSidebar}
+        closeLabel={closeLabel}
       />
       <SessionTabBar activeTab={activeTab} onTabChange={setActiveTab} />
       <div
@@ -160,6 +172,7 @@ export function PreviewModal({
               session={session}
               isOpen={false}
               onToggle={handleToggleAiPanel}
+              onContinue={continueInChat}
             />
           )}
         </div>
@@ -168,6 +181,7 @@ export function PreviewModal({
             session={session}
             isOpen={true}
             onToggle={handleToggleAiPanel}
+            onContinue={continueInChat}
             selectedText={selectedText}
             onClearSelection={handleClearSelection}
           />

@@ -2,9 +2,12 @@ import { useState, useMemo, useEffect, useRef } from 'react'
 import { History, Calendar, Pencil, Trash2, Check, X, ChevronDown, ChevronRight, Search, FileText, Sparkles } from 'lucide-react'
 import { useUIStore } from '../stores/uiStore'
 import { useSessionStore } from '../stores/sessionStore'
+import { useTopicStore } from '../stores/topicStore'
 import { useTagStore } from '../stores/tagStore'
 import { exportToTxt } from '../utils/storage'
-import { ActionDialog } from './ActionDialog'
+import { SessionDeleteDialog } from './SessionDeleteDialog'
+import { SessionProjectLinks } from './SessionProjectLinks'
+import { getProjectLinkOrigins, selectReviewSessions } from '../utils/projectSchema'
 import { TagSelector, TagFilter } from './TagSelector'
 import type { TranscriptSession } from '../types'
 
@@ -19,11 +22,17 @@ export function HistoryPanel({
   className = '',
   contentHeightClassName,
 }: HistoryPanelProps) {
-  const { t, openReview } = useUIStore()
-  const { sessions, updateSessionTitle, deleteSession } = useSessionStore()
-  const { tags, selectedTagIds, searchQuery, setSearchQuery } = useTagStore()
+  const { t, openReview, reviewFolder, reviewSessionId } = useUIStore()
+  const { sessions, updateSessionTitle } = useSessionStore()
+  const topics = useTopicStore((state) => state.topics)
+  const projectId = reviewFolder.kind === 'topic' ? reviewFolder.topicId : undefined
+  const folderLabel = projectId ? topics.find((topic) => topic.id === projectId)?.name : reviewFolder.kind === 'unclassified' ? t.reviewFolders.unclassified : t.reviewFolders.all
+  const folderCount = selectReviewSessions(sessions, topics, reviewFolder).length
+  const { tags, selectedTagIds, searchQuery, setSearchQuery, selectedReviewDate, setSelectedReviewDate } = useTagStore()
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editingTitle, setEditingTitle] = useState('')
+  const [titleSaving, setTitleSaving] = useState(false)
+  const [titleError, setTitleError] = useState('')
   const [expandedDates, setExpandedDates] = useState<Set<string>>(new Set())
   const [collapsedDates, setCollapsedDates] = useState<Set<string>>(new Set())
   const [inputValue, setInputValue] = useState(searchQuery)
@@ -68,65 +77,8 @@ export function HistoryPanel({
 
   // 按标签和搜索词筛选会话
   const filteredSessions = useMemo(() => {
-    let result = sessions
-
-    // 搜索时包含所有 session（含主题内的），否则隐藏有 topicId 的 session
-    if (!searchQuery.trim()) {
-      result = result.filter((session) => !session.topicId)
-    }
-    
-    // 标签筛选
-    if (selectedTagIds.length > 0) {
-      result = result.filter(session => 
-        selectedTagIds.some(tagId => session.tagIds?.includes(tagId))
-      )
-    }
-    
-    // 搜索筛选
-    if (searchQuery.trim()) {
-      const query = searchQuery.toLowerCase().trim()
-      result = result.filter(session => {
-        const tagNames = (session.tagIds || [])
-          .map((tagId) => tags.find((tag) => tag.id === tagId)?.name || '')
-          .filter(Boolean)
-        const postProcessSearch = [
-          session.postProcess?.summary || '',
-          ...(session.postProcess?.actionItems || []),
-          ...(session.postProcess?.keywords || []),
-          ...(session.postProcess?.tagSuggestions || []),
-          ...(session.postProcess?.chapters || []).flatMap((chapter) => [
-            chapter.title || '',
-            chapter.summary || '',
-          ]),
-        ]
-        const speakerSearch = [
-          ...(session.speakers || []).flatMap((speaker) => [
-            speaker.id,
-            speaker.label,
-            speaker.displayName || '',
-          ]),
-          ...(session.segments || []).map((segment) => segment.speakerId || ''),
-        ]
-        const searchableContent = [
-          session.title,
-          session.date,
-          session.time,
-          session.transcript,
-          session.translatedTranscript?.text || '',
-          session.providerId || '',
-          ...tagNames,
-          ...postProcessSearch,
-          ...speakerSearch,
-        ]
-          .join('\n')
-          .toLowerCase()
-
-        return searchableContent.includes(query)
-      })
-    }
-    
-    return result
-  }, [sessions, selectedTagIds, searchQuery, tags])
+    return selectReviewSessions(sessions, topics, reviewFolder, selectedTagIds, searchQuery, tags, selectedReviewDate)
+  }, [sessions, topics, reviewFolder, selectedTagIds, searchQuery, tags, selectedReviewDate])
 
   // 按日期分组
   const groupedSessions = useMemo(() => {
@@ -147,7 +99,7 @@ export function HistoryPanel({
   const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0]
 
   const toggleDate = (date: string) => {
-    const isDefault = date === today || date === yesterday
+    const isDefault = variant === 'rail' || Boolean(projectId) || date === today || date === yesterday
     if (isDefault) {
       const next = new Set(collapsedDates)
       if (next.has(date)) {
@@ -171,17 +123,21 @@ export function HistoryPanel({
     e.stopPropagation()
     setEditingId(session.id)
     setEditingTitle(session.title)
+    setTitleError('')
   }
 
   const saveTitle = () => {
-    if (editingId && editingTitle.trim()) {
-      updateSessionTitle(editingId, editingTitle.trim())
-    }
-    setEditingId(null)
-    setEditingTitle('')
+    if (!editingId || !editingTitle.trim() || titleSaving) return
+    setTitleSaving(true)
+    setTitleError('')
+    void updateSessionTitle(editingId, editingTitle.trim()).then(() => {
+      setEditingId(null)
+      setEditingTitle('')
+    }).catch((error: unknown) => setTitleError(error instanceof Error ? error.message : String(error))).finally(() => setTitleSaving(false))
   }
 
   const cancelEditing = () => {
+    if (titleSaving) return
     setEditingId(null)
     setEditingTitle('')
   }
@@ -216,7 +172,7 @@ export function HistoryPanel({
   }
 
   const isExpanded = (date: string) => {
-    const isDefault = date === today || date === yesterday
+    const isDefault = variant === 'rail' || Boolean(projectId) || date === today || date === yesterday
     if (isDefault) return !collapsedDates.has(date)
     return expandedDates.has(date)
   }
@@ -229,21 +185,21 @@ export function HistoryPanel({
     <>
       <div className={`workspace-panel overflow-hidden ${className}`}>
         {/* 头部 */}
-        <div className={`space-y-3 border-b border-border/70 bg-muted/20 ${isRail ? 'px-5 py-4' : 'px-6 py-4'}`}>
+        <div className={`shrink-0 space-y-3 border-b border-border/70 bg-muted/20 ${isRail ? 'px-3 py-3' : 'px-6 py-4'}`}>
           <div className="flex items-center justify-between gap-3">
-            <div className="space-y-1">
-              <div className="inline-flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.24em] text-primary/80">
-                <History className="h-3.5 w-3.5" />
-                {t.history.title}
+            <div className="min-w-0 flex-1 space-y-1">
+              <div className="flex min-w-0 items-center gap-2 text-xs font-semibold uppercase tracking-[0.24em] text-primary/80">
+                <History className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate" title={folderLabel}>{folderLabel}</span>
               </div>
-              <p className="text-xs text-muted-foreground">
-                {railDescription}
+              <p className={`${isRail ? 'hidden' : ''} text-xs text-muted-foreground`}>
+                {projectId ? t.topics.includeDescendants : railDescription}
               </p>
             </div>
             <span className="workspace-badge">
-              {(selectedTagIds.length > 0 || searchQuery.trim())
-                ? `${filteredSessions.length}/${sessions.length} ${t.common.items}`
-                : `${sessions.length} ${t.common.items}`
+              {(selectedTagIds.length > 0 || searchQuery.trim() || selectedReviewDate)
+                ? `${filteredSessions.length}/${folderCount} ${t.common.items}`
+                : `${filteredSessions.length} ${t.common.items}`
               }
             </span>
           </div>
@@ -272,6 +228,8 @@ export function HistoryPanel({
           
           {/* 标签筛选栏 */}
           <TagFilter />
+          {selectedReviewDate && <button className="rounded border border-border px-2 py-1 text-xs" aria-label={`${t.reviewFolders.clearDate}: ${selectedReviewDate}`} onClick={() => setSelectedReviewDate(null)}>{selectedReviewDate} <span aria-hidden="true">x</span></button>}
+          {(searchQuery || selectedTagIds.length > 0 || selectedReviewDate) && <button className="text-xs text-primary" onClick={() => { clearSearch(); useTagStore.getState().clearTagFilter(); setSelectedReviewDate(null) }}>{t.reviewFolders.clearFilters}</button>}
         </div>
 
         {/* 内容 */}
@@ -288,7 +246,7 @@ export function HistoryPanel({
               <p className="text-sm">
                 {searchQuery.trim() 
                   ? t.history.noSearchResults(searchQuery)
-                  : selectedTagIds.length > 0 
+                  : selectedTagIds.length > 0 || selectedReviewDate
                     ? t.history.noMatchingRecords
                     : t.history.noRecords
                 }
@@ -301,7 +259,8 @@ export function HistoryPanel({
                   {/* 日期头部 */}
                   <button
                     onClick={() => toggleDate(date)}
-                    className="w-full flex items-center gap-2 px-6 py-3 hover:bg-muted/50 transition-colors group"
+                    aria-expanded={isExpanded(date)}
+                    className="w-full flex items-center gap-2 px-3 py-3 hover:bg-muted/50 transition-colors group"
                   >
                     {isExpanded(date) ? (
                       <ChevronDown className="w-4 h-4 text-muted-foreground group-hover:text-foreground transition-colors" />
@@ -325,35 +284,35 @@ export function HistoryPanel({
                           key={session.id}
                           role="button"
                           tabIndex={0}
+                          aria-label={session.title}
+                          aria-pressed={reviewSessionId === session.id}
                           onClick={() => handlePreview(session)}
-                          onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handlePreview(session) } }}
-                          className="group flex flex-col gap-2 px-4 py-3 rounded-lg mx-2
-                                   cursor-pointer interactive-card border border-transparent hover:border-primary/20 hover:bg-primary/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                          onKeyDown={(e) => { if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); handlePreview(session) } }}
+                          className={`group min-w-0 flex flex-col gap-2 px-3 py-3 rounded-lg
+                                   cursor-pointer interactive-card border ${reviewSessionId === session.id ? 'border-primary/30 bg-primary/10' : 'border-transparent'} hover:border-primary/20 hover:bg-primary/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring`}
                         >
                           {/* 第一行：时间、标题、操作 */}
-                          <div className="flex items-center gap-3">
-                            {/* 时间 */}
-                            <span className="text-xs text-muted-foreground font-mono w-12 flex-shrink-0 bg-muted/50 px-1.5 py-0.5 rounded text-center">
-                              {session.time}
-                            </span>
-
+                          <div className="flex min-w-0 flex-col gap-1">
                             {/* 标题 */}
                             {editingId === session.id ? (
-                              <div className="flex-1 flex items-center gap-2" onClick={e => e.stopPropagation()}>
+                              <div className="flex min-w-0 items-center gap-2" onClick={e => e.stopPropagation()} onKeyDown={e => e.stopPropagation()}>
                                 <input
                                   type="text"
                                   value={editingTitle}
                                   onChange={(e) => setEditingTitle(e.target.value)}
                                   onKeyDown={(e) => {
-                                    if (e.key === 'Enter') saveTitle()
-                                    if (e.key === 'Escape') cancelEditing()
+                                    if (e.key === 'Enter' && !e.nativeEvent.isComposing && e.keyCode !== 229) { e.preventDefault(); saveTitle() }
+                                    if (e.key === 'Escape') { e.preventDefault(); cancelEditing() }
                                   }}
-                                  className="flex-1 h-8 px-2 text-sm border border-input rounded bg-background 
+                                  className="min-w-0 flex-1 h-8 px-2 text-sm border border-input rounded bg-background
                                            focus:outline-none focus:ring-1 focus:ring-ring"
                                   autoFocus
+                                  aria-label={t.history.editTitle}
+                                  disabled={titleSaving}
                                 />
                                 <button
                                   onClick={saveTitle}
+                                  disabled={titleSaving}
                                   className="h-8 w-8 min-h-8 min-w-8 flex items-center justify-center text-success hover:bg-success/10 dark:hover:bg-success/10 rounded transition-colors"
                                   aria-label="Save title"
                                 >
@@ -361,6 +320,7 @@ export function HistoryPanel({
                                 </button>
                                 <button
                                   onClick={cancelEditing}
+                                  disabled={titleSaving}
                                   className="h-8 w-8 min-h-8 min-w-8 flex items-center justify-center text-muted-foreground hover:bg-muted rounded transition-colors"
                                   aria-label="Cancel editing"
                                 >
@@ -369,17 +329,19 @@ export function HistoryPanel({
                               </div>
                             ) : (
                               <>
-                                <span className="flex-1 min-w-0 text-sm font-medium text-foreground truncate group-hover:text-primary transition-colors">
+                                <span title={session.title} className="min-w-0 line-clamp-2 break-words text-sm font-medium text-foreground group-hover:text-primary transition-colors [overflow-wrap:anywhere]">
                                   {session.title}
                                 </span>
+                                <div className="flex min-w-0 flex-wrap items-center gap-1 text-xs text-muted-foreground">
+                                <span className="mr-1 shrink-0 font-mono">{session.time}</span>
                                 {session.providerId && (
-                                  <span className={`shrink-0 rounded-full border border-border/70 bg-background/80 px-2 py-0.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground ${isRail ? 'inline-flex' : 'hidden md:inline-flex'}`}>
+                                  <span className="min-w-0 max-w-[40%] truncate rounded border border-border/70 px-1.5 py-0.5" title={session.providerId}>
                                     {session.providerId}
                                   </span>
                                 )}
 
                                 {/* 操作按钮 - hidden until hover, don't reserve space */}
-                                <div className="hidden items-center gap-1 group-hover:flex flex-shrink-0">
+                                <div className="ml-auto flex items-center gap-1 flex-shrink-0" onKeyDown={e => e.stopPropagation()}>
                                   <button
                                     onClick={(e) => startEditing(e, session)}
                                     className="h-8 w-8 min-h-8 min-w-8 flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-background rounded-md transition-all shadow-sm border border-transparent hover:border-border"
@@ -405,21 +367,26 @@ export function HistoryPanel({
                                     <Trash2 className="w-3.5 h-3.5" />
                                   </button>
                                 </div>
-                                <ChevronRight className="w-4 h-4 shrink-0 text-muted-foreground/30 group-hover:text-muted-foreground group-hover:translate-x-0.5 transition-all" />
+                                </div>
                               </>
                             )}
                           </div>
 
                           {/* 第二行：标签 */}
                           {editingId !== session.id && (
-                            <div className="pl-[3.75rem]">
+                            <div className="min-w-0">
                               <div className="space-y-2">
-                                <div className="flex flex-wrap items-center gap-2" onClick={e => e.stopPropagation()}>
-                                  <TagSelector 
+                                {projectId && <p className="text-xs text-muted-foreground">{getProjectLinkOrigins(session, topics, projectId).direct ? t.topics.directAssociation : t.topics.inheritedFrom}</p>}
+                                <SessionProjectLinks session={session} compact editable={!isRail} />
+                                <div className="flex min-w-0 flex-wrap items-center gap-2" onClick={e => e.stopPropagation()} onKeyDown={e => e.stopPropagation()}>
+                                  {isRail ? (session.tagIds || []).map((id) => {
+                                    const tag = tags.find((item) => item.id === id)
+                                    return tag ? <span key={id} title={tag.name} className="max-w-full truncate rounded border border-border px-1.5 py-0.5 text-xs text-muted-foreground">{tag.name}</span> : null
+                                  }) : <TagSelector
                                     sessionId={session.id} 
                                     sessionTagIds={session.tagIds || []}
                                     compact
-                                  />
+                                  />}
                                   {session.postProcess?.summary && (
                                     <span className="inline-flex items-center gap-1 rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-xs font-semibold uppercase tracking-wide text-primary">
                                       <Sparkles className="h-3 w-3" />
@@ -428,9 +395,8 @@ export function HistoryPanel({
                                   )}
                                 </div>
                                 {getSessionPreviewText(session) && (
-                                  <p className="text-xs leading-5 text-muted-foreground">
-                                    {getSessionPreviewText(session).slice(0, 150)}
-                                    {getSessionPreviewText(session).length > 150 ? '...' : ''}
+                                  <p className="line-clamp-2 break-words text-xs leading-5 text-muted-foreground [overflow-wrap:anywhere]">
+                                    {getSessionPreviewText(session)}
                                   </p>
                                 )}
                               </div>
@@ -447,29 +413,8 @@ export function HistoryPanel({
         </div>
       </div>
 
-      <ActionDialog
-        open={pendingDeleteSession !== null}
-        title={t.common.delete}
-        description={t.history.deleteConfirm}
-        onClose={() => setPendingDeleteSession(null)}
-        actions={[
-          {
-            label: t.common.cancel,
-            onClick: () => setPendingDeleteSession(null),
-            variant: 'secondary',
-          },
-          {
-            label: t.common.delete,
-            onClick: () => {
-              if (pendingDeleteSession) {
-                deleteSession(pendingDeleteSession.id)
-              }
-              setPendingDeleteSession(null)
-            },
-            variant: 'danger',
-          },
-        ]}
-      />
+      {titleError && <p role="alert" className="px-3 py-2 text-xs text-destructive">{titleError}</p>}
+      <SessionDeleteDialog key={pendingDeleteSession?.id || 'closed'} session={pendingDeleteSession} onClose={() => setPendingDeleteSession(null)} />
     </>
   )
 }

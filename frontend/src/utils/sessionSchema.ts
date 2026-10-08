@@ -3,6 +3,7 @@ import type {
   CorrectionConfigSnapshot,
   CorrectionPatchSafetyLimits,
   CorrectionShardProgress,
+  ModelCorrectionPatch,
   ResolvedCorrectionPatch,
   RecognitionConfigSnapshot,
   TranscriptAskTurn,
@@ -26,13 +27,16 @@ import type {
   TranscriptTextSourceMetadata,
 } from '../types'
 import { formatDate, formatTime, generateId } from './storageUtils'
+import { DEFAULT_CORRECTION_PATCH_LIMITS } from './correctionPatch'
+import { normalizeProjectIds } from './projectSchema'
+import { normalizeCorrectedMarkdownFileState, normalizeManagedAssetReference, normalizeRevision } from '../../../shared/fileStorage'
 import {
   normalizeGlossaryEntries,
   normalizeMeetingContextConfig,
   normalizeMeetingContextSnapshot,
 } from './meetingContext'
 
-export const CURRENT_SESSION_SCHEMA_VERSION = 7
+export const CURRENT_SESSION_SCHEMA_VERSION = 8
 const DEFAULT_SESSION_STATUS: TranscriptSessionStatus = 'completed'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -165,6 +169,7 @@ function normalizeSourceMeta(value: unknown): TranscriptSourceMeta | undefined {
 
   const sourceKind = value.sourceKind === 'recording-audio'
     || value.sourceKind === 'uploaded-audio'
+    || value.sourceKind === 'extracted-video-audio'
     ? value.sourceKind
     : undefined
 
@@ -178,6 +183,11 @@ function normalizeSourceMeta(value: unknown): TranscriptSourceMeta | undefined {
   const audioMimeType = getString(value.audioMimeType)?.trim()
   const audioFileName = getString(value.audioFileName)?.trim()
   const audioSize = getNumber(value.audioSize)
+  const originalFileName = getString(value.originalFileName)?.trim()
+  const originalMimeType = getString(value.originalMimeType)?.trim()
+  const originalFileSize = getNumber(value.originalFileSize)
+  const managedAsset = normalizeManagedAssetReference(value.managedAsset)
+  const originalSourceId = getString(value.originalSourceId)?.trim()
 
   if (
     !captureMode
@@ -190,7 +200,12 @@ function normalizeSourceMeta(value: unknown): TranscriptSourceMeta | undefined {
     && !audioMimeType
     && !audioFileName
     && !audioSize
+    && !originalFileName
+    && !originalMimeType
+    && !originalFileSize
     && !captureAudioSource
+    && !managedAsset
+    && !originalSourceId
   ) {
     return undefined
   }
@@ -206,6 +221,15 @@ function normalizeSourceMeta(value: unknown): TranscriptSourceMeta | undefined {
     audioMimeType: audioMimeType || undefined,
     audioFileName: audioFileName || undefined,
     audioSize,
+    audioAvailable: typeof value.audioAvailable === 'boolean' ? value.audioAvailable : undefined,
+    audioError: getString(value.audioError)?.trim() || undefined,
+    managedAsset,
+    originalSourceId: originalSourceId || undefined,
+    originalSourceRevision: originalSourceId ? normalizeRevision(value.originalSourceRevision) : undefined,
+    currentOriginalFileName: getString(value.currentOriginalFileName)?.trim() || undefined,
+    ...(originalFileName ? { originalFileName } : {}),
+    ...(originalMimeType ? { originalMimeType } : {}),
+    ...(originalFileSize !== undefined ? { originalFileSize } : {}),
     captureAudioSource,
   }
 }
@@ -465,6 +489,7 @@ function normalizeAutoPostProcessWorkflow(value: unknown): TranscriptAutoPostPro
     step,
     correctionMode,
     titleAtStart,
+    titleRevisionAtStart: value.titleRevisionAtStart === undefined ? undefined : normalizeRevision(value.titleRevisionAtStart),
     startedAt,
     updatedAt,
     completedAt: getNumber(value.completedAt),
@@ -529,6 +554,21 @@ function normalizeResolvedPatch(raw: unknown): ResolvedCorrectionPatch | null {
     if (op === 'delete' && (!sourceText || replacement || sourceStart === sourceEnd)) return null
     if (op === 'replace' && (!sourceText || !replacement || sourceText === replacement || sourceStart === sourceEnd)) return null
   }
+  const intent = isRecord(raw.modelIntent) ? raw.modelIntent : undefined
+  const modelIntent: ModelCorrectionPatch | undefined = intent
+    && (intent.op === 'replace' || intent.op === 'insert' || intent.op === 'delete')
+    && typeof intent.category === 'string' && VALID_PATCH_CATEGORIES.has(intent.category)
+    && ['oldText', 'replacement', 'before', 'after', 'reason'].every((key) => typeof intent[key] === 'string')
+    ? {
+        op: intent.op,
+        category: intent.category as ModelCorrectionPatch['category'],
+        oldText: String(intent.oldText).slice(0, DEFAULT_CORRECTION_PATCH_LIMITS.maxPatchTextLength),
+        replacement: String(intent.replacement).slice(0, DEFAULT_CORRECTION_PATCH_LIMITS.maxPatchTextLength),
+        before: String(intent.before).slice(0, DEFAULT_CORRECTION_PATCH_LIMITS.maxPatchTextLength),
+        after: String(intent.after).slice(0, DEFAULT_CORRECTION_PATCH_LIMITS.maxPatchTextLength),
+        reason: String(intent.reason).slice(0, DEFAULT_CORRECTION_PATCH_LIMITS.maxPatchTextLength),
+      }
+    : undefined
   return {
     id,
     shardId,
@@ -542,6 +582,10 @@ function normalizeResolvedPatch(raw: unknown): ResolvedCorrectionPatch | null {
     reason,
     state,
     rejectionReason: getString(raw.rejectionReason),
+    origin: raw.origin === 'ai' || raw.origin === 'manual' ? raw.origin : undefined,
+    locationVerified: typeof raw.locationVerified === 'boolean' ? raw.locationVerified : undefined,
+    modelIntent,
+    recoveredFromPatchId: getString(raw.recoveredFromPatchId),
   }
 }
 
@@ -583,6 +627,8 @@ function normalizeCorrectionConfig(value: unknown): CorrectionConfigSnapshot | n
   return {
     model,
     baseUrl,
+    provider: value.provider === 'anthropic-compatible' ? 'anthropic-compatible' : 'openai-compatible',
+    thinkingMode: value.thinkingMode === 'disabled' ? 'disabled' : 'default',
     promptLanguage,
     promptVersion: getString(value.promptVersion) || 'patch-v1',
     schemaVersion: getString(value.schemaVersion) || '1',
@@ -598,7 +644,7 @@ function normalizeCorrectionConfig(value: unknown): CorrectionConfigSnapshot | n
     credentialRef: 'ai-post-process',
     credentialVersion: typeof value.credentialVersion === 'number' && Number.isInteger(value.credentialVersion) && value.credentialVersion > 0
       ? value.credentialVersion : undefined,
-    identityVersion: value.identityVersion === 1 ? 1 : undefined,
+    identityVersion: value.identityVersion === 2 ? 2 : value.identityVersion === 1 ? 1 : undefined,
     configIdentity: getString(value.configIdentity),
     transport: value.transport === 'json' || value.transport === 'sse' ? value.transport : undefined,
   }
@@ -705,7 +751,7 @@ function normalizePublished(value: unknown): TranscriptCorrectionPublished | und
   const rejected = stats ? getNumber(stats.rejected) : undefined
   if (!id || revision === undefined || !baseTranscriptHash || !outputTextHash || correctedText === undefined
     || !model || completedAt === undefined || !patches || applied === undefined || reverted === undefined || rejected === undefined) return undefined
-  return { id, formatVersion: 1, revision, baseTranscriptHash, outputTextHash, correctedText, model, completedAt, patches, stats: { applied, reverted, rejected } }
+  return { id, formatVersion: 1, revision, baseTranscriptHash, outputTextHash, correctedText, model, completedAt, patches, safetyLimits: normalizeSafetyLimits(value.safetyLimits) || undefined, stats: { applied, reverted, rejected } }
 }
 
 function normalizeLegacy(value: unknown): TranscriptCorrectionLegacy | undefined {
@@ -744,7 +790,7 @@ function normalizeCorrection(raw: unknown): TranscriptCorrection | undefined {
   const hadDraftPayload = obj.draft !== undefined
   const corruptedDraft = hadDraftPayload && !draft
   const wasLegacyInProgress = !hadDraftPayload && (status === 'detecting' || status === 'correcting')
-  const legacy = explicitLegacy || (correctedText ? {
+  const legacy = explicitLegacy || (!published && correctedText ? {
     correctedText,
     source: 'v3-corrected-text' as const,
     model: getString(obj.model),
@@ -805,11 +851,13 @@ export function normalizeTranscriptSession(session: Partial<TranscriptSession>):
   const status = session.status === 'recording' || session.status === 'interrupted' || session.status === 'completed'
     ? session.status
     : DEFAULT_SESSION_STATUS
+  const projectIds = normalizeProjectIds(session.projectIds, session.topicId)
 
   return {
     id: getString(session.id)?.trim() || generateId(),
     schemaVersion: CURRENT_SESSION_SCHEMA_VERSION,
     title,
+    titleRevision: normalizeRevision(session.titleRevision),
     date: getString(session.date)?.trim() || formatDate(createdAt),
     time: getString(session.time)?.trim() || formatTime(createdAt),
     createdAt,
@@ -817,7 +865,12 @@ export function normalizeTranscriptSession(session: Partial<TranscriptSession>):
     transcript: getString(session.transcript) || '',
     translatedTranscript: normalizeTranslationData(session.translatedTranscript),
     duration: getNumber(session.duration),
-    topicId: getString(session.topicId)?.trim() || undefined,
+    projectIds,
+    topicId: projectIds[0],
+    defaultSaveProjectId: getString(session.defaultSaveProjectId)?.trim() || undefined,
+    correctedMarkdownFile: normalizeCorrectedMarkdownFileState(session.correctedMarkdownFile),
+    managedNaming: session.managedNaming && ['queued', 'saved', 'error'].includes(session.managedNaming.status)
+      ? { status: session.managedNaming.status, titleRevision: normalizeRevision(session.managedNaming.titleRevision), error: getString(session.managedNaming.error) } : undefined,
     tagIds: normalizeStringArray(session.tagIds),
     tokens: tokens && tokens.length > 0 ? tokens : undefined,
     speakers: speakers ?? [],

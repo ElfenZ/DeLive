@@ -4,7 +4,6 @@ import {
   ChevronDown,
   Eye,
   EyeOff,
-  FolderOpen,
   Key,
   Loader2,
   Plus,
@@ -16,7 +15,7 @@ import {
 } from 'lucide-react'
 import { Switch } from '../ui'
 import type { Translations } from '../../i18n'
-import type { AiFeatureKey, AiGlossaryEntry, AiPostProcessConfig, MeetingContextConfig } from '../../types'
+import type { AiFeatureKey, AiGlossaryEntry, AiPostProcessConfig, AiProviderProtocol, MeetingContextConfig } from '../../types'
 import {
   fetchAvailableModels,
   invalidateAiEndpointModels,
@@ -63,12 +62,6 @@ export function AiPostProcessPanel({
   const effectiveDefault = cfg.defaultModel?.trim() || cfg.model?.trim() || ''
   const selected = useMemo(() => cfg.selectedModels ?? [], [cfg.selectedModels])
   const glossary = useMemo(() => cfg.glossary ?? [], [cfg.glossary])
-  const supportsAutoExport = Boolean(window.electronAPI?.pickDirectoryPath && window.electronAPI?.writeAutoExportFile)
-
-  const handlePickAutoExportDirectory = useCallback(async () => {
-    const directory = await window.electronAPI?.pickDirectoryPath?.()
-    if (directory) updateAiPostProcessConfig({ autoExportDirectory: directory })
-  }, [updateAiPostProcessConfig])
 
   const filteredModels = useMemo(() => {
     const all = cfg.availableModels ?? []
@@ -83,7 +76,7 @@ export function AiPostProcessPanel({
     setFetchStatus('loading')
     setFetchError('')
     try {
-      const models = await fetchAvailableModels(baseUrl, cfg.apiKey)
+      const models = await fetchAvailableModels(baseUrl, cfg.apiKey, cfg.provider)
       updateAiPostProcessConfig(reconcileAiEndpointModels(cfg, models))
       setFetchStatus('success')
     } catch (err) {
@@ -95,6 +88,8 @@ export function AiPostProcessPanel({
   const correctionTestIdentity = JSON.stringify({
     baseUrl: cfg.baseUrl?.trim() || '',
     apiKey: cfg.apiKey || '',
+    provider: cfg.provider || 'openai-compatible',
+    thinkingMode: cfg.thinkingMode || 'default',
     model: resolveModelForFeature(cfg, 'correction'),
     structuredOutput: cfg.correctionStructuredOutput || 'prompt-json',
     streaming: cfg.enableStreaming !== false,
@@ -127,6 +122,19 @@ export function AiPostProcessPanel({
     setFetchStatus('idle')
     setFetchError('')
   }, [cfg.baseUrl, updateAiPostProcessConfig])
+
+  const handleProviderChange = useCallback((provider: AiProviderProtocol) => {
+    if (provider === (cfg.provider || 'openai-compatible')) return
+    updateAiPostProcessConfig({
+      provider,
+      ...invalidateAiEndpointModels(),
+      ...(provider === 'anthropic-compatible' && cfg.correctionStructuredOutput === 'json_object'
+        ? { correctionStructuredOutput: 'prompt-json' as const }
+        : {}),
+    })
+    setFetchStatus('idle')
+    setFetchError('')
+  }, [cfg.correctionStructuredOutput, cfg.provider, updateAiPostProcessConfig])
 
   const toggleModelSelected = useCallback(
     (modelId: string) => {
@@ -223,13 +231,45 @@ export function AiPostProcessPanel({
           {isZh ? 'API 连接' : 'API Connection'}
         </label>
 
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="space-y-2">
+            <label className="text-xs font-medium text-muted-foreground">{t.settings.aiProtocolType}</label>
+            <select
+              value={cfg.provider || 'openai-compatible'}
+              onChange={(event) => handleProviderChange(event.target.value as AiProviderProtocol)}
+              className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+            >
+              <option value="openai-compatible">OpenAI Compatible</option>
+              <option value="anthropic-compatible">Anthropic Compatible</option>
+            </select>
+          </div>
+
+          <div className="space-y-2">
+            <label className="text-xs font-medium text-muted-foreground">{t.settings.aiThinkingMode}</label>
+            <select
+              value={cfg.thinkingMode || 'default'}
+              onChange={(event) => updateAiPostProcessConfig({
+                thinkingMode: event.target.value === 'disabled' ? 'disabled' : 'default',
+              })}
+              className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+            >
+              <option value="default">{t.settings.aiThinkingDefault}</option>
+              <option value="disabled">{t.settings.aiThinkingDisabled}</option>
+            </select>
+          </div>
+        </div>
+
+        <p className="text-xs text-muted-foreground">{t.settings.aiThinkingModeDesc}</p>
+
         <div className="space-y-2">
           <label className="text-xs font-medium text-muted-foreground">{t.settings.aiBaseUrl}</label>
           <input
             type="text"
             value={cfg.baseUrl || ''}
             onChange={(e) => handleBaseUrlChange(e.target.value)}
-            placeholder="http://127.0.0.1:11434/v1"
+            placeholder={(cfg.provider || 'openai-compatible') === 'anthropic-compatible'
+              ? 'https://api.anthropic.com'
+              : 'http://127.0.0.1:11434/v1'}
             className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
           />
         </div>
@@ -310,7 +350,9 @@ export function AiPostProcessPanel({
         {testStatus === 'success' && testDetails && (
           <div className="rounded-md border border-success/40 bg-success/5 p-3 text-xs text-success">
             <p className="font-medium">{isZh ? '纠错连接验证成功' : 'Correction connection verified'}</p>
-            <p className="mt-1 break-all text-muted-foreground">{testDetails.endpoint} · {testDetails.model} · {testDetails.transport.toUpperCase()}</p>
+            <p className="mt-1 break-all text-muted-foreground">
+              {(cfg.provider || 'openai-compatible') === 'anthropic-compatible' ? 'Anthropic' : 'OpenAI'} · {testDetails.endpoint} · {testDetails.model} · {testDetails.transport.toUpperCase()}
+            </p>
             <p className="mt-1">{isZh ? '当前测试使用的是未保存草稿；点击底部“保存”后，才会成为全局纠错配置。' : 'This test used the unsaved draft. Save the settings below before it becomes the global correction configuration.'}</p>
           </div>
         )}
@@ -630,7 +672,9 @@ export function AiPostProcessPanel({
           {isZh ? '按服务端能力显式选择，不支持时会报错，不会自动降级重试。' : 'Choose explicitly for your endpoint. Unsupported modes fail without automatic downgrade.'}
         </p>
         <div className="grid grid-cols-3 gap-2">
-          {(['prompt-json', 'json_object', 'json_schema'] as const).map((option) => (
+          {((cfg.provider || 'openai-compatible') === 'anthropic-compatible'
+            ? ['prompt-json', 'json_schema'] as const
+            : ['prompt-json', 'json_object', 'json_schema'] as const).map((option) => (
             <button
               key={option}
               type="button"
@@ -673,63 +717,7 @@ export function AiPostProcessPanel({
 
         <div className="border-t border-border/70" />
 
-        <div className="space-y-3">
-          <div className="flex items-center justify-between gap-4">
-            <div>
-              <label className="text-sm font-medium leading-none flex items-center gap-2">
-                <FolderOpen className="w-3.5 h-3.5 text-muted-foreground" />
-                {isZh ? '自动导出纠错稿 Markdown' : 'Auto-export Corrected Markdown'}
-              </label>
-              <p className="text-xs text-muted-foreground mt-2">
-                {isZh
-                  ? '完整自动后处理完成标题步骤后，将纠错后的全文写入指定目录。'
-                  : 'Write the corrected transcript to the selected folder after the full automatic workflow finishes its title step.'}
-              </p>
-            </div>
-            <Switch
-              checked={!!cfg.autoExportCorrectedMarkdown && supportsAutoExport}
-              disabled={!supportsAutoExport}
-              onChange={(val) => updateAiPostProcessConfig({ autoExportCorrectedMarkdown: val })}
-              aria-label={isZh ? '自动导出纠错稿 Markdown' : 'Auto-export corrected Markdown'}
-            />
-          </div>
-
-          {supportsAutoExport ? (
-            <div className="space-y-2 rounded-lg border border-border/70 bg-muted/20 p-3">
-              <div className="break-all rounded-md bg-background px-3 py-2 text-xs text-muted-foreground">
-                {cfg.autoExportDirectory?.trim() || (isZh ? '尚未选择导出目录' : 'No export folder selected')}
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  onClick={() => void handlePickAutoExportDirectory()}
-                  className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-input bg-background px-3 text-xs font-medium transition-colors hover:bg-accent"
-                >
-                  <FolderOpen className="w-3.5 h-3.5" />
-                  {isZh ? '选择文件夹' : 'Choose Folder'}
-                </button>
-                {cfg.autoExportDirectory?.trim() && (
-                  <button
-                    type="button"
-                    onClick={() => updateAiPostProcessConfig({ autoExportDirectory: '' })}
-                    className="inline-flex h-8 items-center justify-center rounded-md border border-input bg-background px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent"
-                  >
-                    {isZh ? '清除路径' : 'Clear Path'}
-                  </button>
-                )}
-              </div>
-              {cfg.autoExportCorrectedMarkdown && !cfg.autoExportDirectory?.trim() && (
-                <p className="text-xs text-destructive">
-                  {isZh ? '开启自动导出前必须选择目录。' : 'Choose a folder before enabling automatic export.'}
-                </p>
-              )}
-            </div>
-          ) : (
-            <p className="rounded-md border border-border/70 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-              {isZh ? '自动导出仅在 DeLive 桌面应用中可用。' : 'Automatic export is available only in the DeLive desktop app.'}
-            </p>
-          )}
-        </div>
+        <p className="text-xs text-muted-foreground">{t.fileStorage.aiSettingsHint}</p>
 
         <div className="border-t border-border/70" />
 

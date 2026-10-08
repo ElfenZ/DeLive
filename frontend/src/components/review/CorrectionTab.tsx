@@ -1,57 +1,34 @@
-import { useEffect, useMemo, useState } from 'react'
-import { AlertCircle, Check, CheckCircle2, Loader2, Pause, Play, RotateCcw, SpellCheck, Trash2, Zap } from 'lucide-react'
-import type { CorrectionIssueCategory, LegacyCorrectionIssueCategory, ResolvedCorrectionPatch, TranscriptSession } from '../../types'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { AlertCircle, CheckCircle2, Loader2, Pause, Play, RotateCcw, SpellCheck, Trash2, Zap } from 'lucide-react'
+import type { ResolvedCorrectionPatch, TranscriptSession } from '../../types'
 import type { CorrectionDiffPart } from '../../utils/correctionPatch'
 import { resolveModelForFeature } from '../../services/aiPostProcess'
 import { isCorrectionConfigSnapshotCurrent } from '../../services/aiCorrection'
-import { safeOpenAiEndpoint } from '../../services/openAiCompatible'
+import { safeAiEndpoint } from '../../services/aiProtocol'
 import { useSessionStore } from '../../stores/sessionStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useUIStore } from '../../stores/uiStore'
 import { projectSessionCorrection } from '../../utils/correctedSegmentProjection'
 import { SpeakerCorrectionResult } from './SpeakerCorrectionResult'
+import { useCorrectionReviewStore } from '../../stores/correctionReviewStore'
+import { ActionDialog } from '../ActionDialog'
+import { CorrectionWorkspace } from './CorrectionWorkspace'
+import { correctionErrorMessage } from './correctionMessages'
 
 interface CorrectionTabProps {
   session: TranscriptSession
 }
 
-const CATEGORY_COLORS: Record<CorrectionIssueCategory, string> = {
-  homophone: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300',
-  'proper-noun': 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300',
-  punctuation: 'bg-cyan-100 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-300',
-  'asr-substitution': 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300',
-  'asr-omission': 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300',
-  'asr-duplication': 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300',
-}
-
-function categoryLabel(category: LegacyCorrectionIssueCategory, isZh: boolean): string {
-  const labels: Record<LegacyCorrectionIssueCategory, [string, string]> = {
-    homophone: ['同音/近音', 'Homophone'],
-    'proper-noun': ['专有名词', 'Proper noun'],
-    punctuation: ['标点', 'Punctuation'],
-    'asr-substitution': ['错词', 'Substitution'],
-    'asr-omission': ['漏词', 'Omission'],
-    'asr-duplication': ['重复词', 'Duplication'],
-    grammar: ['历史语法项', 'Legacy grammar'],
-    other: ['历史其他项', 'Legacy other'],
-  }
-  return labels[category][isZh ? 0 : 1]
-}
-
-function contextForPatch(transcript: string, patch: ResolvedCorrectionPatch): string {
-  return transcript.slice(Math.max(0, patch.sourceStart - 36), Math.min(transcript.length, patch.sourceEnd + 36))
-}
-
 function CorrectionDiffResult({ parts }: { parts: CorrectionDiffPart[] }) {
   return (
-    <div className="whitespace-pre-wrap rounded-lg border border-border bg-muted/20 p-4 text-sm leading-relaxed">
+    <div className="whitespace-pre-wrap break-words rounded-lg border border-border bg-muted/20 p-4 text-sm leading-relaxed">
       {parts.map((part, index) => <span key={`${part.patchId || 'text'}-${index}`} className={part.type === 'removed' ? 'bg-red-100 text-red-700 line-through dark:bg-red-900/30 dark:text-red-300' : part.type === 'added' ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300' : undefined}>{part.text}</span>)}
     </div>
   )
 }
 
 export function CorrectionTab({ session }: CorrectionTabProps) {
-  const language = useUIStore((state) => state.language)
+  const { language, t } = useUIStore()
   const isZh = language === 'zh'
   const settings = useSettingsStore((state) => state.settings)
   const liveSession = useSessionStore((state) => state.sessions.find((item) => item.id === session.id)) || session
@@ -66,17 +43,30 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
     applySessionCorrectionReview,
     updateSessionCorrectionDraftPatch,
     restoreSessionLegacyCorrection,
-    setSessionCorrectionPatchState,
     revertAllSessionCorrectionPatches,
   } = useSessionStore()
-  const [selected, setSelected] = useState<Set<string>>(new Set())
   const [error, setError] = useState<string | null>(null)
-  const [draftEdits, setDraftEdits] = useState<Record<string, string>>({})
   const [editErrors, setEditErrors] = useState<Record<string, string>>({})
+  const editSaveQueue = useRef<Promise<void>>(Promise.resolve())
+  const [pending, setPending] = useState(false)
+  const pendingRef = useRef(false)
+  const [controlPending, setControlPending] = useState(false)
+  const controlRef = useRef(false)
+  const [workspaceBusy, setWorkspaceBusy] = useState(false)
+  const [rerun, setRerun] = useState<{ kind: 'new' | 'resume' | 'retry'; runId?: string; draftRevision?: number; publishedId?: string; publishedRevision?: number; legacyText?: string } | null>(null)
+  const [abandonRunId, setAbandonRunId] = useState<string | null>(null)
   const correction = liveSession.correction
   const draft = correction?.draft
   const published = correction?.published
   const legacy = correction?.legacy
+  const storedReview = useCorrectionReviewStore((state) => state.reviews[session.id])
+  const review = storedReview?.runId === draft?.runId ? storedReview : undefined
+  const selected = new Set(review?.selectedIds || draft?.proposedPatches.filter((patch) => patch.state !== 'reverted').map((patch) => patch.id) || [])
+  const draftEdits = review?.edits || {}
+  const setSelected = (value: Set<string> | ((current: Set<string>) => Set<string>)) => {
+    if (!draft) return
+    useCorrectionReviewStore.getState().select(session.id, draft.runId, Array.from(typeof value === 'function' ? value(selected) : value))
+  }
   const mode = settings.aiPostProcess?.correctionMode || 'quick'
   const configured = Boolean(settings.aiPostProcess?.enabled && resolveModelForFeature(settings.aiPostProcess || {}, 'correction'))
   const draftConfigCurrent = draft ? isCorrectionConfigSnapshotCurrent(draft.config, settings) : true
@@ -84,16 +74,14 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
     || draft?.shards.find((shard) => shard.status === 'failed')
   const endpointLabel = draft ? (() => {
     try {
-      return new URL(safeOpenAiEndpoint(draft.config.baseUrl)).host
+      return new URL(safeAiEndpoint(draft.config.baseUrl)).host
     } catch {
-      return safeOpenAiEndpoint(draft.config.baseUrl)
+      return safeAiEndpoint(draft.config.baseUrl)
     }
   })() : ''
 
   useEffect(() => {
     if (draft?.runId) {
-      setSelected(new Set())
-      setDraftEdits({})
       setEditErrors({})
     }
   }, [draft?.runId])
@@ -102,18 +90,43 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
   const readyReviewPatchIdSignature = draft?.status === 'ready-for-review'
     ? draft.proposedPatches.map((patch) => patch.id).join('\u001f')
     : ''
+  const readyReviewRevertedSignature = draft?.status === 'ready-for-review'
+    ? draft.proposedPatches.filter((patch) => patch.state === 'reverted').map((patch) => patch.id).join('\u001f') : ''
   useEffect(() => {
     if (!readyReviewRunId) return
-    setSelected(new Set(readyReviewPatchIdSignature ? readyReviewPatchIdSignature.split('\u001f') : []))
-  }, [readyReviewRunId, readyReviewPatchIdSignature])
+    const store = useCorrectionReviewStore.getState()
+    store.sync(session.id, readyReviewRunId, readyReviewPatchIdSignature ? readyReviewPatchIdSignature.split('\u001f') : [])
+    if (readyReviewRevertedSignature) {
+      const revertedIds = new Set(readyReviewRevertedSignature.split('\u001f'))
+      store.select(session.id, readyReviewRunId, useCorrectionReviewStore.getState().reviews[session.id].selectedIds.filter((id) => !revertedIds.has(id)))
+    }
+  }, [session.id, readyReviewRunId, readyReviewPatchIdSignature, readyReviewRevertedSignature])
 
-  const run = async (action: () => Promise<unknown>) => {
+  const run = async (action: () => Promise<unknown>, control = false) => {
+    if (control ? controlRef.current : pendingRef.current || workspaceBusy) return false
+    if (control) { controlRef.current = true; setControlPending(true) }
+    else { pendingRef.current = true; setPending(true) }
     setError(null)
     try {
       await action()
+      return true
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
+      setError(correctionErrorMessage(reason, isZh))
+      return false
+    } finally {
+      if (control) { controlRef.current = false; setControlPending(false) }
+      else { pendingRef.current = false; setPending(false) }
     }
+  }
+  const executeRun = (kind: 'new' | 'resume' | 'retry') => kind === 'resume' ? resumeSessionCorrection(session.id)
+    : kind === 'retry' ? retrySessionCorrection(session.id)
+      : mode === 'quick' ? startSessionQuickCorrection(session.id) : detectSessionCorrectionIssues(session.id)
+  const requestRun = (kind: 'new' | 'resume' | 'retry') => {
+    if (pendingRef.current || controlRef.current || workspaceBusy) return
+    if (kind === 'new' ? published || legacy : !draftConfigCurrent) {
+      setRerun({ kind, runId: draft?.runId, draftRevision: draft?.revision, publishedId: published?.id,
+        publishedRevision: published?.revision, legacyText: legacy?.correctedText })
+    } else void run(() => executeRun(kind))
   }
   const completedShards = draft?.shards.filter((shard) => shard.status === 'completed').length || 0
   const totalShards = draft?.shards.length || 0
@@ -125,8 +138,8 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
     [correction, liveSession.segments, liveSession.transcript],
   )
   const allReviewPatchesSelected = Boolean(
-    draft?.proposedPatches.length
-    && draft.proposedPatches.every((patch) => selected.has(patch.id)),
+    draft?.proposedPatches.some((patch) => patch.state !== 'reverted')
+    && draft.proposedPatches.filter((patch) => patch.state !== 'reverted').every((patch) => selected.has(patch.id)),
   )
   const progressLabel = activeShard?.stage === 'connecting'
     ? (isZh ? '正在连接纠错服务…' : 'Connecting to correction service…')
@@ -140,18 +153,30 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
           ? (isZh ? `第 ${activeShard.index + 1} 个分片等待重试` : `Shard ${activeShard.index + 1} is waiting to retry`)
           : (isZh ? '等待模型响应…' : 'Waiting for the model response…')
   const persistDraftEdit = async (patch: ResolvedCorrectionPatch) => {
-    const replacement = draftEdits[patch.id] ?? patch.replacement
-    if (replacement === patch.replacement) return
-    try {
-      await updateSessionCorrectionDraftPatch(session.id, patch.id, replacement)
-      setEditErrors((current) => {
-        const next = { ...current }
-        delete next[patch.id]
-        return next
-      })
-    } catch (reason) {
-      setEditErrors((current) => ({ ...current, [patch.id]: reason instanceof Error ? reason.message : String(reason) }))
-    }
+    const operation = editSaveQueue.current.catch(() => undefined).then(async () => {
+      const latestDraft = useSessionStore.getState().sessions.find((item) => item.id === session.id)?.correction?.draft
+      if (!draft || latestDraft?.runId !== draft.runId) throw new Error('correction-revision-mismatch')
+      const current = latestDraft.proposedPatches.find((item) => item.id === patch.id)
+      if (!current) throw new Error('correction-revision-mismatch')
+      const stored = useCorrectionReviewStore.getState().reviews[session.id]
+      const replacement = stored?.runId === draft.runId ? stored.edits[patch.id] ?? current.replacement : current.replacement
+      try {
+        if (replacement !== current.replacement) await updateSessionCorrectionDraftPatch(session.id, patch.id, replacement, {
+          target: 'draft', id: latestDraft.runId, revision: latestDraft.revision, baseTranscriptHash: latestDraft.baseTranscriptHash,
+        })
+        if (draft) useCorrectionReviewStore.getState().saved(session.id, draft.runId, patch.id, replacement)
+        setEditErrors((current) => {
+          const next = { ...current }
+          delete next[patch.id]
+          return next
+        })
+      } catch (reason) {
+        setEditErrors((current) => ({ ...current, [patch.id]: reason instanceof Error ? reason.message : String(reason) }))
+        throw reason
+      }
+    })
+    editSaveQueue.current = operation
+    return operation
   }
 
   const renderCorrectionResult = () => {
@@ -193,27 +218,28 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
     <div className="flex h-full flex-col overflow-hidden">
       <div className="flex items-center justify-between border-b border-border px-6 py-3">
         <div className="flex items-center gap-2"><SpellCheck className="h-4 w-4 text-primary" /><h3 className="text-sm font-medium">{isZh ? 'AI 严格纠错' : 'Strict AI correction'}</h3></div>
-        {draft && <button type="button" onClick={() => void run(() => abandonSessionCorrection(session.id))} className="inline-flex h-8 items-center gap-1.5 rounded-md border border-input px-3 text-xs"><Trash2 className="h-3.5 w-3.5" />{isZh ? '放弃任务' : 'Abandon'}</button>}
+        {draft && <button type="button" disabled={controlPending || workspaceBusy} onClick={() => setAbandonRunId(draft.runId)} className="inline-flex h-8 items-center gap-1.5 rounded-md border border-input px-3 text-xs disabled:opacity-50"><Trash2 className="h-3.5 w-3.5" />{isZh ? '放弃任务' : 'Abandon'}</button>}
       </div>
-      <div className="flex-1 space-y-5 overflow-y-auto p-6">
+      <div className="min-w-0 flex-1 space-y-5 overflow-y-auto p-3 sm:p-5">
         {!draft && !published && !legacy && (
           <div className="flex flex-col items-center gap-4 py-12 text-center">
             <SpellCheck className="h-12 w-12 text-muted-foreground/40" />
             <p className="max-w-lg text-sm text-muted-foreground">{isZh ? 'AI 只返回局部 ASR 修改意图。本地会严格定位和校验 Patch，原始转录始终保持不变。' : 'AI returns local ASR edit intents only. Patches are resolved and validated locally, and the original transcript is never overwritten.'}</p>
             {!configured ? <p className="text-sm text-destructive">{isZh ? '请先启用 AI 并配置纠错模型。' : 'Enable AI and configure a correction model first.'}</p> : (
-              <button type="button" onClick={() => void run(() => mode === 'quick' ? startSessionQuickCorrection(session.id) : detectSessionCorrectionIssues(session.id))} className="inline-flex h-10 items-center gap-2 rounded-lg bg-primary px-5 text-sm font-medium text-primary-foreground"><Zap className="h-4 w-4" />{mode === 'quick' ? (isZh ? '检测并自动应用' : 'Detect and apply') : (isZh ? '检测候选' : 'Detect candidates')}</button>
+              <button type="button" disabled={pending || workspaceBusy} onClick={() => requestRun('new')} className="inline-flex h-10 items-center gap-2 rounded-lg bg-primary px-5 text-sm font-medium text-primary-foreground disabled:opacity-50"><Zap className="h-4 w-4" />{mode === 'quick' ? (isZh ? '检测并自动应用' : 'Detect and apply') : (isZh ? '检测候选' : 'Detect candidates')}</button>
             )}
           </div>
         )}
+        {!draft && !published && !legacy && <CorrectionWorkspace key={`${session.id}-new`} session={liveSession} patches={[]} isZh={isZh} disabled={pending || controlPending || liveSession.status === 'recording' || liveSession.status === 'interrupted'} onBusyChange={setWorkspaceBusy} />}
 
         {draft && !reviewReady && (
           <section className="space-y-4 rounded-xl border border-border bg-muted/20 p-5">
-            <div className="flex items-center justify-between gap-4">
+            <div className="flex flex-wrap items-center justify-between gap-4">
               <div><p className="text-sm font-medium">{draft.status === 'paused' ? (isZh ? '任务已暂停' : 'Task paused') : draft.status === 'failed' || draft.status === 'blocked-auth' ? (isZh ? '任务需要处理' : 'Task needs attention') : (isZh ? '正在逐片检测' : 'Detecting shard by shard')}</p><p className="mt-1 text-xs text-muted-foreground">{completedShards}/{totalShards} {isZh ? '分片完成' : 'shards completed'} · {draft.proposedPatches.length} {isZh ? '合法候选' : 'valid candidates'} · {draft.rejectedPatches.length} {isZh ? '已拒绝' : 'rejected'}</p><p className="mt-1 max-w-xl truncate text-xs text-muted-foreground" title={`${draft.config.baseUrl} · ${draft.config.model}`}>{endpointLabel} · {draft.config.model} · {(draft.config.transport || 'legacy').toUpperCase()}{activeShard ? ` · ${isZh ? '分片' : 'shard'} ${activeShard.index + 1}/${totalShards} · ${isZh ? '尝试' : 'attempt'} ${activeShard.attempt}${activeShard.attemptLimit ? `/${activeShard.attemptLimit}` : ''}` : ''}</p></div>
               <div className="flex gap-2">
-                {processing && <button type="button" onClick={() => void run(() => pauseSessionCorrection(session.id))} className="inline-flex h-8 items-center gap-1.5 rounded-md border border-input px-3 text-xs"><Pause className="h-3.5 w-3.5" />{isZh ? '暂停' : 'Pause'}</button>}
-                {draft.status === 'paused' && <button type="button" onClick={() => void run(() => resumeSessionCorrection(session.id))} className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs text-primary-foreground"><Play className="h-3.5 w-3.5" />{isZh ? '继续' : 'Resume'}</button>}
-                {(draft.status === 'failed' || draft.status === 'blocked-auth') && <button type="button" onClick={() => void run(() => retrySessionCorrection(session.id))} className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs text-primary-foreground"><RotateCcw className="h-3.5 w-3.5" />{draftConfigCurrent ? (isZh ? '重试失败分片' : 'Retry failed shard') : (isZh ? '使用当前配置重新检测' : 'Restart with saved configuration')}</button>}
+                {processing && <button type="button" disabled={controlPending} onClick={() => void run(() => pauseSessionCorrection(session.id), true)} className="inline-flex h-8 items-center gap-1.5 rounded-md border border-input px-3 text-xs disabled:opacity-50"><Pause className="h-3.5 w-3.5" />{isZh ? '暂停' : 'Pause'}</button>}
+                {draft.status === 'paused' && <button type="button" disabled={pending || controlPending} onClick={() => requestRun('resume')} className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs text-primary-foreground disabled:opacity-50"><Play className="h-3.5 w-3.5" />{isZh ? '继续' : 'Resume'}</button>}
+                {(draft.status === 'failed' || draft.status === 'blocked-auth') && <button type="button" disabled={pending || controlPending} onClick={() => requestRun('retry')} className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs text-primary-foreground disabled:opacity-50"><RotateCcw className="h-3.5 w-3.5" />{draftConfigCurrent ? (isZh ? '重试失败分片' : 'Retry failed shard') : (isZh ? '使用当前配置重新检测' : 'Restart with saved configuration')}</button>}
               </div>
             </div>
             <div className="h-2 overflow-hidden rounded-full bg-muted"><div className="h-full bg-primary transition-all" style={{ width: `${percent}%` }} /></div>
@@ -227,35 +253,65 @@ export function CorrectionTab({ session }: CorrectionTabProps) {
 
         {reviewReady && draft && (
           <section className="space-y-4">
-            <div className="flex items-start justify-between gap-4"><div><p className="text-sm font-medium">{isZh ? `发现 ${draft.proposedPatches.length} 个合法候选` : `${draft.proposedPatches.length} valid candidates`}</p><p className="mt-1 text-xs text-muted-foreground">{isZh ? '默认全部选中。确认后仅在本地应用，不再调用模型。' : 'All candidates are selected by default. Confirmation applies patches locally without another model call.'}</p></div>{draft.proposedPatches.length > 0 && <button type="button" onClick={() => setSelected(allReviewPatchesSelected ? new Set() : new Set(draft.proposedPatches.map((patch) => patch.id)))} className="shrink-0 rounded-md border border-input bg-background px-3 py-1.5 text-xs font-medium hover:bg-accent">{allReviewPatchesSelected ? (isZh ? '全部不选' : 'Select none') : (isZh ? '全部选中' : 'Select all')}</button>}</div>
-            {draft.proposedPatches.length === 0 && <div className="flex items-center gap-2 rounded-lg bg-muted/50 p-4 text-sm text-muted-foreground"><CheckCircle2 className="h-5 w-5 text-green-500" />{isZh ? '没有需要修改的候选，可直接完成。' : 'No correction candidates were found.'}</div>}
-            <div className="space-y-2">
-              {draft.proposedPatches.map((patch) => {
-                const checked = selected.has(patch.id)
-                return <div key={patch.id} className={`block rounded-lg border p-4 ${checked ? 'border-primary/40 bg-primary/5' : 'border-border'}`}>
-                  <div className="flex items-start gap-3">
-                    <button type="button" aria-pressed={checked} onClick={() => setSelected((current) => { const next = new Set(current); if (next.has(patch.id)) next.delete(patch.id); else next.add(patch.id); return next })} className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded border ${checked ? 'border-primary bg-primary text-primary-foreground' : 'border-input'}`}>{checked && <Check className="h-3 w-3" />}</button>
-                    <div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2 font-mono text-sm"><span className="text-destructive line-through">{patch.sourceText || '∅'}</span><span>→</span><input aria-label={isZh ? '建议修改' : 'Suggested replacement'} value={draftEdits[patch.id] ?? patch.replacement} onChange={(event) => setDraftEdits((current) => ({ ...current, [patch.id]: event.target.value }))} onBlur={() => void persistDraftEdit(patch)} className={`h-8 min-w-32 flex-1 rounded-md border bg-background px-2 text-sm text-green-600 dark:text-green-400 ${editErrors[patch.id] ? 'border-destructive' : 'border-input'}`} /><span className={`rounded-full px-2 py-0.5 font-sans text-xs ${CATEGORY_COLORS[patch.category]}`}>{categoryLabel(patch.category, isZh)}</span></div>{editErrors[patch.id] && <p className="mt-1 text-xs text-destructive">{editErrors[patch.id]}</p>}<p className="mt-2 text-xs text-muted-foreground">{patch.reason}</p><pre className="mt-2 whitespace-pre-wrap rounded bg-muted/50 p-2 text-xs">{contextForPatch(liveSession.transcript, patch)}</pre></div>
-                  </div>
-                </div>
-              })}
+            <div className="flex flex-wrap items-start justify-between gap-4">
+              <div><p className="text-sm font-medium">{isZh ? `发现 ${draft.proposedPatches.length} 个合法候选` : `${draft.proposedPatches.length} valid candidates`}</p><p className="mt-1 text-xs text-muted-foreground">{isZh ? '默认全部选中。确认后仅在本地应用，不再调用模型。' : 'All candidates are selected by default. Confirmation applies patches locally without another model call.'}</p></div>
+              {draft.proposedPatches.length > 0 && <button type="button" disabled={pending || workspaceBusy} onClick={() => setSelected(allReviewPatchesSelected ? new Set() : new Set(draft.proposedPatches.filter((patch) => patch.state !== 'reverted').map((patch) => patch.id)))} className="shrink-0 rounded-md border border-input bg-background px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:opacity-50">{allReviewPatchesSelected ? (isZh ? '全部不选' : 'Select none') : (isZh ? '全部选中' : 'Select all')}</button>}
             </div>
-            {draft.rejectedPatches.length > 0 && <details className="rounded-lg border border-border p-3 text-xs"><summary className="cursor-pointer text-muted-foreground">{isZh ? `${draft.rejectedPatches.length} 个非法 Patch 已拒绝` : `${draft.rejectedPatches.length} invalid patches rejected`}</summary><div className="mt-2 space-y-1">{draft.rejectedPatches.map((patch) => <p key={patch.id}>{patch.rejectionReason}: {patch.sourceText || patch.replacement}</p>)}</div></details>}
-            <button type="button" disabled={Object.keys(editErrors).length > 0} onClick={() => void run(() => applySessionCorrectionReview(session.id, Array.from(selected)))} className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-primary text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50"><Zap className="h-4 w-4" />{isZh ? `本地应用 ${selected.size} 项` : `Apply ${selected.size} locally`}</button>
+            {draft.proposedPatches.length === 0 && <div className="flex items-center gap-2 rounded-lg bg-muted/50 p-4 text-sm text-muted-foreground"><CheckCircle2 className="h-5 w-5 text-green-500" />{isZh ? '没有需要修改的候选，可直接完成。' : 'No correction candidates were found.'}</div>}
+            <CorrectionWorkspace key={`${session.id}-${draft.runId}`} session={liveSession} patches={[...draft.proposedPatches, ...draft.rejectedPatches]} isZh={isZh} disabled={pending || controlPending || Boolean(processing)} onBusyChange={setWorkspaceBusy}
+              onSaved={(patchId) => setEditErrors((current) => { const next = { ...current }; delete next[patchId]; return next })} review={{
+              selected, edits: draftEdits, errors: editErrors,
+              onToggle: (patchId) => setSelected((current) => { const next = new Set(current); if (next.has(patchId)) next.delete(patchId); else next.add(patchId); return next }),
+              onEdit: (patchId, value) => useCorrectionReviewStore.getState().edit(session.id, draft.runId, patchId, value),
+              onPersist: persistDraftEdit,
+            }} />
+            <button type="button" disabled={pending || controlPending || workspaceBusy || correctionInFlight || Object.keys(editErrors).length > 0} onClick={() => void run(async () => {
+              for (const patch of draft.proposedPatches) await persistDraftEdit(patch)
+              const latestDraft = useSessionStore.getState().sessions.find((item) => item.id === session.id)?.correction?.draft
+              if (latestDraft?.runId !== draft.runId) throw new Error('correction-revision-mismatch')
+              const savedReview = useCorrectionReviewStore.getState().reviews[session.id]
+              await applySessionCorrectionReview(session.id, savedReview?.runId === draft.runId ? savedReview.selectedIds : Array.from(selected), {
+                target: 'draft', id: latestDraft.runId, revision: latestDraft.revision, baseTranscriptHash: latestDraft.baseTranscriptHash,
+              })
+            })} className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-primary text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50"><Zap className="h-4 w-4" />{isZh ? `本地应用 ${selected.size} 项` : `Apply ${selected.size} locally`}</button>
           </section>
         )}
 
-        {published && !draft && (
+        {published && (
           <section className="space-y-4">
-            <div className="flex flex-wrap items-center gap-2"><CheckCircle2 className="h-5 w-5 text-green-500" /><p className="text-sm font-medium">{isZh ? `已应用 ${published.stats.applied}，拒绝 ${published.stats.rejected}` : `${published.stats.applied} applied, ${published.stats.rejected} rejected`}</p><div className="ml-auto flex gap-2"><button type="button" onClick={() => void run(() => mode === 'quick' ? startSessionQuickCorrection(session.id) : detectSessionCorrectionIssues(session.id))} className="inline-flex h-8 items-center gap-1.5 rounded-md border border-input px-3 text-xs"><Zap className="h-3.5 w-3.5" />{isZh ? '重新检测' : 'Run again'}</button><button type="button" onClick={() => void run(() => revertAllSessionCorrectionPatches(session.id))} className="inline-flex h-8 items-center gap-1.5 rounded-md border border-input px-3 text-xs"><RotateCcw className="h-3.5 w-3.5" />{isZh ? '全部恢复原文' : 'Restore original'}</button></div></div>
-            {renderCorrectionResult()}
-            <div className="space-y-2">{published.patches.filter((patch) => patch.state !== 'rejected').map((patch) => <div key={patch.id} className="flex items-center gap-3 rounded-lg border border-border p-3 text-xs"><span className="font-mono"><span className="text-destructive line-through">{patch.sourceText || '∅'}</span> → <span className="text-green-600">{patch.replacement || '∅'}</span></span><button type="button" onClick={() => void run(() => setSessionCorrectionPatchState(session.id, patch.id, patch.state === 'applied' ? 'reverted' : 'applied'))} className="ml-auto rounded-md border border-input px-2 py-1">{patch.state === 'applied' ? (isZh ? '撤销' : 'Revert') : (isZh ? '恢复' : 'Apply')}</button></div>)}</div>
+            <div className="flex flex-wrap items-center gap-2"><CheckCircle2 className="h-5 w-5 text-green-500" /><p className="text-sm font-medium">{draft ? (isZh ? '上一版结果（只读）' : 'Previous result (read-only)') : (isZh ? `已应用 ${published.stats.applied}，拒绝 ${published.stats.rejected}` : `${published.stats.applied} applied, ${published.stats.rejected} rejected`)}</p>{!draft && <div className="ml-auto flex flex-wrap gap-2"><button type="button" disabled={pending || workspaceBusy || !configured} onClick={() => requestRun('new')} className="inline-flex h-8 items-center gap-1.5 rounded-md border border-input px-3 text-xs disabled:opacity-50"><Zap className="h-3.5 w-3.5" />{isZh ? '重新检测' : 'Run again'}</button><button type="button" disabled={pending || workspaceBusy} onClick={() => void run(() => revertAllSessionCorrectionPatches(session.id))} className="inline-flex h-8 items-center gap-1.5 rounded-md border border-input px-3 text-xs disabled:opacity-50"><RotateCcw className="h-3.5 w-3.5" />{isZh ? '全部恢复原文' : 'Restore original'}</button></div>}</div>
+            {draft && <p className="text-sm text-muted-foreground">{isZh ? '新结果发布后替换此结果；失败、暂停或放弃任务不会丢失旧修正。' : 'New publication replaces this result. Failure, pause or abandonment preserves these edits.'}</p>}
+            <CorrectionWorkspace key={`${session.id}-published`} session={liveSession} patches={published.patches} isZh={isZh} disabled={pending || controlPending || Boolean(processing)} readOnly={Boolean(draft)} onBusyChange={setWorkspaceBusy} />
+            <div data-correction-body>{renderCorrectionResult()}</div>
           </section>
         )}
 
-        {legacy && !draft && !published && <section className="space-y-3 rounded-xl border border-amber-300 bg-amber-50 p-5 dark:border-amber-900 dark:bg-amber-950/20"><p className="text-sm font-medium">{isZh ? 'Legacy 全文纠错结果' : 'Legacy full-text correction result'}</p><p className="text-xs text-muted-foreground">{isZh ? '旧结果没有可信 Patch，不能单条撤销。原说话人分段会保留，并附完整历史修正稿。' : 'This result has no trusted patches and cannot be reverted item by item. Original speaker segments are preserved with the complete legacy correction.'}</p>{renderCorrectionResult()}<div className="flex gap-2"><button type="button" onClick={() => void run(() => mode === 'quick' ? startSessionQuickCorrection(session.id) : detectSessionCorrectionIssues(session.id))} className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs text-primary-foreground"><Zap className="h-3.5 w-3.5" />{isZh ? '重新检测' : 'Run patch detection'}</button><button type="button" onClick={() => void run(() => restoreSessionLegacyCorrection(session.id))} className="inline-flex h-8 items-center gap-1.5 rounded-md border border-input bg-background px-3 text-xs"><RotateCcw className="h-3.5 w-3.5" />{isZh ? '恢复原文' : 'Restore original'}</button></div></section>}
+        {legacy && !published && <section className="space-y-3 rounded-xl border border-amber-300 bg-amber-50 p-5 dark:border-amber-900 dark:bg-amber-950/20"><p className="text-sm font-medium">{isZh ? 'Legacy 全文纠错结果' : 'Legacy full-text correction result'}</p><p className="text-sm text-muted-foreground">{isZh ? '旧结果没有可信 Patch，不能单条管理或追加纠错。请确认重新检测，建立 Patch 结果后再编辑。原说话人分段会保留，并附完整历史修正稿。' : 'This result has no trusted patches. Confirm redetection before adding or managing individual edits. Original speaker segments are preserved with the complete legacy correction.'}</p>{draft ? <p className="text-sm text-muted-foreground">{isZh ? '新结果发布后替换；当前历史结果仅供查看。' : 'Replacement happens only on publication. This previous result is read-only.'}</p> : <div className="flex flex-wrap gap-2"><button type="button" disabled={pending || !configured} onClick={() => requestRun('new')} className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs text-primary-foreground disabled:opacity-50"><Zap className="h-3.5 w-3.5" />{isZh ? '重新检测' : 'Run patch detection'}</button><button type="button" disabled={pending} onClick={() => void run(() => restoreSessionLegacyCorrection(session.id))} className="inline-flex h-8 items-center gap-1.5 rounded-md border border-input bg-background px-3 text-xs disabled:opacity-50"><RotateCcw className="h-3.5 w-3.5" />{isZh ? '恢复原文' : 'Restore original'}</button></div>}<div data-correction-body>{renderCorrectionResult()}</div></section>}
         {error && !draft && <p className="text-sm text-destructive">{error}</p>}
       </div>
+      <ActionDialog open={Boolean(abandonRunId)} title={t.preview.abandonCorrection} description={`${t.preview.abandonCorrectionHint}${error ? `\n\n${error}` : ''}`} onClose={() => { if (!controlRef.current) setAbandonRunId(null) }} actions={[
+        { label: t.common.cancel, variant: 'secondary', disabled: controlPending, onClick: () => setAbandonRunId(null) },
+        { label: isZh ? '放弃任务' : 'Abandon', variant: 'danger', disabled: controlPending, onClick: () => void run(async () => {
+          if (useSessionStore.getState().sessions.find((item) => item.id === session.id)?.correction?.draft?.runId !== abandonRunId) throw new Error(isZh ? '任务已变化，请重新确认。' : 'Task changed; confirm again.')
+          await abandonSessionCorrection(session.id)
+          setAbandonRunId(null)
+        }, true) },
+      ]} />
+      <ActionDialog open={Boolean(rerun)} title={isZh ? '重新检测并替换纠错' : 'Redetect and replace corrections'}
+        description={`${isZh ? '本次检测只使用原始转录。新结果成功发布后，将替换当前已应用、已撤销及人工修正的整个纠错集合，不合并旧项。取消、失败或放弃不会丢失旧结果；原始转录保持不变。' : 'Detection uses only the original transcript. Successful publication replaces the entire applied, reverted and manual correction set, without merging old edits. Cancel, failure or abandonment preserves the previous result. The original transcript stays unchanged.'}${error ? `\n\n${error}` : ''}`}
+        onClose={() => { if (!pendingRef.current) setRerun(null) }} actions={[
+          { label: t.common.cancel, disabled: pending, onClick: () => setRerun(null) },
+          { label: isZh ? '确认重新检测' : 'Confirm redetection', variant: 'primary', disabled: pending || workspaceBusy || !configured, onClick: () => void run(async () => {
+            if (!rerun) return
+            const current = useSessionStore.getState().sessions.find((item) => item.id === session.id)?.correction
+            if (current?.draft?.runId !== rerun.runId || current?.draft?.revision !== rerun.draftRevision
+              || current?.published?.id !== rerun.publishedId || current?.published?.revision !== rerun.publishedRevision
+              || current?.legacy?.correctedText !== rerun.legacyText) throw new Error('correction-revision-mismatch')
+            const kind = rerun.kind
+            setRerun(null)
+            await executeRun(kind)
+          }) },
+        ]} />
     </div>
   )
 }

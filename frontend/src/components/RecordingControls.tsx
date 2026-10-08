@@ -25,7 +25,7 @@ const TRANSLATION_OPTIONS = [
 
 interface RecordingControlsProps {
   onError: (message: string) => void
-  startRecording: (meetingContextOverride?: MeetingContextOverride) => Promise<void>
+  startRecording: (meetingContextOverride?: MeetingContextOverride) => Promise<boolean>
   pauseRecording: () => Promise<void>
   resumeRecording: () => Promise<void>
   stopRecording: () => Promise<string | null>
@@ -91,8 +91,10 @@ export function RecordingControls({
         onError(t.recording.configureApiFirst)
         return
       }
-      void startRecording(meetingContextOverride)
-      setMeetingContextOverride({ mode: 'inherit' })
+      const contextAtStart = meetingContextOverride
+      void startRecording(contextAtStart).then((started) => {
+        if (started) setMeetingContextOverride((current) => current === contextAtStart ? { mode: 'inherit' } : current)
+      }).catch((error: unknown) => onError(error instanceof Error ? error.message : String(error)))
     }
   }
 

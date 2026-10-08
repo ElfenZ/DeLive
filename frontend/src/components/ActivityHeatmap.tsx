@@ -1,4 +1,4 @@
-import { useMemo, useState, useCallback } from 'react'
+import { Fragment, useMemo, useState, useCallback } from 'react'
 import { Flame, Calendar, Clock, TrendingUp, ChevronDown } from 'lucide-react'
 import type { TranscriptSession } from '../types'
 import { useUIStore } from '../stores/uiStore'
@@ -247,7 +247,7 @@ export function ActivityHeatmap({ sessions, onDateClick, activeDate }: ActivityH
 
           {/* Day rows: label + cells */}
           {Array.from({ length: DAYS_PER_WEEK }).map((_, dayIdx) => (
-            <>
+            <Fragment key={dayIdx}>
               <div key={`dl-${dayIdx}`} className="text-[10px] leading-none text-muted-foreground/70 text-right pr-1 flex items-center justify-end">
                 {dayLabels[dayIdx]}
               </div>
@@ -259,9 +259,12 @@ export function ActivityHeatmap({ sessions, onDateClick, activeDate }: ActivityH
                 const level = getLevel(cell.count)
                 const isActive = activeDate === cell.date
                 return (
-                  <div
+                  <button
+                    type="button"
+                    aria-label={`${cell.date}: ${cell.count} ${copy.recording}`}
+                    aria-pressed={isActive}
                     key={`c-${weekIdx}-${dayIdx}`}
-                    className={`aspect-square rounded-[3px] cursor-pointer transition-all duration-100 ${levelClasses[level]} ${
+                    className={`min-h-0 min-w-0 aspect-square rounded-[3px] cursor-pointer transition-all duration-100 ${levelClasses[level]} ${
                       isActive ? 'ring-2 ring-primary ring-offset-1 ring-offset-background' : 'hover:ring-1 hover:ring-foreground/20'
                     }`}
                     onClick={() => onDateClick?.(cell.date)}
@@ -270,7 +273,7 @@ export function ActivityHeatmap({ sessions, onDateClick, activeDate }: ActivityH
                   />
                 )
               })}
-            </>
+            </Fragment>
           ))}
         </div>
 

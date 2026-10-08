@@ -7,6 +7,26 @@ export interface WhatsNewEntry {
 
 const entries: WhatsNewEntry[] = [
   {
+    version: '2.5.12', date: '2026-10-06', features: [],
+    fixes: [
+      { zh: '修复不变文件状态重复写整库、编辑单条记录重建其他记录引发的卡顿，避免重复标题文件同步', en: 'Skip unchanged file-state writes and preserve unrelated records on metadata edits; avoid duplicate saved-title file synchronization' },
+      { zh: '设置 → 数据管理新增录音恢复项确认；手动迁移的项目可逐项标记不再提醒，文件保留，新变化仍提示', en: 'Review recovery items in Settings → Data Management; acknowledge manually moved items without deleting files, while new evidence remains visible' },
+      { zh: '增加默认关闭的脱敏性能诊断和较大资料库界面回归，用于进一步定位真实环境中的卡顿', en: 'Add opt-in redacted performance diagnostics and larger-library UI regressions to investigate remaining environment-specific stalls' },
+    ],
+  },
+  {
+    version: '2.5.11',
+    date: '2026-10-06',
+    features: [
+      { zh: '回顾统一管理主题文件夹，支持层级、多主题关联、未分类、归档恢复及搜索、日期、标签组合筛选；所有记录仍保留在全部历史', en: 'Review now manages hierarchical topic folders, multiple links, unclassified records, archive/restore, and combined search, date and tag filters without removing records from all history' },
+      { zh: '音频存储与自动导出分开设置，可仅更改新音频位置，旧音频保留原位置；历史音频迁移预览涵盖全部托管来源', en: 'Audio storage is separate from automatic text export. Change the location for new audio only while preserving old registrations, or preview all managed sources for an explicit migration' },
+    ],
+    fixes: [
+      { zh: '打开和切换记录默认进入摘要，未生成、生成中和失败状态不再跳到转录；浏览主题不会改变全局录音或导入归属', en: 'Opening or switching records defaults to Summary, including empty, pending and failed states. Browsing topics does not assign global recordings or imports' },
+      { zh: '本机文件登记升级为版本 2，保留旧目录授权与资产位置；旧安装版不能直接读取新版登记，不支持直接降级', en: 'Local file registrations use version 2 to preserve old directory permissions and asset locations. Older installations cannot read this registry; direct downgrade is unsupported' },
+    ],
+  },
+  {
     version: '2.5.10',
     date: '2026-08-27',
     features: [],

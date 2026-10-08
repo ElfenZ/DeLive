@@ -65,10 +65,6 @@ describe('Settings panels – nav item configuration', () => {
     }
   })
 
-  it('settings nav width is 192px (w-48)', () => {
-    const SETTINGS_NAV_WIDTH = 192
-    expect(SETTINGS_NAV_WIDTH).toBe(192)
-  })
 })
 
 describe('OpenApiPanel – token generation', () => {

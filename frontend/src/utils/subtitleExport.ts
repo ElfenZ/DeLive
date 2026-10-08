@@ -4,7 +4,7 @@
  */
 
 import type { TranscriptTokenData, TranscriptSession } from '../types'
-import { buildSessionExportFilename } from './storageUtils'
+import { buildSessionExportFilename, saveManualExport } from './storageUtils'
 
 type SubtitleTranslationDisplay = 'auto' | 'source-only' | 'dual' | 'translated-only'
 
@@ -407,17 +407,8 @@ export function downloadSubtitle(
     includeSpeaker?: boolean
     translationDisplay?: SubtitleTranslationDisplay
   }
-): void {
+): Promise<void> {
   const content = generateSubtitleFromSession(session, format, options)
   const mimeType = format === 'srt' ? 'text/plain' : 'text/vtt'
-  const blob = new Blob([content], { type: `${mimeType};charset=utf-8` })
-  const url = URL.createObjectURL(blob)
-  
-  const a = document.createElement('a')
-  a.href = url
-  a.download = buildSessionExportFilename(session, format)
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
-  URL.revokeObjectURL(url)
+  return saveManualExport(session, content, buildSessionExportFilename(session, format), `${mimeType};charset=utf-8`)
 }

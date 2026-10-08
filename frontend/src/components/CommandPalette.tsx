@@ -21,7 +21,7 @@ export function CommandPalette() {
   const commands = useMemo<Command[]>(() => [
     { id: 'nav-live', label: t.nav?.live || 'Live', shortcut: 'Ctrl+1', icon: Mic, action: () => setView('live' as WorkspaceView) },
     { id: 'nav-review', label: t.nav?.review || 'Review', shortcut: 'Ctrl+2', icon: FileText, action: () => setView('review' as WorkspaceView) },
-    { id: 'nav-topics', label: t.nav?.topics || 'Topics', shortcut: 'Ctrl+3', icon: FolderOpen, action: () => setView('topics' as WorkspaceView) },
+    { id: 'nav-folders', label: t.reviewFolders.title, shortcut: 'Ctrl+3', icon: FolderOpen, action: () => setView('topics' as WorkspaceView) },
     { id: 'nav-caption', label: t.nav?.caption || 'Caption', icon: Monitor, action: () => {
       window.electronAPI?.captionToggle?.(undefined, 'command-palette')
     }},

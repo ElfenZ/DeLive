@@ -150,17 +150,16 @@ export function attachApiServer({ server }: ApiServerOptions): ApiServerAttachme
         const offset = parseInt(params.get('offset') || '0', 10)
 
         let sessions
+        const filter = { topicId: params.get('topicId') || undefined, projectId: params.get('projectId') || undefined, includeDescendants: params.get('includeDescendants') !== 'false' }
         if (search && search.trim()) {
-          sessions = await requestSearchSessions(search.trim())
+          sessions = await requestSearchSessions(search.trim(), filter)
         } else {
-          sessions = await requestSessions()
+          sessions = await requestSessions(filter)
         }
 
-        const topicId = params.get('topicId')
         const status = params.get('status')
 
         let filtered = sessions
-        if (topicId) filtered = filtered.filter(s => s.topicId === topicId)
         if (status) filtered = filtered.filter(s => s.status === status)
 
         const total = filtered.length
@@ -215,7 +214,7 @@ export function attachApiServer({ server }: ApiServerOptions): ApiServerAttachme
         return
       }
 
-      if (pathname === '/api/v1/topics' && req.method === 'GET') {
+      if ((pathname === '/api/v1/topics' || pathname === '/api/v1/projects') && req.method === 'GET') {
         const topics = await requestTopics()
         jsonResponse(res, 200, { topics })
         return

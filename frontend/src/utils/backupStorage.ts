@@ -2,21 +2,24 @@ import type {
   AiPostProcessConfig,
   AppSettings,
   CaptionStyle,
+  DeletedSessionSnapshot,
   ProviderConfigData,
   Tag,
   Topic,
   TranscriptSession,
 } from '../types'
-import { getSessions, saveSessions } from './sessionStorage'
+import { getSessions } from './sessionStorage'
 import { getSettings, getTags, getTopics, saveSettings, saveTags, saveTopics } from './settingsStorage'
 import { normalizeTranscriptSessions } from './sessionSchema'
-import { getDefaultSettings } from './storageShared'
+import { DELETED_SESSION_STORE, getDefaultSettings, META_KEY_SESSIONS_MIGRATED, META_STORE, openAppDatabase, SESSION_STORE, STORAGE_KEYS, supportsIndexedDb } from './storageShared'
 import { generateId } from './storageUtils'
 import { normalizeGlossaryEntries, normalizeMeetingContextConfig } from './meetingContext'
-import { nextOpenAiCredentialVersion } from '../services/openAiCompatible'
+import { nextAiCredentialVersion } from '../services/aiProtocol'
+import { normalizeProjects, validateProjectHierarchy } from './projectSchema'
+import { getDeletedSessionSnapshots, normalizeDeletedSessionSnapshot, replaceDeletedSessionSnapshots } from './deletedSessionStorage'
 
-export const CURRENT_BACKUP_VERSION = '4.0'
-export const CURRENT_BACKUP_SCHEMA_VERSION = 4
+export const CURRENT_BACKUP_VERSION = '5.0'
+export const CURRENT_BACKUP_SCHEMA_VERSION = 5
 
 export function mergeImportedAiPostProcessConfig(
   current: AiPostProcessConfig | undefined,
@@ -26,13 +29,14 @@ export function mergeImportedAiPostProcessConfig(
   return {
     ...(incoming || {}),
     apiKey: mergedApiKey,
-    credentialVersion: nextOpenAiCredentialVersion(
+    credentialVersion: nextAiCredentialVersion(
       {
         baseUrl: incoming?.baseUrl,
         apiKey: incoming?.apiKey,
+        provider: incoming?.provider,
         credentialVersion: incoming?.credentialVersion,
       },
-      { baseUrl: incoming?.baseUrl, apiKey: mergedApiKey },
+      { baseUrl: incoming?.baseUrl, apiKey: mergedApiKey, provider: incoming?.provider },
     ),
   }
 }
@@ -70,6 +74,7 @@ export interface BackupData {
   tags: Tag[]
   settings: AppSettings
   topics?: Topic[]
+  deletedSessionSnapshots?: DeletedSessionSnapshot[]
 }
 
 export function getBackupValidationErrors(data: unknown): string[] {
@@ -78,12 +83,17 @@ export function getBackupValidationErrors(data: unknown): string[] {
   }
 
   const errors: string[] = []
+  if (typeof data.version === 'string' && Number.parseFloat(data.version) > Number.parseFloat(CURRENT_BACKUP_VERSION)) errors.push('Unsupported future backup version')
+  if (typeof data.schemaVersion === 'number' && data.schemaVersion > CURRENT_BACKUP_SCHEMA_VERSION) errors.push('Unsupported future backup schemaVersion')
+  for (const key of ['topics', 'deletedSessionSnapshots']) {
+    if (data[key] !== undefined && !Array.isArray(data[key])) errors.push(`Invalid "${key}" array`)
+  }
 
   if (typeof data.version !== 'string' || data.version.trim().length === 0) {
     errors.push('Missing or invalid "version"')
   }
 
-  if (data.schemaVersion !== undefined && (typeof data.schemaVersion !== 'number' || !Number.isFinite(data.schemaVersion))) {
+  if (data.schemaVersion !== undefined && (typeof data.schemaVersion !== 'number' || !Number.isSafeInteger(data.schemaVersion) || data.schemaVersion < 1)) {
     errors.push('Invalid "schemaVersion"')
   }
 
@@ -119,7 +129,7 @@ export function getBackupValidationErrors(data: unknown): string[] {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function getString(value: unknown): string {
@@ -190,9 +200,10 @@ function normalizeAiPostProcessConfig(value: unknown): AiPostProcessConfig | und
     return undefined
   }
 
-  const provider = value.provider === 'openai-compatible'
+  const provider = value.provider === 'openai-compatible' || value.provider === 'anthropic-compatible'
     ? value.provider
     : 'openai-compatible'
+  const thinkingMode = value.thinkingMode === 'disabled' ? 'disabled' : 'default'
   const promptLanguage = value.promptLanguage === 'en' || value.promptLanguage === 'zh'
     ? value.promptLanguage
     : undefined
@@ -211,7 +222,9 @@ function normalizeAiPostProcessConfig(value: unknown): AiPostProcessConfig | und
   const correctionStructuredOutput = value.correctionStructuredOutput === 'prompt-json'
     || value.correctionStructuredOutput === 'json_object'
     || value.correctionStructuredOutput === 'json_schema'
-    ? value.correctionStructuredOutput
+    ? provider === 'anthropic-compatible' && value.correctionStructuredOutput === 'json_object'
+      ? 'prompt-json'
+      : value.correctionStructuredOutput
     : undefined
   const advancedValue = isRecord(value.correctionAdvanced) ? value.correctionAdvanced : undefined
   const safetyValue = advancedValue && isRecord(advancedValue.safetyLimits) ? advancedValue.safetyLimits : undefined
@@ -246,6 +259,7 @@ function normalizeAiPostProcessConfig(value: unknown): AiPostProcessConfig | und
   return {
     enabled: typeof value.enabled === 'boolean' ? value.enabled : undefined,
     provider,
+    thinkingMode,
     baseUrl: typeof value.baseUrl === 'string' ? value.baseUrl : undefined,
     model: typeof value.model === 'string' ? value.model : undefined,
     apiKey: typeof value.apiKey === 'string' ? value.apiKey : undefined,
@@ -264,9 +278,7 @@ function normalizeAiPostProcessConfig(value: unknown): AiPostProcessConfig | und
     autoExportCorrectedMarkdown: typeof value.autoExportCorrectedMarkdown === 'boolean'
       ? value.autoExportCorrectedMarkdown
       : undefined,
-    autoExportDirectory: typeof value.autoExportDirectory === 'string' && value.autoExportDirectory.trim()
-      ? value.autoExportDirectory.trim()
-      : undefined,
+    autoExportDirectory: undefined,
     correctionStructuredOutput,
     correctionAdvanced: normalizedCorrectionAdvanced,
   }
@@ -290,7 +302,7 @@ export function sanitizeSettingsForBackup(settings: AppSettings): AppSettings {
     apiKey: '',
     providerConfigs,
     aiPostProcess: settings.aiPostProcess
-      ? { ...settings.aiPostProcess, apiKey: '' }
+      ? { ...settings.aiPostProcess, apiKey: '', autoExportDirectory: undefined }
       : undefined,
     openApi: settings.openApi
       ? { ...settings.openApi, token: '' }
@@ -315,6 +327,7 @@ function normalizeSettings(value: unknown): AppSettings {
 
   return {
     ...defaults,
+    autoSavePublishedCorrection: typeof record.autoSavePublishedCorrection === 'boolean' ? record.autoSavePublishedCorrection : undefined,
     apiKey: typeof record.apiKey === 'string' ? record.apiKey : defaults.apiKey,
     languageHints: Array.isArray(record.languageHints)
       ? normalizeStringArray(record.languageHints)
@@ -366,8 +379,8 @@ function normalizeSettings(value: unknown): AppSettings {
   }
 }
 
-export async function exportAllData(): Promise<void> {
-  const data: BackupData = {
+export async function buildBackupData(): Promise<BackupData> {
+  return upgradeBackupData({
     version: CURRENT_BACKUP_VERSION,
     schemaVersion: CURRENT_BACKUP_SCHEMA_VERSION,
     exportedAt: new Date().toISOString(),
@@ -375,7 +388,12 @@ export async function exportAllData(): Promise<void> {
     tags: getTags(),
     settings: sanitizeSettingsForBackup(getSettings()),
     topics: getTopics(),
-  }
+    deletedSessionSnapshots: await getDeletedSessionSnapshots(),
+  })
+}
+
+export async function exportAllData(): Promise<void> {
+  const data = await buildBackupData()
 
   const blob = new Blob([JSON.stringify(data, null, 2)], {
     type: 'application/json;charset=utf-8',
@@ -395,30 +413,75 @@ export function validateBackupData(data: unknown): data is BackupData {
 }
 
 export function upgradeBackupData(data: BackupData): BackupData {
+  const errors = getBackupValidationErrors(data)
+  if (errors.length) throw new Error(errors.join('; '))
+  const topics = normalizeProjects(data.topics ?? [])
+  validateProjectHierarchy(topics)
+  const snapshots = (data.deletedSessionSnapshots ?? []).map(normalizeDeletedSessionSnapshot)
+  if (snapshots.some((snapshot) => !snapshot)) throw new Error('Invalid or unsupported deleted-result snapshot')
+  const sessions = normalizeTranscriptSessions(data.sessions).map((session) => ({
+    ...session,
+    sourceMeta: session.sourceMeta ? { ...session.sourceMeta, audioPath: undefined, audioAvailable: false, audioError: 'Requires local verification', originalSourceId: undefined, originalSourceRevision: undefined } : undefined,
+    correctedMarkdownFile: session.correctedMarkdownFile ? { status: 'missing' as const, revision: 0, publicationId: session.correctedMarkdownFile.publicationId, publicationRevision: session.correctedMarkdownFile.publicationRevision, error: 'Requires local verification' } : undefined,
+    autoPostProcessWorkflow: session.autoPostProcessWorkflow ? { ...session.autoPostProcessWorkflow, exportPath: undefined, exportedAt: undefined } : undefined,
+  }))
+  for (const [label, records] of [['Session', sessions], ['snapshot', snapshots], ['tag', data.tags]] as const) {
+    const ids = records.map((record) => record?.id)
+    if (new Set(ids).size !== ids.length) throw new Error(`Duplicate ${label} IDs in backup`)
+  }
+  if (sessions.some((session) => snapshots.some((snapshot) => snapshot?.id === session.id))) throw new Error('Session ID conflicts with deleted-result snapshot')
   return {
     version: CURRENT_BACKUP_VERSION,
     schemaVersion: CURRENT_BACKUP_SCHEMA_VERSION,
     exportedAt: data.exportedAt || new Date().toISOString(),
-    sessions: normalizeTranscriptSessions(data.sessions),
+    sessions,
     tags: data.tags
       .map(normalizeTag)
       .filter((tag): tag is Tag => tag !== null),
     settings: normalizeSettings(data.settings),
-    topics: Array.isArray(data.topics)
-      ? data.topics.filter((t): t is Topic => isRecord(t) && typeof (t as Record<string, unknown>).id === 'string' && typeof (t as Record<string, unknown>).name === 'string')
-      : [],
+    topics,
+    deletedSessionSnapshots: snapshots as DeletedSessionSnapshot[],
   }
+}
+
+async function restoreRecords(sessions: TranscriptSession[], snapshots: DeletedSessionSnapshot[]): Promise<void> {
+  if (!supportsIndexedDb()) {
+    await replaceDeletedSessionSnapshots(snapshots)
+    const serialized = JSON.stringify(sessions)
+    localStorage.setItem(STORAGE_KEYS.SESSIONS, serialized)
+    if (localStorage.getItem(STORAGE_KEYS.SESSIONS) !== serialized) throw new Error('Session restore verification failed')
+    return
+  }
+  const db = await openAppDatabase()
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction([SESSION_STORE, DELETED_SESSION_STORE, META_STORE], 'readwrite')
+    transaction.oncomplete = () => resolve()
+    transaction.onerror = () => reject(transaction.error || new Error('Backup restore failed'))
+    transaction.onabort = () => reject(transaction.error || new Error('Backup restore aborted'))
+    const sessionStore = transaction.objectStore(SESSION_STORE)
+    const snapshotStore = transaction.objectStore(DELETED_SESSION_STORE)
+    sessionStore.clear()
+    snapshotStore.clear()
+    sessions.forEach((session) => sessionStore.put(session))
+    snapshots.forEach((snapshot) => snapshotStore.put(snapshot))
+    transaction.objectStore(META_STORE).put({ key: META_KEY_SESSIONS_MIGRATED, value: true })
+  })
+  localStorage.removeItem(STORAGE_KEYS.SESSIONS)
+  if (localStorage.getItem(STORAGE_KEYS.SESSIONS) !== null) throw new Error('Cannot clear legacy Session restore cache')
+}
+
+function verifyRestoredValue(key: string, value: unknown): void {
+  if (localStorage.getItem(key) !== JSON.stringify(value)) throw new Error(`Backup restore write verification failed: ${key}`)
 }
 
 export async function importDataOverwrite(
   data: BackupData,
 ): Promise<{ sessions: number; tags: number; topics: number }> {
   const normalized = upgradeBackupData(data)
-  await saveSessions(normalized.sessions)
+  await restoreRecords(normalized.sessions, normalized.deletedSessionSnapshots ?? [])
   saveTags(normalized.tags)
-  if (normalized.topics?.length) {
-    saveTopics(normalized.topics)
-  }
+  verifyRestoredValue(STORAGE_KEYS.TAGS, normalized.tags)
+  saveTopics(normalized.topics ?? [])
 
   const currentSettings = getSettings()
   const mergedProviderConfigs = mergeProviderApiKeys(
@@ -436,7 +499,7 @@ export async function importDataOverwrite(
     ...baseWebdav,
     password: currentSettings.cloudBackup?.webdav?.password || baseWebdav.password,
   } : undefined
-  saveSettings({
+  const restoredSettings: AppSettings = {
     ...normalized.settings,
     apiKey: currentSettings.apiKey || normalized.settings.apiKey,
     providerConfigs: mergedProviderConfigs,
@@ -453,7 +516,9 @@ export async function importDataOverwrite(
       s3: mergedS3,
       webdav: mergedWebdav,
     },
-  })
+  }
+  saveSettings(restoredSettings)
+  verifyRestoredValue(STORAGE_KEYS.SETTINGS, restoredSettings)
 
   return {
     sessions: normalized.sessions.length,
@@ -469,16 +534,29 @@ export async function importDataMerge(
   const existingSessions = await getSessions()
   const existingTags = getTags()
   const existingTopics = getTopics()
+  const existingSnapshots = await getDeletedSessionSnapshots()
+  for (const [label, incoming, existing] of [
+    ['Session', normalized.sessions, [...existingSessions, ...existingSnapshots]],
+    ['project', normalized.topics ?? [], existingTopics],
+    ['tag', normalized.tags, existingTags],
+    ['snapshot', normalized.deletedSessionSnapshots ?? [], [...existingSnapshots, ...existingSessions]],
+  ] as const) {
+    const ids = new Set(existing.map((record) => record.id))
+    const conflicts = incoming.filter((record) => ids.has(record.id)).map((record) => record.id)
+    if (conflicts.length) throw new Error(`Backup merge ${label} ID conflicts: ${conflicts.join(', ')}`)
+  }
+  validateProjectHierarchy([...existingTopics, ...(normalized.topics ?? [])])
 
   const existingSessionIds = new Set(existingSessions.map((session) => session.id))
   const newSessions = normalized.sessions.filter((session) => !existingSessionIds.has(session.id))
   const mergedSessions = [...existingSessions, ...newSessions]
-  await saveSessions(mergedSessions)
+  await restoreRecords(mergedSessions, [...existingSnapshots, ...(normalized.deletedSessionSnapshots ?? [])])
 
   const existingTagIds = new Set(existingTags.map((tag) => tag.id))
   const newTags = normalized.tags.filter((tag) => !existingTagIds.has(tag.id))
   const mergedTags = [...existingTags, ...newTags]
   saveTags(mergedTags)
+  verifyRestoredValue(STORAGE_KEYS.TAGS, mergedTags)
 
   const existingTopicIds = new Set(existingTopics.map((topic) => topic.id))
   const incomingTopics = normalized.topics ?? []

@@ -30,6 +30,14 @@ export function assertTrustedSender(event: IpcMainInvokeEvent, channel: string):
   }
 }
 
+export function assertMainWindowSender(event: IpcMainInvokeEvent, channel: string, getMainWindow: () => BrowserWindow | null): void {
+  assertTrustedSender(event, channel)
+  const mainWindow = getMainWindow()
+  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.id !== event.sender.id) {
+    throw new Error(`IPC channel '${channel}' rejected: main window required`)
+  }
+}
+
 const SAFE_PATH_ROOTS: string[] = []
 
 function initSafePathRoots(): void {

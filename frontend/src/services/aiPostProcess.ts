@@ -1,5 +1,6 @@
 import type {
   AiFeatureKey,
+  AiProviderProtocol,
   AiPostProcessConfig,
   AppSettings,
   TranscriptChapter,
@@ -11,10 +12,12 @@ import type {
   TranscriptTextSourceMetadata,
 } from '../types'
 import {
-  createOpenAiRequestContext,
-  extractOpenAiErrorEnvelope,
-  extractOpenAiMessageContent,
-} from './openAiCompatible'
+  buildAiCompletionBody,
+  createAiRequestContext,
+  extractAiErrorEnvelope,
+  extractAiMessageContent,
+  parseAiStreamData,
+} from './aiProtocol'
 
 const DEFAULT_AI_BASE_URL = 'http://127.0.0.1:11434/v1'
 const DEFAULT_PROMPT_LANGUAGE: NonNullable<AiPostProcessConfig['promptLanguage']> = 'zh'
@@ -28,8 +31,9 @@ interface ModelsApiResponse {
 export async function fetchAvailableModels(
   baseUrl: string,
   apiKey?: string,
+  provider?: AiProviderProtocol,
 ): Promise<string[]> {
-  const context = createOpenAiRequestContext(baseUrl, apiKey)
+  const context = createAiRequestContext(provider, baseUrl, apiKey)
   const res = await fetch(context.modelsUrl, { headers: context.headers, signal: AbortSignal.timeout(15_000) })
   if (!res.ok) {
     const text = await res.text().catch(() => '')
@@ -37,7 +41,7 @@ export async function fetchAvailableModels(
   }
 
   const payload = (await res.json()) as ModelsApiResponse
-  const envelope = extractOpenAiErrorEnvelope(payload)
+  const envelope = extractAiErrorEnvelope(payload)
   if (envelope) throw new Error(envelope.message)
   const models = (payload.data ?? [])
     .map((m) => m.id)
@@ -109,14 +113,6 @@ export function resolveModelForFeature(
   return ''
 }
 
-interface ChatCompletionResponse {
-  choices?: Array<{
-    message?: {
-      content?: string | Array<{ type?: string; text?: string }>
-    }
-  }>
-}
-
 interface AiBriefingPayload {
   titleSuggestion?: unknown
   tagSuggestions?: unknown
@@ -157,6 +153,7 @@ function getAiConfig(settings: AppSettings): AiPostProcessConfig {
   return {
     enabled: false,
     provider: 'openai-compatible',
+    thinkingMode: 'default',
     baseUrl: DEFAULT_AI_BASE_URL,
     model: '',
     apiKey: '',
@@ -373,24 +370,13 @@ function fastTextHash(text: string): string {
   return `fnv1a-${(hash >>> 0).toString(16).padStart(8, '0')}-${text.length}`
 }
 
-function assertOpenAiPayload(payload: unknown): void {
-  const envelope = extractOpenAiErrorEnvelope(payload)
+function assertAiPayload(payload: unknown): void {
+  const envelope = extractAiErrorEnvelope(payload)
   if (envelope) throw new Error(envelope.message)
 }
 
-export function extractSessionQaStreamChunk(data: string): string | undefined {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(data)
-  } catch {
-    return undefined
-  }
-  assertOpenAiPayload(parsed)
-  const choices = parsed && typeof parsed === 'object'
-    ? (parsed as { choices?: Array<{ delta?: { content?: unknown } }> }).choices
-    : undefined
-  const content = choices?.[0]?.delta?.content
-  return typeof content === 'string' ? content : undefined
+export function extractSessionQaStreamChunk(data: string, provider?: AiProviderProtocol): string | undefined {
+  return parseAiStreamData(data, provider).text
 }
 
 export interface ResolvedTranscriptText {
@@ -619,7 +605,7 @@ export async function generateSessionBriefing(
   settings: AppSettings,
 ): Promise<SessionBriefingResult> {
   const config = getAiConfig(settings)
-  const requestContext = createOpenAiRequestContext(config.baseUrl || DEFAULT_AI_BASE_URL, config.apiKey)
+  const requestContext = createAiRequestContext(config.provider, config.baseUrl || DEFAULT_AI_BASE_URL, config.apiKey)
   const model = resolveModelForFeature(config, 'briefing')
   const promptLanguage = config.promptLanguage || DEFAULT_PROMPT_LANGUAGE
 
@@ -638,14 +624,14 @@ export async function generateSessionBriefing(
   const response = await fetch(requestContext.completionUrl, {
     method: 'POST',
     headers: requestContext.headers,
-    body: JSON.stringify({
+    body: JSON.stringify(buildAiCompletionBody({
+      provider: config.provider,
+      thinkingMode: config.thinkingMode,
       model,
       temperature: 0.2,
-      messages: [
-        { role: 'system', content: buildSystemPrompt(promptLanguage) },
-        { role: 'user', content: buildUserPrompt(session, promptLanguage, config.preferCorrectedText) },
-      ],
-    }),
+      system: buildSystemPrompt(promptLanguage),
+      user: buildUserPrompt(session, promptLanguage, config.preferCorrectedText),
+    })),
     signal: AbortSignal.timeout(120_000),
   })
 
@@ -654,9 +640,9 @@ export async function generateSessionBriefing(
     throw new Error(errorText || `AI 请求失败: HTTP ${response.status}`)
   }
 
-  const payload = await response.json() as ChatCompletionResponse
-  assertOpenAiPayload(payload)
-  const content = extractOpenAiMessageContent(payload).trim()
+  const payload = await response.json() as unknown
+  assertAiPayload(payload)
+  const content = extractAiMessageContent(payload, config.provider).trim()
   const postProcess = parseAiBriefingResponse(content, model)
   const source = resolveTranscriptText(session, config.preferCorrectedText)
   Object.assign(postProcess, sourceMetadata(source))
@@ -671,7 +657,7 @@ export async function askQuestionForSession(
   options?: { conversationId?: string },
 ): Promise<SessionQaResult> {
   const config = getAiConfig(settings)
-  const requestContext = createOpenAiRequestContext(config.baseUrl || DEFAULT_AI_BASE_URL, config.apiKey)
+  const requestContext = createAiRequestContext(config.provider, config.baseUrl || DEFAULT_AI_BASE_URL, config.apiKey)
   const model = resolveModelForFeature(config, 'chat')
   const promptLanguage = config.promptLanguage || DEFAULT_PROMPT_LANGUAGE
   const normalizedQuestion = question.trim()
@@ -693,28 +679,26 @@ export async function askQuestionForSession(
   }
 
   const conversationId = options?.conversationId?.trim()
+  const userPrompt = buildAskUserPrompt({
+    ...session,
+    askHistory: conversationId
+      ? (session.askHistory || []).filter((turn) => (
+        (turn.conversationId || 'default') === conversationId
+      ))
+      : session.askHistory,
+  }, normalizedQuestion, promptLanguage, config.preferCorrectedText)
 
   const response = await fetch(requestContext.completionUrl, {
     method: 'POST',
     headers: requestContext.headers,
-    body: JSON.stringify({
+    body: JSON.stringify(buildAiCompletionBody({
+      provider: config.provider,
+      thinkingMode: config.thinkingMode,
       model,
       temperature: 0.2,
-      messages: [
-        { role: 'system', content: buildAskSystemPrompt(promptLanguage) },
-        {
-          role: 'user',
-          content: buildAskUserPrompt({
-            ...session,
-            askHistory: conversationId
-              ? (session.askHistory || []).filter((turn) => (
-                (turn.conversationId || 'default') === conversationId
-              ))
-              : session.askHistory,
-          }, normalizedQuestion, promptLanguage, config.preferCorrectedText),
-        },
-      ],
-    }),
+      system: buildAskSystemPrompt(promptLanguage),
+      user: userPrompt,
+    })),
     signal: AbortSignal.timeout(120_000),
   })
 
@@ -723,9 +707,9 @@ export async function askQuestionForSession(
     throw new Error(errorText || `AI 请求失败: HTTP ${response.status}`)
   }
 
-  const payload = await response.json() as ChatCompletionResponse
-  assertOpenAiPayload(payload)
-  const content = extractOpenAiMessageContent(payload).trim()
+  const payload = await response.json() as unknown
+  assertAiPayload(payload)
+  const content = extractAiMessageContent(payload, config.provider).trim()
   const result = parseSessionQaResponse(content, model)
   result.source = resolveTranscriptText(session, config.preferCorrectedText)
   return result
@@ -745,7 +729,7 @@ export async function askQuestionForSessionStreaming(
   options?: { conversationId?: string; signal?: AbortSignal },
 ): Promise<void> {
   const config = getAiConfig(settings)
-  const requestContext = createOpenAiRequestContext(config.baseUrl || DEFAULT_AI_BASE_URL, config.apiKey)
+  const requestContext = createAiRequestContext(config.provider, config.baseUrl || DEFAULT_AI_BASE_URL, config.apiKey)
   const model = resolveModelForFeature(config, 'chat')
   const promptLanguage = config.promptLanguage || DEFAULT_PROMPT_LANGUAGE
   const normalizedQuestion = question.trim()
@@ -756,29 +740,27 @@ export async function askQuestionForSessionStreaming(
   if (!normalizedQuestion) throw new Error('请输入问题')
 
   const conversationId = options?.conversationId?.trim()
+  const userPrompt = buildAskUserPrompt({
+    ...session,
+    askHistory: conversationId
+      ? (session.askHistory || []).filter((turn) => (
+        (turn.conversationId || 'default') === conversationId
+      ))
+      : session.askHistory,
+  }, normalizedQuestion, promptLanguage, config.preferCorrectedText)
 
   const res = await fetch(requestContext.completionUrl, {
     method: 'POST',
     headers: requestContext.headers,
-    body: JSON.stringify({
+    body: JSON.stringify(buildAiCompletionBody({
+      provider: config.provider,
+      thinkingMode: config.thinkingMode,
       model,
       temperature: 0.2,
       stream: true,
-      messages: [
-        { role: 'system', content: buildAskSystemPrompt(promptLanguage) },
-        {
-          role: 'user',
-          content: buildAskUserPrompt({
-            ...session,
-            askHistory: conversationId
-              ? (session.askHistory || []).filter((turn) => (
-                (turn.conversationId || 'default') === conversationId
-              ))
-              : session.askHistory,
-          }, normalizedQuestion, promptLanguage, config.preferCorrectedText),
-        },
-      ],
-    }),
+      system: buildAskSystemPrompt(promptLanguage),
+      user: userPrompt,
+    })),
     signal: options?.signal,
   })
 
@@ -809,7 +791,7 @@ export async function askQuestionForSessionStreaming(
         const data = trimmed.slice(5).trim()
         if (data === '[DONE]') continue
 
-        const content = extractSessionQaStreamChunk(data)
+        const content = extractSessionQaStreamChunk(data, config.provider)
         if (content) {
           fullText += content
           callbacks.onChunk(fullText)
@@ -833,7 +815,7 @@ export async function generateSessionMindMap(
   settings: AppSettings,
 ): Promise<SessionMindMapResult> {
   const config = getAiConfig(settings)
-  const requestContext = createOpenAiRequestContext(config.baseUrl || DEFAULT_AI_BASE_URL, config.apiKey)
+  const requestContext = createAiRequestContext(config.provider, config.baseUrl || DEFAULT_AI_BASE_URL, config.apiKey)
   const model = resolveModelForFeature(config, 'mindmap')
   const promptLanguage = config.promptLanguage || DEFAULT_PROMPT_LANGUAGE
 
@@ -852,14 +834,14 @@ export async function generateSessionMindMap(
   const response = await fetch(requestContext.completionUrl, {
     method: 'POST',
     headers: requestContext.headers,
-    body: JSON.stringify({
+    body: JSON.stringify(buildAiCompletionBody({
+      provider: config.provider,
+      thinkingMode: config.thinkingMode,
       model,
       temperature: 0.2,
-      messages: [
-        { role: 'system', content: buildMindMapSystemPrompt(promptLanguage) },
-        { role: 'user', content: buildMindMapUserPrompt(session, promptLanguage, config.preferCorrectedText) },
-      ],
-    }),
+      system: buildMindMapSystemPrompt(promptLanguage),
+      user: buildMindMapUserPrompt(session, promptLanguage, config.preferCorrectedText),
+    })),
     signal: AbortSignal.timeout(120_000),
   })
 
@@ -868,9 +850,9 @@ export async function generateSessionMindMap(
     throw new Error(errorText || `AI 请求失败: HTTP ${response.status}`)
   }
 
-  const payload = await response.json() as ChatCompletionResponse
-  assertOpenAiPayload(payload)
-  const content = extractOpenAiMessageContent(payload).trim()
+  const payload = await response.json() as unknown
+  assertAiPayload(payload)
+  const content = extractAiMessageContent(payload, config.provider).trim()
   const mindMap = parseSessionMindMapResponse(content, model)
   const source = resolveTranscriptText(session, config.preferCorrectedText)
   Object.assign(mindMap, sourceMetadata(source))

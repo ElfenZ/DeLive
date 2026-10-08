@@ -2,11 +2,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import fs from 'fs'
 import path from 'path'
 
-const electronMock = vi.hoisted(() => ({
-  userDataPath: 'C:\\Users\\elfen\\AppData\\Local\\Temp\\kilo\\delive-ipc-test',
-  showItemInFolder: vi.fn(),
-  getPath: vi.fn(() => 'C:\\Users\\elfen\\AppData\\Local\\Temp\\kilo\\delive-ipc-test'),
-}))
+const electronMock = await vi.hoisted(async () => {
+  const os = await import('os')
+  const path = await import('path')
+  const userDataPath = path.join(os.tmpdir(), 'kilo', `delive-ipc-test-${process.pid}`)
+  return { userDataPath, showItemInFolder: vi.fn(), getPath: vi.fn(() => userDataPath) }
+})
 
 vi.mock('electron', () => ({
   app: {
@@ -41,7 +42,7 @@ describe('recording archive IPC', () => {
 
     registerAppIpc({
       ipcMain: ipcMain as never,
-      getMainWindow: () => null,
+      getMainWindow: () => ({ isDestroyed: () => false, webContents: sender }) as never,
       isTrayReady: () => false,
       hideMainWindow: vi.fn(),
       minimizeMainWindow: vi.fn(),
@@ -55,6 +56,7 @@ describe('recording archive IPC', () => {
   }
 
   beforeEach(async () => {
+    vi.resetModules()
     vi.clearAllMocks()
     await fs.promises.rm(electronMock.userDataPath, { recursive: true, force: true })
   })
@@ -66,7 +68,7 @@ describe('recording archive IPC', () => {
     const saveResult = await handlers.get('save-recording-archive')?.(
       { sender },
       {
-        sessionId: 'session:with/bad chars',
+        sessionId: 'recording-session-1',
         fileName: 'source-audio.wav',
         mimeType: 'audio/wav',
         data,
@@ -79,12 +81,65 @@ describe('recording archive IPC', () => {
       mimeType: 'audio/wav',
       fileName: 'source-audio.wav',
     }))
-    expect(saveResult.path).toContain(path.join('media', 'session_with_bad_chars', 'source-audio.wav'))
+    expect(saveResult.path).toContain(path.join('media', 'recording-session-1', 'source-audio.wav'))
     expect(fs.existsSync(saveResult.path)).toBe(true)
 
     const revealResult = await handlers.get('reveal-recording-archive')?.({ sender }, saveResult.path) as { ok: boolean }
     expect(revealResult).toEqual({ ok: true })
     expect(electronMock.showItemInFolder).toHaveBeenCalledWith(saveResult.path)
+  })
+
+  it('returns no recovery notices or skips for independent recordings and empty directories after manual moves', async () => {
+    const { handlers, sender } = await setupHandlers()
+    const { getFileStorageService } = await import('../../electron/fileStorage')
+    const service = getFileStorageService()
+    const saved: string[] = []
+    for (const sessionId of ['independent-record', 'moved-record']) {
+      const result = await handlers.get('save-recording-archive')!({ sender }, {
+        sessionId, fileName: 'source-audio.wav', mimeType: 'audio/wav', data: new Uint8Array([1, 2, 3]).buffer,
+      }) as { ok: boolean; path: string }
+      expect(result.ok).toBe(true)
+      saved.push(result.path)
+    }
+    const movedPath = path.join(electronMock.userDataPath, 'moved-record.wav')
+    await fs.promises.rename(saved[1], movedPath)
+    const empty = await service.sessionDirectory('empty-record', true)
+    const statePath = path.join(service.userData, 'local-file-storage', 'state.json')
+    const before = await fs.promises.readFile(statePath, 'utf8')
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = await handlers.get('recover-recording-archives')!({ sender }, []) as import('../../shared/electronApi').RecordingArchiveRecoverResult
+      expect(result).toMatchObject({ ok: true, recovered: [], skipped: [], ignoredCount: 0, notices: [] })
+    }
+    expect(await fs.promises.readFile(statePath, 'utf8')).toBe(before)
+    expect(await fs.promises.readFile(saved[0])).toEqual(Buffer.from([1, 2, 3]))
+    expect(await fs.promises.readFile(movedPath)).toEqual(Buffer.from([1, 2, 3]))
+    expect(await fs.promises.readdir(path.dirname(saved[1]))).toEqual([])
+    expect(await fs.promises.readdir(empty)).toEqual([])
+  })
+
+  it('does not retry or warn for an acknowledged manually moved group, retains files and reports new groups', async () => {
+    const { handlers, sender } = await setupHandlers()
+    const { getFileStorageService } = await import('../../electron/fileStorage')
+    const service = getFileStorageService()
+    const directory = await service.sessionDirectory('moved-group', true)
+    const metadata = path.join(directory, 'source-audio.json.tmp')
+    await fs.promises.writeFile(metadata, '{"sessionId":"moved-group"}')
+    const first = await handlers.get('recover-recording-archives')!({ sender }, []) as import('../../shared/electronApi').RecordingArchiveRecoverResult
+    expect(first.skipped).toHaveLength(1)
+    expect(first.notices).toHaveLength(1)
+    const item = first.notices![0]
+    await service.acknowledgeRecordingRecovery({ key: item.key, evidence: item.evidence, activeSessionIds: [] })
+    const repeated = await handlers.get('recover-recording-archives')!({ sender }, []) as import('../../shared/electronApi').RecordingArchiveRecoverResult
+    expect(repeated.skipped).toEqual([])
+    expect(repeated.recovered).toEqual([])
+    expect(repeated.ignoredCount).toBe(1)
+    expect(repeated.notices?.filter((notice) => !notice.acknowledged)).toEqual([])
+    expect(await fs.promises.readdir(directory)).toEqual(['source-audio.json.tmp'])
+    expect(await fs.promises.readFile(metadata, 'utf8')).toBe('{"sessionId":"moved-group"}')
+    const other = await service.sessionDirectory('new-group', true)
+    await fs.promises.writeFile(path.join(other, 'source-audio.json.tmp'), '{"sessionId":"new-group"}')
+    const fresh = await handlers.get('recover-recording-archives')!({ sender }, []) as import('../../shared/electronApi').RecordingArchiveRecoverResult
+    expect(fresh.notices?.filter((notice) => !notice.acknowledged).map((notice) => notice.sessionId)).toEqual(['new-group'])
   })
 
   it('streams PCM chunks to a temp archive and finalizes a WAV atomically', async () => {
@@ -132,6 +187,26 @@ describe('recording archive IPC', () => {
     expect(fs.existsSync(`${finalizeResult.path}.tmp`)).toBe(false)
   })
 
+  it('rejects invalid identifiers rather than sanitizing them into another record directory', async () => {
+    const { handlers, sender } = await setupHandlers()
+    const result = await handlers.get('save-recording-archive')!({ sender }, { sessionId: '../outside', fileName: 'source-audio.wav', mimeType: 'audio/wav', data: new Uint8Array([1]).buffer }) as { ok: boolean }
+    expect(result.ok).toBe(false)
+    expect(fs.existsSync(path.join(electronMock.userDataPath, 'outside'))).toBe(false)
+  })
+
+  it('skips active recordings during recovery and retains non-empty PCM when aborting', async () => {
+    const { handlers, sender } = await setupHandlers()
+    const sessionId = 'active-recovery-session'
+    await handlers.get('begin-recording-archive')!({ sender }, { sessionId, sampleRate: 16000, channels: 1, bitsPerSample: 16 })
+    await handlers.get('append-recording-archive')!({ sender }, { sessionId, data: new Int16Array([3]).buffer })
+    const result = await handlers.get('recover-recording-archives')!({ sender }) as { recovered: unknown[]; skipped: unknown[] }
+    expect(result.recovered).toEqual([])
+    expect(result.skipped).toEqual([{ sessionId, reason: 'active-recording' }])
+    const aborted = await handlers.get('abort-recording-archive')!({ sender }, { sessionId }) as { ok: boolean }
+    expect(aborted.ok).toBe(false)
+    expect((await fs.promises.stat(path.join(electronMock.userDataPath, 'media', sessionId, 'source-audio.pcm.tmp'))).size).toBe(2)
+  })
+
   it('does not truncate an active archive when begin is repeated for the same session', async () => {
     const { handlers, sender } = await setupHandlers()
     const request = { sessionId: 'same-session', sampleRate: 16000, channels: 1, bitsPerSample: 16 }
@@ -159,11 +234,6 @@ describe('recording archive IPC', () => {
     const { handlers, sender } = await setupHandlers()
     const request = { sessionId: 'aborted-session', sampleRate: 16000, channels: 1, bitsPerSample: 16 }
     await handlers.get('begin-recording-archive')?.({ sender }, request)
-    await handlers.get('append-recording-archive')?.(
-      { sender },
-      { sessionId: request.sessionId, data: new Int16Array([1, 2]).buffer },
-    )
-
     const aborted = await handlers.get('abort-recording-archive')?.(
       { sender },
       { sessionId: request.sessionId },
@@ -196,7 +266,9 @@ describe('recording archive IPC', () => {
       { sessionId: 'recover-session', data: new Int16Array([42]).buffer },
     )
 
-    const recoverResult = await handlers.get('recover-recording-archives')?.({ sender }) as {
+    vi.resetModules()
+    const { handlers: restartedHandlers } = await setupHandlers()
+    const recoverResult = await restartedHandlers.get('recover-recording-archives')?.({ sender }) as {
       ok: boolean
       recovered: Array<{ ok: boolean; sessionId: string; path: string; size: number }>
     }
@@ -219,7 +291,9 @@ describe('recording archive IPC', () => {
       { sessionId: 'empty-session', sampleRate: 16000, channels: 1, bitsPerSample: 16 },
     )
 
-    const recoverResult = await handlers.get('recover-recording-archives')?.({ sender }) as {
+    vi.resetModules()
+    const { handlers: restartedHandlers } = await setupHandlers()
+    const recoverResult = await restartedHandlers.get('recover-recording-archives')?.({ sender }) as {
       ok: boolean
       recovered: Array<{ ok: boolean; sessionId: string; path: string; size: number }>
       skipped: Array<{ sessionId: string; reason: string; error?: string }>
@@ -233,7 +307,7 @@ describe('recording archive IPC', () => {
     expect(fs.existsSync(path.join(electronMock.userDataPath, 'media', 'empty-session', 'source-audio.wav'))).toBe(false)
   })
 
-  it('recovers PCM archives with missing metadata using the default PCM format', async () => {
+  it('preserves PCM archives with missing metadata instead of guessing their format', async () => {
     const { handlers, sender } = await setupHandlers()
 
     await handlers.get('begin-recording-archive')?.(
@@ -246,25 +320,21 @@ describe('recording archive IPC', () => {
     )
     await fs.promises.rm(path.join(electronMock.userDataPath, 'media', 'missing-meta-session', 'source-audio.json.tmp'), { force: true })
 
-    const recoverResult = await handlers.get('recover-recording-archives')?.({ sender }) as {
+    vi.resetModules()
+    const { handlers: restartedHandlers } = await setupHandlers()
+    const recoverResult = await restartedHandlers.get('recover-recording-archives')?.({ sender }) as {
       ok: boolean
       recovered: Array<{ ok: boolean; sessionId: string; path: string; size: number }>
       skipped: Array<{ sessionId: string; reason: string }>
     }
 
     expect(recoverResult.ok).toBe(true)
-    expect(recoverResult.recovered).toHaveLength(1)
-    expect(recoverResult.recovered[0]).toEqual(expect.objectContaining({
-      sessionId: 'missing-meta-session',
-      size: 46,
-    }))
-    expect(recoverResult.skipped || []).toEqual([])
-    const wav = await fs.promises.readFile(recoverResult.recovered[0].path)
-    expect(wav.subarray(0, 4).toString('ascii')).toBe('RIFF')
-    expect(wav.readUInt32LE(24)).toBe(16000)
+    expect(recoverResult.recovered).toHaveLength(0)
+    expect(recoverResult.skipped).toEqual([{ sessionId: 'missing-meta-session', reason: 'missing-metadata' }])
+    expect(fs.existsSync(path.join(electronMock.userDataPath, 'media', 'missing-meta-session', 'source-audio.pcm.tmp'))).toBe(true)
   })
 
-  it('recovers PCM archives with empty metadata using the default PCM format', async () => {
+  it('preserves PCM and invalid metadata instead of manufacturing a recovered WAV', async () => {
     const { handlers, sender } = await setupHandlers()
 
     await handlers.get('begin-recording-archive')?.(
@@ -277,18 +347,17 @@ describe('recording archive IPC', () => {
     )
     await fs.promises.writeFile(path.join(electronMock.userDataPath, 'media', 'empty-meta-session', 'source-audio.json.tmp'), '')
 
-    const recoverResult = await handlers.get('recover-recording-archives')?.({ sender }) as {
+    vi.resetModules()
+    const { handlers: restartedHandlers } = await setupHandlers()
+    const recoverResult = await restartedHandlers.get('recover-recording-archives')?.({ sender }) as {
       ok: boolean
       recovered: Array<{ ok: boolean; sessionId: string; path: string; size: number }>
       skipped: Array<{ sessionId: string; reason: string }>
     }
 
     expect(recoverResult.ok).toBe(true)
-    expect(recoverResult.recovered).toHaveLength(1)
-    expect(recoverResult.recovered[0]).toEqual(expect.objectContaining({
-      sessionId: 'empty-meta-session',
-      size: 46,
-    }))
-    expect(recoverResult.skipped || []).toEqual([])
+    expect(recoverResult.recovered).toHaveLength(0)
+    expect(recoverResult.skipped).toEqual([expect.objectContaining({ sessionId: 'empty-meta-session', reason: 'invalid-metadata' })])
+    expect(fs.existsSync(path.join(electronMock.userDataPath, 'media', 'empty-meta-session', 'source-audio.pcm.tmp'))).toBe(true)
   })
 })

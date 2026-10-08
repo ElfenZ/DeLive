@@ -1,4 +1,5 @@
 import type { AppSettings, Tag, Topic } from '../types'
+import { projectRepository } from './projectRepository'
 import {
   createTransaction,
   getDefaultSettings,
@@ -143,7 +144,10 @@ export function saveTags(tags: Tag[]): void {
 
 export function getSettings(): AppSettings {
   const settings = readJsonFromLocalStorage<AppSettings | null>(STORAGE_KEYS.SETTINGS, null)
-  return settings ?? getDefaultSettings()
+  const value = settings ?? getDefaultSettings()
+  return { ...value, autoSavePublishedCorrection: value.autoSavePublishedCorrection === undefined
+    ? value.aiPostProcess?.autoExportCorrectedMarkdown === true
+    : value.autoSavePublishedCorrection === true }
 }
 
 export function saveSettings(settings: AppSettings): void {
@@ -156,9 +160,9 @@ export function saveSettings(settings: AppSettings): void {
 }
 
 export function getTopics(): Topic[] {
-  return readJsonFromLocalStorage(STORAGE_KEYS.TOPICS, [] as Topic[])
+  return projectRepository.read()
 }
 
 export function saveTopics(topics: Topic[]): void {
-  writeJsonToLocalStorage(STORAGE_KEYS.TOPICS, topics, 'Failed to save topics to localStorage:')
+  projectRepository.write(topics)
 }

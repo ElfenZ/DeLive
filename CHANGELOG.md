@@ -11,6 +11,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 2.5.12 Prepared / 卡顿修复测试版（未发布）
+- Skip unchanged media/naming/job replay writes and retain unrelated normalized Session/content references during single-record metadata updates. Preserve durable write queues, rollback and correction checkpoints.
+- 不变的媒体、命名和任务状态不重复落盘；编辑单条记录不重建无关记录及内容引用，保留持久化队列、回滚与纠错检查点。
+- Avoid repeated current-title naming/state notifications. Native legacy Markdown selection performs logical context synchronization without an unnecessary pre-dialog audio rename pass.
+- 相同标题不重复改名和通知；选择旧纠错稿前只同步逻辑上下文，不先等待无关音频改名。
+- Add per-item recording recovery acknowledgement in Settings → Data Management. Matching managed-file evidence suppresses repeated reminders/recovery attempts; changed/new evidence remains visible. No files are deleted, moved or adopted by acknowledgement.
+- 设置 → 数据管理可逐项确认手动迁移的录音恢复项，相同托管文件证据不重复提醒或重试，新的或变化的异常仍显示；确认操作不删除、移动或接管文件。
+- Add opt-in bounded numeric performance diagnostics, disabled by default, without transcript content, credentials, paths or raw error payloads. Larger isolated UI fixtures cover 105 records and approximately 200,000 synthetic tokens.
+- 增加默认关闭、有数量上限的脱敏性能诊断，不含正文、密钥、路径或原始错误；隔离界面回归扩展到 105 条记录和约 20 万个模拟词。
+- Treat independently organized recordings/transcripts and empty recording directories after manual moves as normal. Keep temporary recording groups, unsafe files and pending publication journals visible without deleting files or registrations.
+- 录音与转录分开整理、手动迁移后留下的空录音目录不再提示异常；临时录音、异常文件和未完成发布日志仍保留提示，不删除文件或登记。
+- Synchronize open topic management panels with folder selection and isolate directory picker state per topic. Different topics retain independent export directories; existing files and task ownership remain unchanged.
+- 已打开的主题管理面板跟随主题选择，目录选择状态按主题隔离；各主题分别保存自动导出目录，不移动已有文件或改变任务归属。
+- Unsigned Windows x64 installer and portable packages are built locally; no public release is implied. Native OS dialogs remain substituted in automated UI tests; real-environment acceptance is still required.
+- 本地已生成未签名 Windows x64 安装包和便携版，不代表公开发布；自动界面测试中的 OS 对话框仍使用替身，真实环境还须验收。
+
+### 2.5.11 Prepared / 新版准备（未发布）
+- Review integrates hierarchical topic folders, unclassified records, archive/restore and topic management. Folder, text, date and tag filters combine while all history retains every record.
+- 回顾整合层级主题文件夹、未分类、归档恢复和主题管理；文件夹、搜索、日期和标签组合筛选，关联记录始终保留在全部历史。
+- Details open on Summary for existing, empty, pending and failed AI summaries. Browsing does not change new-task ownership; only explicit topic recording/import or creation selection assigns it.
+- 详情默认进入摘要，包括未生成、生成中和失败状态。浏览不改变新任务归属，只有明确在主题录音/导入或选择创建归属才关联。
+- Native audio-location selection changes future writes only, independently of automatic text export. Registered old audio stays readable and mutable at its original location. Explicit migration covers every managed source root and retains old copies until separately confirmed cleanup.
+- 原生音频位置选择仅影响新写入，与自动导出目录独立；旧音频仍按登记位置读取和管理。显式迁移覆盖全部托管来源，旧副本保留至另行确认清理。
+- Local file state upgrades from version 1 to version 2 without automatically moving bytes. Old installations reject the new registry, so direct downgrade is unsupported. Preserve the full profile/registry and audio copies before any restore; JSON/cloud backup alone is not a media backup or a directory permission grant.
+- 本机文件登记由版本 1 升级为版本 2，不自动移动文件。旧安装版会拒绝新版登记，不支持直接降级。恢复前须保留完整本机配置、登记和音频副本；JSON/云备份不包含音频字节，也不能恢复目录授权。
+- Manifest and release notes are prepared only. No installer, deployment or release is implied by these changes.
+- 本次仅准备版本字段和更新说明，不代表安装包已经构建、部署或发布。
+
 ---
 
 ## [2.5.10] - 2026-08-27

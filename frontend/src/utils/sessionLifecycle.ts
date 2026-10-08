@@ -13,27 +13,35 @@ import {
 } from './transcriptState'
 import { formatDate, formatTime, generateId } from './storageUtils'
 import { restoreStoredTokens } from './sessionSnapshot'
+import { normalizeProjectIds } from './projectSchema'
 
 export function createDraftSession(options: {
+  id?: string
   now?: number
   title: string
   providerId?: string
   topicId?: string
+  projectIds?: string[]
+  defaultSaveProjectId?: string
   sourceMeta?: TranscriptSourceMeta
   meetingContext?: MeetingContextSnapshot
   recognitionConfig?: RecognitionConfigSnapshot
 }): TranscriptSession {
   const now = options.now ?? Date.now()
+  const projectIds = normalizeProjectIds(options.projectIds, options.topicId)
 
   return {
-    id: generateId(),
+    id: options.id || generateId(),
     title: options.title,
+    titleRevision: 0,
     date: formatDate(now),
     time: formatTime(now),
     createdAt: now,
     updatedAt: now,
     transcript: '',
-    topicId: options.topicId,
+    projectIds,
+    topicId: projectIds[0],
+    defaultSaveProjectId: options.defaultSaveProjectId ?? projectIds[0],
     tagIds: [],
     providerId: options.providerId,
     sourceMeta: options.sourceMeta,

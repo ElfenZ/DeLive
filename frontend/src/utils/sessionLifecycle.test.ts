@@ -38,6 +38,17 @@ describe('sessionLifecycle', () => {
     vi.useRealTimers()
   })
 
+  it('uses a preallocated session id for durable video work', () => {
+    const draft = createDraftSession({
+      id: 'video-session-123',
+      now: 123,
+      title: 'Local video',
+    })
+
+    expect(draft.id).toBe('video-session-123')
+    expect(draft.createdAt).toBe(123)
+  })
+
   it('restores runtime state from a persisted session', () => {
     const runtimeState = buildRuntimeStateFromSession({
       id: 'session-1',

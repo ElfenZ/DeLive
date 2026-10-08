@@ -10,6 +10,8 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
+    // Native Electron/PowerShell fixtures contend with transforms on high-core Windows hosts.
+    maxWorkers: 4,
     include: ['src/**/*.test.ts'],
   },
 })

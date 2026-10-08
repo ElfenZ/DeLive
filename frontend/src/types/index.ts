@@ -1,5 +1,7 @@
 // 重新导出 ASR 相关类型
 export * from './asr'
+export type { ManagedAssetReference, CorrectedMarkdownFileState, LocalFileOperationStatus } from '../../../shared/fileStorage'
+import type { ManagedAssetReference, CorrectedMarkdownFileState, ManagedNamingState } from '../../../shared/fileStorage'
 
 // 兼容旧代码：保留 Soniox 类型别名
 export type { SonioxToken, SonioxResponse, SonioxConfig } from './asr/vendors/soniox'
@@ -10,6 +12,8 @@ export interface Topic {
   name: string
   emoji: string
   description?: string
+  parentId?: string
+  archivedAt?: number
   createdAt: number
   updatedAt: number
 }
@@ -123,6 +127,27 @@ export interface ResolvedCorrectionPatch {
   reason: string
   state: ResolvedCorrectionPatchState
   rejectionReason?: string
+  origin?: 'ai' | 'manual'
+  locationVerified?: boolean
+  modelIntent?: ModelCorrectionPatch
+  recoveredFromPatchId?: string
+}
+
+export interface CorrectionEditExpectation {
+  target: 'draft' | 'published' | 'new'
+  id?: string
+  revision: number
+  baseTranscriptHash: string
+}
+
+export interface ManualCorrectionEdit {
+  sourceStart: number
+  sourceEnd: number
+  sourceText: string
+  replacement: string
+  patchId?: string
+  recoveredFromPatchId?: string
+  confirmedConflictIds?: string[]
 }
 
 export interface CorrectionPatchSafetyLimits {
@@ -172,10 +197,14 @@ export interface CorrectionShardProgress extends CorrectionShardPlan {
 }
 
 export type CorrectionStructuredOutputMode = 'prompt-json' | 'json_object' | 'json_schema'
+export type AiProviderProtocol = 'openai-compatible' | 'anthropic-compatible'
+export type AiThinkingMode = 'default' | 'disabled'
 
 export interface CorrectionConfigSnapshot {
   model: string
   baseUrl: string
+  provider?: AiProviderProtocol
+  thinkingMode?: AiThinkingMode
   promptLanguage: 'zh' | 'en'
   promptVersion: string
   schemaVersion: string
@@ -190,7 +219,7 @@ export interface CorrectionConfigSnapshot {
   safetyLimits: CorrectionPatchSafetyLimits
   credentialRef: 'ai-post-process'
   credentialVersion?: number
-  identityVersion?: 1
+  identityVersion?: 1 | 2
   configIdentity?: string
   transport?: 'json' | 'sse'
 }
@@ -232,6 +261,7 @@ export interface TranscriptCorrectionPublished {
   patches: ResolvedCorrectionPatch[]
   model: string
   completedAt: number
+  safetyLimits?: CorrectionPatchSafetyLimits
   stats: {
     applied: number
     reverted: number
@@ -324,6 +354,7 @@ export interface TranscriptAutoPostProcessWorkflow {
   step: TranscriptAutoPostProcessWorkflowStep
   correctionMode: 'quick' | 'review'
   titleAtStart: string
+  titleRevisionAtStart?: number
   startedAt: number
   updatedAt: number
   completedAt?: number
@@ -338,11 +369,20 @@ export interface TranscriptSourceMeta {
   sourceLabel?: string
   platform?: 'win32' | 'darwin' | 'linux' | 'unknown'
   providerMode?: 'realtime' | 'full-session-retranscription' | 'local-runtime' | 'unknown'
-  sourceKind?: 'recording-audio' | 'uploaded-audio'
+  sourceKind?: 'recording-audio' | 'uploaded-audio' | 'extracted-video-audio'
   audioPath?: string
   audioMimeType?: string
   audioFileName?: string
   audioSize?: number
+  audioAvailable?: boolean
+  audioError?: string
+  originalFileName?: string
+  originalMimeType?: string
+  originalFileSize?: number
+  managedAsset?: ManagedAssetReference
+  originalSourceId?: string
+  originalSourceRevision?: number
+  currentOriginalFileName?: string
   captureAudioSource?: 'system' | 'microphone' | 'mixed'
 }
 
@@ -408,6 +448,7 @@ export interface TranscriptSession {
   id: string
   schemaVersion?: number
   title: string
+  titleRevision?: number
   date: string // YYYY-MM-DD 格式
   time: string // HH:mm 格式
   createdAt: number // 时间戳
@@ -416,6 +457,10 @@ export interface TranscriptSession {
   translatedTranscript?: TranscriptTranslationData
   duration?: number // 毫秒
   topicId?: string // 归属的主题ID
+  projectIds?: string[]
+  defaultSaveProjectId?: string
+  correctedMarkdownFile?: CorrectedMarkdownFileState
+  managedNaming?: ManagedNamingState
   tagIds?: string[] // 关联的标签ID列表
   tokens?: TranscriptTokenData[] // 带时间戳的 tokens（用于 SRT 导出）
   speakers?: TranscriptSpeaker[]
@@ -432,6 +477,21 @@ export interface TranscriptSession {
   status?: TranscriptSessionStatus
   lastPersistedAt?: number
   wasInterrupted?: boolean
+}
+
+export interface DeletedSessionSnapshot {
+  version: 1
+  id: string
+  originalSessionId: string
+  title: string
+  createdAt: number
+  deletedAt: number
+  projectIds: string[]
+  sourceLabel?: string
+  originalFileName?: string
+  postProcess?: TranscriptPostProcess
+  askHistory?: TranscriptAskTurn[]
+  mindMap?: TranscriptMindMap
 }
 
 // 应用状态类型
@@ -456,7 +516,8 @@ export interface AiGlossaryEntry {
 
 export interface AiPostProcessConfig {
   enabled?: boolean
-  provider?: 'openai-compatible'
+  provider?: AiProviderProtocol
+  thinkingMode?: AiThinkingMode
   baseUrl?: string
   apiKey?: string
   credentialVersion?: number
@@ -531,6 +592,7 @@ export interface CloudBackupFileInfo {
 
 // 应用设置（支持多提供商）
 export interface AppSettings {
+  autoSavePublishedCorrection?: boolean
   // 兼容旧版：保留单一 API Key（用于 Soniox）
   apiKey: string
   languageHints: string[]

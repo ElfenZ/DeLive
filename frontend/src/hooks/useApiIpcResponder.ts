@@ -1,13 +1,36 @@
 import { useEffect } from 'react'
 import { useSessionStore } from '../stores/sessionStore'
-import { getTags, getTopics } from '../utils/settingsStorage'
+import { getTags } from '../utils/settingsStorage'
+import { useTopicStore } from '../stores/topicStore'
+import { getDirectProjectIds, normalizeProjects, selectProjectSessions } from '../utils/projectSchema'
+import type { ApiProjectData, ApiSessionDetail, ApiSessionFilter, ApiSessionSummary } from '../../../shared/apiTypes'
 import type {
-  SessionSummary,
-  SessionDetail,
   ApiRecordingStatus,
 } from '../../../shared/electronApi'
 import type { RecordingState } from '../../../shared/recordingState'
-import type { TranscriptSession } from '../types'
+import type { Topic, TranscriptSession } from '../types'
+
+export function selectApiSessions(sessions: TranscriptSession[], projects: Topic[], filter: ApiSessionFilter = {}, query = ''): TranscriptSession[] {
+  let selected = sessions
+  if (filter.topicId) selected = selectProjectSessions(selected, projects, filter.topicId, false)
+  if (filter.projectId) selected = selectProjectSessions(selected, projects, filter.projectId, filter.includeDescendants !== false)
+  const lowerQuery = query.toLowerCase()
+  const seen = new Set<string>()
+  return selected.filter(session => {
+    if (seen.has(session.id) || (lowerQuery && !session.title.toLowerCase().includes(lowerQuery)
+      && !(session.transcript ?? '').toLowerCase().includes(lowerQuery))) return false
+    seen.add(session.id)
+    return true
+  })
+}
+
+export function toApiProjects(projects: Topic[]): ApiProjectData[] {
+  return normalizeProjects(projects).map(project => ({
+    id: project.id, name: project.name, emoji: project.emoji, description: project.description,
+    parentId: project.parentId, archivedAt: project.archivedAt,
+    createdAt: project.createdAt, updatedAt: project.updatedAt,
+  }))
+}
 
 export function projectApiRecordingStatus(
   recordingState: RecordingState,
@@ -20,7 +43,8 @@ export function projectApiRecordingStatus(
   }
 }
 
-export function toSessionSummary(session: TranscriptSession): SessionSummary {
+export function toSessionSummary(session: TranscriptSession): ApiSessionSummary {
+  const projectIds = getDirectProjectIds(session)
   return {
     id: session.id,
     title: session.title,
@@ -30,7 +54,8 @@ export function toSessionSummary(session: TranscriptSession): SessionSummary {
     updatedAt: session.updatedAt,
     duration: session.duration,
     status: session.status,
-    topicId: session.topicId,
+    topicId: projectIds[0],
+    projectIds,
     tagIds: session.tagIds,
     providerId: session.providerId,
     hasSummary: Boolean(session.postProcess?.summary),
@@ -39,7 +64,8 @@ export function toSessionSummary(session: TranscriptSession): SessionSummary {
   }
 }
 
-export function toSessionDetail(session: TranscriptSession): SessionDetail {
+export function toSessionDetail(session: TranscriptSession): ApiSessionDetail {
+  const projectIds = getDirectProjectIds(session)
   return {
     id: session.id,
     title: session.title,
@@ -49,7 +75,8 @@ export function toSessionDetail(session: TranscriptSession): SessionDetail {
     updatedAt: session.updatedAt,
     duration: session.duration,
     status: session.status,
-    topicId: session.topicId,
+    topicId: projectIds[0],
+    projectIds,
     tagIds: session.tagIds,
     providerId: session.providerId,
     transcript: session.transcript ?? '',
@@ -144,46 +171,42 @@ export function useApiIpcResponder(): void {
     const cleanups: Array<() => void> = [unsubscribeStore]
 
     cleanups.push(
-      api.onApiGetSessions(() => {
+      api.onApiGetSessions((_event, requestId, filter) => {
         const sessions = useSessionStore.getState().sessions
-        api.apiRespondSessions(sessions.map(toSessionSummary))
+        api.apiRespondSessions(selectApiSessions(sessions, useTopicStore.getState().topics, filter).map(toSessionSummary), requestId)
       }),
     )
 
     cleanups.push(
-      api.onApiGetSessionDetail((_event, sessionId) => {
+      api.onApiGetSessionDetail((_event, sessionId, requestId) => {
         const session = useSessionStore.getState().sessions.find(s => s.id === sessionId)
-        api.apiRespondSessionDetail(session ? toSessionDetail(session) : null)
+        api.apiRespondSessionDetail(session ? toSessionDetail(session) : null, requestId)
       }),
     )
 
     cleanups.push(
-      api.onApiSearchSessions((_event, query) => {
-        const lowerQuery = query.toLowerCase()
-        const sessions = useSessionStore.getState().sessions.filter(s =>
-          s.title.toLowerCase().includes(lowerQuery)
-          || (s.transcript ?? '').toLowerCase().includes(lowerQuery),
-        )
-        api.apiRespondSearchSessions(sessions.map(toSessionSummary))
+      api.onApiSearchSessions((_event, query, requestId, filter) => {
+        const sessions = selectApiSessions(useSessionStore.getState().sessions, useTopicStore.getState().topics, filter, query)
+        api.apiRespondSearchSessions(sessions.map(toSessionSummary), requestId)
       }),
     )
 
     cleanups.push(
-      api.onApiGetTopics(() => {
-        api.apiRespondTopics(getTopics())
+      api.onApiGetTopics((_event, requestId) => {
+        api.apiRespondTopics(toApiProjects(useTopicStore.getState().topics), requestId)
       }),
     )
 
     cleanups.push(
-      api.onApiGetTags(() => {
-        api.apiRespondTags(getTags())
+      api.onApiGetTags((_event, requestId) => {
+        api.apiRespondTags(getTags().map(tag => ({ id: tag.id, name: tag.name, color: tag.color })), requestId)
       }),
     )
 
     cleanups.push(
-      api.onApiGetRecordingStatus(() => {
+      api.onApiGetRecordingStatus((_event, requestId) => {
         const { recordingState, currentSessionId } = useSessionStore.getState()
-        api.apiRespondRecordingStatus(projectApiRecordingStatus(recordingState, currentSessionId))
+        api.apiRespondRecordingStatus(projectApiRecordingStatus(recordingState, currentSessionId), requestId)
       }),
     )
 

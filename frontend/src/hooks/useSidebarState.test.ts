@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+import { getSidebarWidth, parseSidebarPreference } from './useSidebarState'
 
 describe('sidebar state – keyboard shortcut detection', () => {
   const isToggleShortcut = (e: { ctrlKey: boolean; metaKey: boolean; key: string }) =>
@@ -22,14 +23,14 @@ describe('sidebar state – keyboard shortcut detection', () => {
 })
 
 describe('sidebar state – width mapping', () => {
-  const getWidth = (collapsed: boolean) => collapsed ? 56 : 224
+  const getWidth = getSidebarWidth
 
   it('collapsed = 56px', () => {
     expect(getWidth(true)).toBe(56)
   })
 
-  it('expanded = 224px', () => {
-    expect(getWidth(false)).toBe(224)
+  it('expanded = 176px', () => {
+    expect(getWidth(false)).toBe(176)
   })
 })
 
@@ -40,10 +41,11 @@ describe('sidebar state – persistence key', () => {
   })
 
   it('initial collapsed state from string', () => {
-    const fromStorage = (val: string | null) => val === 'true'
+    const fromStorage = parseSidebarPreference
     expect(fromStorage('true')).toBe(true)
     expect(fromStorage('false')).toBe(false)
-    expect(fromStorage(null)).toBe(false)
+    expect(fromStorage(null)).toBe(true)
+    expect(fromStorage('malformed')).toBe(true)
   })
 })
 

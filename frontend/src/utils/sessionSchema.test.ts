@@ -2,6 +2,35 @@ import { describe, expect, it } from 'vitest'
 import { CURRENT_SESSION_SCHEMA_VERSION, normalizeTranscriptSession } from './sessionSchema'
 
 describe('sessionSchema', () => {
+  it('round-trips optional manual/rejected evidence without trusting historical placeholder locations', () => {
+    const rejected = {
+      id: 'rejected', shardId: 's', op: 'replace', sourceStart: 0, sourceEnd: 0, sourceText: '', replacement: 'new',
+      sourceTextHash: 'hash', category: 'homophone', reason: 'Original AI reason', state: 'rejected', rejectionReason: 'anchor-not-unique',
+    }
+    const source = {
+      id: 'manual', title: 'Manual', date: '2026-10-07', time: '10:00', createdAt: 1, updatedAt: 1, transcript: 'old text',
+      correction: {
+        status: 'done', mode: 'quick', published: {
+          id: 'publication', formatVersion: 1, revision: 2, baseTranscriptHash: 'hash', outputTextHash: 'out', correctedText: 'new text',
+          model: 'manual', completedAt: 1, stats: { applied: 1, reverted: 0, rejected: 2 }, patches: [
+            rejected,
+            { ...rejected, id: 'new-rejected', origin: 'ai', locationVerified: false, modelIntent: {
+              op: 'replace', oldText: 'old', replacement: 'new', before: '', after: ' text', category: 'homophone', reason: 'intent', apiKey: 'drop',
+            } },
+            { ...rejected, id: 'manual-patch', sourceEnd: 3, sourceText: 'old', state: 'applied', rejectionReason: undefined,
+              origin: 'manual', locationVerified: true, recoveredFromPatchId: 'rejected' },
+          ],
+        },
+      },
+    }
+    const normalized = normalizeTranscriptSession(source as never)
+    expect(normalized.correction?.published?.patches[0].locationVerified).toBeUndefined()
+    expect(normalized.correction?.published?.patches[1]).toMatchObject({ origin: 'ai', locationVerified: false, modelIntent: { oldText: 'old', after: ' text' } })
+    expect(normalized.correction?.published?.patches[1].modelIntent).not.toHaveProperty('apiKey')
+    expect(normalized.correction?.published?.patches[2]).toMatchObject({ origin: 'manual', locationVerified: true, recoveredFromPatchId: 'rejected' })
+    expect(normalizeTranscriptSession(JSON.parse(JSON.stringify(normalized)))).toEqual(normalized)
+    expect(normalized.schemaVersion).toBe(CURRENT_SESSION_SCHEMA_VERSION)
+  })
   it('normalizes ask history entries and citations', () => {
     const normalized = normalizeTranscriptSession({
       id: 'session-1',
@@ -118,6 +147,38 @@ describe('sessionSchema', () => {
       transcript: 'Old transcript',
     })
     expect(oldSession.sourceMeta).toBeUndefined()
+  })
+
+  it('preserves extracted video audio metadata without accepting unknown fields', () => {
+    const normalized = normalizeTranscriptSession({
+      id: 'video-session',
+      title: 'Video Session',
+      createdAt: 1,
+      updatedAt: 2,
+      transcript: 'Transcript',
+      sourceMeta: {
+        captureMode: 'file',
+        sourceKind: 'extracted-video-audio',
+        audioPath: 'C:/Users/test/AppData/Roaming/DeLive/media/video-session/source-audio.mp3',
+        audioMimeType: 'audio/mpeg',
+        audioFileName: 'source-audio.mp3',
+        audioSize: 2048,
+        originalFileName: 'meeting.mkv',
+        originalMimeType: 'video/x-matroska',
+        originalFileSize: 50_000,
+        apiKey: 'must-not-survive',
+      } as never,
+    })
+
+    expect(normalized.sourceMeta).toEqual(expect.objectContaining({
+      sourceKind: 'extracted-video-audio',
+      audioFileName: 'source-audio.mp3',
+      audioSize: 2048,
+      originalFileName: 'meeting.mkv',
+      originalMimeType: 'video/x-matroska',
+      originalFileSize: 50_000,
+    }))
+    expect(normalized.sourceMeta).not.toHaveProperty('apiKey')
   })
 
   it('migrates v3 corrected text to an immutable legacy result idempotently', () => {
@@ -244,6 +305,8 @@ describe('sessionSchema', () => {
     })
     expect(normalized.correction?.draft?.config.configIdentity).toBeUndefined()
     expect(normalized.correction?.draft?.config.transport).toBeUndefined()
+    expect(normalized.correction?.draft?.config.provider).toBe('openai-compatible')
+    expect(normalized.correction?.draft?.config.thinkingMode).toBe('default')
     expect(normalized.correction?.draft?.shards[0]).toMatchObject({
       stage: 'retry-countdown', nextRetryAt: 100, timeoutKind: 'idle', timeoutMs: 60_000,
     })
@@ -264,7 +327,7 @@ describe('sessionSchema', () => {
         updatedAt: 20,
       },
     })
-    expect(normalized.schemaVersion).toBe(7)
+    expect(normalized.schemaVersion).toBe(CURRENT_SESSION_SCHEMA_VERSION)
     expect(normalized.autoPostProcessWorkflow).toEqual({
       version: 1,
       status: 'waiting-review',

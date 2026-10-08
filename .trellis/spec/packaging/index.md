@@ -9,6 +9,7 @@
 - [ ] If the task mentions `win-unpacked`, `dist:win`, or Windows installers, read [Windows Packaging](./win-unpacked.md) before running any packaging command.
 - [ ] Confirm the working tree has no unrelated generated artifact assumptions; packaging rewrites `frontend/dist`, `dist-electron`, and `release/win-unpacked`.
 - [ ] Clear Electron debug/runtime environment variables before smoke-testing a packaged app.
+- [ ] If media processing changes, read [Bundled FFmpeg Runtime](./ffmpeg-runtime.md) and prepare the exact target architecture before packaging.
 
 ---
 
@@ -17,6 +18,7 @@
 | Guide | Description | Status |
 |-------|-------------|--------|
 | [Windows Packaging](./win-unpacked.md) | Rules for updating Windows unpacked, installer, and portable artifacts | Active |
+| [Bundled FFmpeg Runtime](./ffmpeg-runtime.md) | Pinned binary supply chain, architecture selection, and package validation | Active |
 
 ---
 

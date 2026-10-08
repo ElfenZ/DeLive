@@ -2,8 +2,10 @@ import type { TranscriptCorrection, TranscriptSession } from '../types'
 import {
   deleteSessionById,
   getSessions,
+  migrateProjectSessions,
   saveSessions,
   upsertSession,
+  upsertSessionStrict,
   upsertSessions,
 } from './sessionStorage'
 import {
@@ -12,6 +14,8 @@ import {
 } from './sessionSchema'
 import type { TranscriptPersistenceSnapshot } from './sessionSnapshot'
 import { hasPostProcessContent } from './transcriptState'
+import { deleteSessionPreservingResults, getDeletedSessionSnapshots } from './deletedSessionStorage'
+import { startPerformanceSpan } from '../../../shared/performanceDiagnostics'
 
 export type SessionProgressSnapshot = TranscriptPersistenceSnapshot
 
@@ -23,11 +27,12 @@ export interface SessionLaunchState {
 let cachedSessions: TranscriptSession[] = []
 let cacheReady = false
 const sessionWriteQueues = new Map<string, Promise<void>>()
-const pendingCorrections = new Map<string, TranscriptCorrection>()
+const deletingSessionIds = new Set<string>()
+const normalizedRecords = new WeakSet<TranscriptSession>()
 
 function enqueueSessionWrite(sessionId: string, operation: () => Promise<void>): Promise<void> {
   const previous = sessionWriteQueues.get(sessionId) || Promise.resolve()
-  const write = previous.then(operation)
+  const write = previous.catch(() => undefined).then(operation)
   sessionWriteQueues.set(sessionId, write)
   void write.finally(() => {
     if (sessionWriteQueues.get(sessionId) === write) sessionWriteQueues.delete(sessionId)
@@ -36,11 +41,14 @@ function enqueueSessionWrite(sessionId: string, operation: () => Promise<void>):
 }
 
 function normalizeSession(session: TranscriptSession): TranscriptSession {
-  return normalizeTranscriptSession(session)
+  if (normalizedRecords.has(session)) return session
+  const normalized = normalizeTranscriptSession(session)
+  normalizedRecords.add(normalized)
+  return normalized
 }
 
 function getCachedSessions(): TranscriptSession[] {
-  return cachedSessions.map(normalizeSession)
+  return [...cachedSessions]
 }
 
 function updateCachedSessions(sessions: TranscriptSession[]): TranscriptSession[] {
@@ -60,6 +68,7 @@ function persistSessions(sessions: TranscriptSession[]): TranscriptSession[] {
 }
 
 function persistSingleSession(sessionId: string, sessions: TranscriptSession[]): TranscriptSession[] {
+  if (deletingSessionIds.has(sessionId)) return getCachedSessions()
   const nextSessions = updateCachedSessions(sessions)
   const targetSession = nextSessions.find((session) => session.id === sessionId)
 
@@ -67,11 +76,12 @@ function persistSingleSession(sessionId: string, sessions: TranscriptSession[]):
     return nextSessions
   }
 
-  const pendingCorrection = pendingCorrections.get(sessionId)
-  const durableTarget = pendingCorrection
-    ? normalizeSession({ ...targetSession, correction: pendingCorrection })
-    : targetSession
-  void enqueueSessionWrite(sessionId, () => upsertSession(durableTarget)).catch((error) => {
+  void enqueueSessionWrite(sessionId, () => {
+    // A metadata write queued during a checkpoint must use the committed correction,
+    // not resurrect a failed checkpoint or overwrite a successful one with old data.
+    const committedCorrection = cachedSessions.find((session) => session.id === sessionId)?.correction
+    return upsertSession(normalizeSession({ ...targetSession, correction: committedCorrection }))
+  }).catch((error) => {
     console.error('[sessionRepository] Failed to persist session:', error)
   })
 
@@ -161,6 +171,11 @@ function recoverInterruptedAutoPostProcessWorkflow(session: TranscriptSession, n
 }
 
 export const sessionRepository = {
+  getSessionsSnapshot(): TranscriptSession[] {
+    if (!cacheReady) throw new Error('Load records before changing project relationships')
+    return getCachedSessions()
+  },
+
   async loadForLaunch(): Promise<SessionLaunchState> {
     const loadedSessions = await getSessions()
     const upgraded = upgradeTranscriptSessions(loadedSessions)
@@ -202,7 +217,10 @@ export const sessionRepository = {
       ]))
       : Array.from(new Set([...interruptedSessionIds, ...staleTaskSessionIds]))
 
-    if (sessionIdsToPersist.length > 0) {
+    const projectUpgradeCommitted = await migrateProjectSessions(loadedSessions, sessions)
+    if (projectUpgradeCommitted) {
+      sessions = updateCachedSessions(sessions)
+    } else if (sessionIdsToPersist.length > 0) {
       sessions = await persistSessionBatch(sessionIdsToPersist, sessions)
     }
 
@@ -241,18 +259,86 @@ export const sessionRepository = {
     return persistSingleSession(sessionId, sessions)
   },
 
-  async checkpointCorrection(sessionId: string, correction: NonNullable<TranscriptSession['correction']>): Promise<TranscriptSession[]> {
-    const sessions = updateSessionCollection(getCachedSessions(), sessionId, { correction })
-    const target = sessions.find((session) => session.id === sessionId)
-    if (!target) throw new Error(`Session ${sessionId} was not found for correction checkpoint`)
-    pendingCorrections.set(sessionId, correction)
+  async updateMetadataDurable(sessionId: string, patch: Partial<TranscriptSession> | ((session: TranscriptSession) => Partial<TranscriptSession>)): Promise<TranscriptSession[]> {
+    if (deletingSessionIds.has(sessionId)) throw new Error('Session deletion is in progress')
+    const span = startPerformanceSpan('repository.metadata', { records: cachedSessions.length })
+    let successful = false, writes = 0
     try {
-      await enqueueSessionWrite(sessionId, () => upsertSession(target))
-      const committed = updateSessionCollection(getCachedSessions(), sessionId, { correction })
-      return updateCachedSessions(committed)
-    } finally {
-      if (pendingCorrections.get(sessionId) === correction) pendingCorrections.delete(sessionId)
+    await enqueueSessionWrite(sessionId, async () => {
+      const current = cachedSessions.find((session) => session.id === sessionId)
+      if (!current) throw new Error(`Session ${sessionId} does not exist`)
+      const updates = typeof patch === 'function' ? patch(normalizeTranscriptSession(current)) : patch
+      if (Object.entries(updates).every(([key, value]) => Object.is(current[key as keyof TranscriptSession], value))) return
+      const target = normalizeSession({ ...current, ...updates, updatedAt: Date.now() })
+      updateCachedSessions(cachedSessions.map((session) => session.id === sessionId ? target : session))
+      const optimistic = cachedSessions.find((session) => session.id === sessionId)
+      try {
+        await upsertSessionStrict(target)
+        writes++
+      } catch (error) {
+        if (cachedSessions.find((session) => session.id === sessionId) === optimistic) {
+          updateCachedSessions(cachedSessions.map((session) => session.id === sessionId ? current : session))
+        }
+        throw error
+      }
+    })
+    successful = true
+    return getCachedSessions()
+    } finally { span.finish(successful ? 'success' : 'error', { writes }) }
+  },
+
+  async importCompletedSession(session: TranscriptSession): Promise<TranscriptSession[]> {
+    if (deletingSessionIds.has(session.id)) throw new Error('Record deletion is in progress')
+    if ((await getDeletedSessionSnapshots()).some((snapshot) => snapshot.originalSessionId === session.id)) {
+      throw new Error('This record was deleted; import again as a new task')
     }
+    const existing = cachedSessions.find((item) => item.id === session.id)
+    if (existing) {
+      return this.updateMetadataDurable(session.id, (current) => ({
+        transcript: session.transcript, tokens: session.tokens, segments: session.segments,
+        speakers: session.speakers, duration: session.duration, status: 'completed',
+        sourceMeta: { ...current.sourceMeta, ...session.sourceMeta },
+      }))
+    }
+    await enqueueSessionWrite(session.id, async () => {
+      const target = normalizeSession({ ...session, status: 'completed' })
+      await upsertSessionStrict(target)
+      updateCachedSessions([target, ...getCachedSessions().filter((item) => item.id !== session.id)])
+    })
+    return getCachedSessions()
+  },
+
+  async deleteSessionWithResults(sessionId: string): Promise<TranscriptSession[]> {
+    if (deletingSessionIds.has(sessionId)) throw new Error('Session deletion is already in progress')
+    deletingSessionIds.add(sessionId)
+    try {
+      await enqueueSessionWrite(sessionId, async () => {
+        const session = cachedSessions.find((item) => item.id === sessionId)
+        if (!session) return
+        await deleteSessionPreservingResults(session)
+        updateCachedSessions(getCachedSessions().filter((item) => item.id !== sessionId))
+      })
+    } finally {
+      deletingSessionIds.delete(sessionId)
+    }
+    return getCachedSessions()
+  },
+
+  async checkpointCorrection(
+    sessionId: string,
+    correctionOrFactory: TranscriptCorrection | ((session: TranscriptSession) => Promise<TranscriptCorrection>),
+  ): Promise<TranscriptSession[]> {
+    if (deletingSessionIds.has(sessionId)) throw new Error('Session deletion is in progress')
+    await enqueueSessionWrite(sessionId, async () => {
+      const current = cachedSessions.find((session) => session.id === sessionId)
+      if (!current) throw new Error(`Session ${sessionId} was not found for correction checkpoint`)
+      const correction = typeof correctionOrFactory === 'function'
+        ? await correctionOrFactory(normalizeTranscriptSession(current)) : correctionOrFactory
+      const target = updateSessionCollection(getCachedSessions(), sessionId, { correction }).find((session) => session.id === sessionId)!
+      await upsertSessionStrict(normalizeSession(target))
+      updateCachedSessions(updateSessionCollection(getCachedSessions(), sessionId, { correction }))
+    })
+    return getCachedSessions()
   },
 
   saveProgress(sessionId: string, snapshot: SessionProgressSnapshot): TranscriptSession[] {

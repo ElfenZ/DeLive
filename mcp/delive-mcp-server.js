@@ -53,10 +53,17 @@ server.registerTool(
     inputSchema: {
       query: z.string().describe('Search keyword to match in session titles and transcript content'),
       limit: z.number().optional().default(10).describe('Maximum number of results to return'),
+      topicId: z.string().optional().describe('Legacy topic ID: matches any direct project association'),
+      projectId: z.string().optional().describe('Project ID to search, including descendants by default'),
+      includeDescendants: z.boolean().optional().describe('Include child projects at all levels (default true)'),
     },
   },
-  async ({ query, limit }) => {
-    const data = await callApi(`/api/v1/sessions?search=${encodeURIComponent(query)}&limit=${limit}`)
+  async ({ query, limit, topicId, projectId, includeDescendants }) => {
+    const params = new URLSearchParams({ search: query, limit: String(limit) })
+    if (topicId) params.set('topicId', topicId)
+    if (projectId) params.set('projectId', projectId)
+    if (includeDescendants !== undefined) params.set('includeDescendants', String(includeDescendants))
+    const data = await callApi(`/api/v1/sessions?${params}`)
     const sessions = data.sessions || []
 
     if (sessions.length === 0) {
@@ -218,7 +225,7 @@ server.registerTool(
 server.registerTool(
   'list_topics',
   {
-    description: 'List all topics (categories) used to organize transcription sessions in DeLive.',
+    description: 'List all projects used to organize transcription sessions in DeLive. The legacy list_topics name is retained for compatibility.',
     inputSchema: {},
   },
   async () => {
@@ -229,7 +236,7 @@ server.registerTool(
       return { content: [{ type: 'text', text: 'No topics found.' }] }
     }
 
-    const lines = topics.map((t, i) => `${i + 1}. ${t.emoji} **${t.name}** (ID: ${t.id})${t.description ? `\n   ${t.description}` : ''}`)
+    const lines = topics.map((t, i) => `${i + 1}. ${t.emoji} **${t.name}** (ID: ${t.id})${t.parentId ? ` | Parent: ${t.parentId}` : ''}${t.archivedAt !== undefined ? ' | Archived' : ''}${t.description ? `\n   ${t.description}` : ''}`)
     return { content: [{ type: 'text', text: `Topics:\n\n${lines.join('\n')}` }] }
   }
 )

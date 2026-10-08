@@ -20,6 +20,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
 | [Local Proxy Server](./local-proxy-server.md) | Electron proxy/API binding, discovery, and shutdown | Active |
+| [Managed Media Processing](./media-processing.md) | Restricted video audio extraction, archive access, and deletion IPC | Active |
 
 ---
 

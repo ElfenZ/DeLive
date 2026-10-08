@@ -10,7 +10,7 @@ import {
   normalizeAiCorrectionGlossary,
   requestCorrectionShard,
 } from './aiCorrection'
-import { nextOpenAiCredentialVersion } from './openAiCompatible'
+import { nextAiCredentialVersion } from './aiProtocol'
 
 function session(transcript = '需要侍应新的工作。'): TranscriptSession {
   return {
@@ -77,6 +77,9 @@ describe('aiCorrection config and body', () => {
     const snapshot = createCorrectionConfigSnapshot(settings({ apiKey: 'secret' }))
     expect(snapshot.baseUrl).toBe('http://127.0.0.1:11434/v1')
     expect(snapshot.concurrency).toBe(1)
+    expect(snapshot.provider).toBe('openai-compatible')
+    expect(snapshot.thinkingMode).toBe('default')
+    expect(snapshot.identityVersion).toBe(2)
     expect(snapshot).not.toHaveProperty('apiKey')
     expect(snapshot.credentialRef).toBe('ai-post-process')
     expect(snapshot.configIdentity).not.toContain('secret')
@@ -84,9 +87,10 @@ describe('aiCorrection config and body', () => {
 
   it('increments credential version only when normalized URL or key changes', () => {
     const current = { baseUrl: 'https://api.example.com/v1/', apiKey: 'key-a', credentialVersion: 4 }
-    expect(nextOpenAiCredentialVersion(current, { baseUrl: ' https://api.example.com/v1 ', apiKey: 'key-a' })).toBe(4)
-    expect(nextOpenAiCredentialVersion(current, { baseUrl: 'https://api-b.example.com/v1', apiKey: 'key-a' })).toBe(5)
-    expect(nextOpenAiCredentialVersion(current, { baseUrl: current.baseUrl, apiKey: 'key-b' })).toBe(5)
+    expect(nextAiCredentialVersion(current, { baseUrl: ' https://api.example.com/v1 ', apiKey: 'key-a' })).toBe(4)
+    expect(nextAiCredentialVersion(current, { baseUrl: 'https://api-b.example.com/v1', apiKey: 'key-a' })).toBe(5)
+    expect(nextAiCredentialVersion(current, { baseUrl: current.baseUrl, apiKey: 'key-b' })).toBe(5)
+    expect(nextAiCredentialVersion(current, { baseUrl: current.baseUrl, apiKey: current.apiKey, provider: 'anthropic-compatible' })).toBe(5)
   })
 
   it('normalizes and deduplicates glossary entries', () => {
@@ -126,6 +130,43 @@ describe('aiCorrection config and body', () => {
     })
     expect(snapshot.transport).toBe('sse')
     expect(body.stream).toBe(true)
+  })
+
+  it('builds Anthropic correction requests and disables thinking without temperature', () => {
+    const transcript = 'CORE'
+    const snapshot = createCorrectionConfigSnapshot(settings({
+      provider: 'anthropic-compatible',
+      thinkingMode: 'disabled',
+      correctionStructuredOutput: 'json_schema',
+      enableStreaming: false,
+    }))
+    const body = buildCorrectionRequestBody({
+      transcript,
+      shard: { id: 's', index: 0, contextStart: 0, coreStart: 0, coreEnd: transcript.length, contextEnd: transcript.length },
+      snapshot,
+    })
+    expect(body).toMatchObject({
+      model: 'qwen',
+      max_tokens: 8192,
+      thinking: { type: 'disabled' },
+      messages: [{ role: 'user', content: expect.stringContaining('<EDITABLE_CORE>') }],
+      output_config: { format: { type: 'json_schema' } },
+    })
+    expect(body).toHaveProperty('system')
+    expect(body).not.toHaveProperty('temperature')
+  })
+
+  it('normalizes Anthropic json_object mode to prompt-json', () => {
+    const snapshot = createCorrectionConfigSnapshot(settings({
+      provider: 'anthropic-compatible',
+      correctionStructuredOutput: 'json_object',
+    }))
+    expect(snapshot.structuredOutput).toBe('prompt-json')
+    expect(buildCorrectionRequestBody({
+      transcript: 'CORE',
+      shard: { id: 's', index: 0, contextStart: 0, coreStart: 0, coreEnd: 4, contextEnd: 4 },
+      snapshot,
+    })).not.toHaveProperty('output_config')
   })
 
   it('injects bounded context as JSON data before transcript regions without replacing the fixed contract', () => {
@@ -241,13 +282,45 @@ describe('aiCorrection transport', () => {
       'data: [DONE]',
       '',
     ].join('\n')
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(rawResponse(sse, 'text/event-stream')))
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(sse, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    })))
     const transcript = session().transcript
     await expect(requestCorrectionShard({
       transcript,
       shard: createCorrectionShards(transcript)[0],
       snapshot: createCorrectionConfigSnapshot(settings({ enableStreaming: true })),
     })).resolves.toMatchObject({ patches: [validPatch] })
+  })
+
+  it('parses Anthropic SSE text without appending thinking deltas', async () => {
+    const sse = [
+      'event: message_start',
+      'data: {"type":"message_start","usage":{"input_tokens":10}}',
+      '',
+      'event: content_block_delta',
+      'data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"private"}}',
+      '',
+      'event: content_block_delta',
+      `data: ${JSON.stringify({ type: 'content_block_delta', delta: { type: 'text_delta', text: JSON.stringify({ patches: [validPatch] }) } })}`,
+      '',
+      'event: message_delta',
+      'data: {"type":"message_delta","usage":{"output_tokens":20}}',
+      '',
+    ].join('\n')
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(sse, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    })))
+    const transcript = session().transcript
+    const stages: string[] = []
+    await expect(requestCorrectionShard({
+      transcript,
+      shard: createCorrectionShards(transcript)[0],
+      snapshot: createCorrectionConfigSnapshot(settings({ provider: 'anthropic-compatible', enableStreaming: true })),
+      onProgress: (progress) => { stages.push(progress.stage) },
+    })).resolves.toMatchObject({ patches: [validPatch], usage: { promptTokens: 10, completionTokens: 20, totalTokens: 30 } })
+    expect(stages).toContain('thinking')
+    expect(stages).toContain('receiving-content')
   })
 
   it('rejects responses above the 5 MB safety limit', async () => {
@@ -335,6 +408,7 @@ describe('aiCorrection transport', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(aiCorrectionRecoveryFetch).toHaveBeenCalledWith(expect.objectContaining({
       url: 'http://127.0.0.1:11434/v1/chat/completions',
+      provider: 'openai-compatible',
       firstByteTimeoutMs: 100,
       idleTimeoutMs: 1_000,
       absoluteTimeoutMs: 10_000,

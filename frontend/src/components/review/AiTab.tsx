@@ -32,6 +32,8 @@ export function AiTab({ session }: AiTabProps) {
   const tags = useTagStore((state) => state.tags)
   const addTag = useTagStore((state) => state.addTag)
   const [exportRetrying, setExportRetrying] = useState(false)
+  const [titleSaving, setTitleSaving] = useState(false)
+  const [titleError, setTitleError] = useState('')
 
   const postProcess = session.postProcess
   const workflow = session.autoPostProcessWorkflow
@@ -62,8 +64,10 @@ export function AiTab({ session }: AiTabProps) {
   }
 
   const handleApplySuggestedTitle = () => {
-    if (!session || !postProcess?.titleSuggestion?.trim()) return
-    updateSessionTitle(session.id, postProcess.titleSuggestion.trim())
+    if (!session || !postProcess?.titleSuggestion?.trim() || titleSaving) return
+    setTitleSaving(true)
+    setTitleError('')
+    void updateSessionTitle(session.id, postProcess.titleSuggestion.trim()).catch((error: unknown) => setTitleError(error instanceof Error ? error.message : String(error))).finally(() => setTitleSaving(false))
   }
 
   const handleApplySuggestedTags = () => {
@@ -100,6 +104,7 @@ export function AiTab({ session }: AiTabProps) {
 
   return (
     <div className="flex-1 overflow-y-auto p-6 space-y-6">
+      {titleError && <p role="alert" className="text-xs text-destructive">{titleError}</p>}
       <div className="rounded-xl border border-border bg-gradient-to-br from-card/90 to-card/60 p-5 space-y-4 border-l-4 border-l-primary/40 backdrop-blur">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="space-y-1">
@@ -205,7 +210,7 @@ export function AiTab({ session }: AiTabProps) {
                   <div className="text-sm font-medium text-foreground">{postProcess.titleSuggestion}</div>
                   <button
                     onClick={handleApplySuggestedTitle}
-                    disabled={session.title.trim() === postProcess.titleSuggestion.trim()}
+                    disabled={titleSaving || session.title.trim() === postProcess.titleSuggestion.trim()}
                     className={`inline-flex items-center justify-center rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
                       session.title.trim() === postProcess.titleSuggestion.trim()
                         ? 'cursor-not-allowed border border-border bg-muted text-muted-foreground'

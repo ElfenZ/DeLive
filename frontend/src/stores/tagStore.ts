@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { persist } from 'zustand/middleware'
 import type { Tag } from '../types'
 import { getTags, saveTags, generateId } from '../utils/storage'
 import { useSessionStore } from './sessionStore'
@@ -17,9 +18,11 @@ export interface TagState {
 
   searchQuery: string
   setSearchQuery: (query: string) => void
+  selectedReviewDate: string | null
+  setSelectedReviewDate: (date: string | null) => void
 }
 
-export const useTagStore = create<TagState>((set, get) => ({
+export const useTagStore = create<TagState>()(persist((set, get) => ({
   tags: [],
   loadTags: () => {
     const tags = getTags()
@@ -66,4 +69,16 @@ export const useTagStore = create<TagState>((set, get) => ({
 
   searchQuery: '',
   setSearchQuery: (query) => set({ searchQuery: query }),
+  selectedReviewDate: null,
+  setSelectedReviewDate: (selectedReviewDate) => set({ selectedReviewDate }),
+}), {
+  name: 'delive-review-filters',
+  partialize: (state) => ({ selectedTagIds: state.selectedTagIds, searchQuery: state.searchQuery, selectedReviewDate: state.selectedReviewDate }),
+  merge: (persisted, current) => {
+    const filters = persisted as Partial<TagState> | undefined
+    return { ...current, searchQuery: typeof filters?.searchQuery === 'string' ? filters.searchQuery : '',
+      selectedReviewDate: typeof filters?.selectedReviewDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(filters.selectedReviewDate) ? filters.selectedReviewDate : null,
+      selectedTagIds: Array.isArray(filters?.selectedTagIds) ? filters.selectedTagIds.filter((id) => typeof id === 'string') : [],
+    }
+  },
 }))

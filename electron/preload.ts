@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type {
   ApiRecordingStatus,
   ApiTagData,
@@ -10,6 +10,46 @@ import type {
 } from '../shared/electronApi'
 
 const electronAPI: ElectronAPI = {
+  manualExportFile: (request) => ipcRenderer.invoke('manual-export-file', request),
+  getFileStorageStatus: () => ipcRenderer.invoke('file-storage-status'),
+  chooseMediaDirectory: () => ipcRenderer.invoke('choose-media-directory'),
+  setPerformanceDiagnostics: (enabled) => ipcRenderer.invoke('set-performance-diagnostics', enabled),
+  getPerformanceDiagnostics: () => ipcRenderer.invoke('get-performance-diagnostics'),
+  clearPerformanceDiagnostics: () => ipcRenderer.invoke('clear-performance-diagnostics'),
+  chooseTranscriptDirectory: (selection) => ipcRenderer.invoke('choose-transcript-directory', selection),
+  openStorageDirectory: (target) => ipcRenderer.invoke('open-storage-directory', target),
+  chooseMediaMigration: () => ipcRenderer.invoke('choose-media-migration'),
+  registerSessionFiles: (context, nameFiles) => ipcRenderer.invoke('register-session-files', context, nameFiles),
+  previewManagedNames: (contexts) => ipcRenderer.invoke('preview-managed-names', contexts),
+  applyManagedNames: (token) => ipcRenderer.invoke('apply-managed-names', token),
+  savePublishedMarkdown: (request) => ipcRenderer.invoke('save-published-markdown', request),
+  relocatePublishedMarkdown: (sessionId) => ipcRenderer.invoke('relocate-published-markdown', sessionId),
+  locatePublishedMarkdown: (sessionId) => ipcRenderer.invoke('locate-published-markdown', sessionId),
+  adoptLegacyPublishedMarkdown: (request) => ipcRenderer.invoke('adopt-legacy-published-markdown', request),
+  registerOriginalSource: (filePath, sessionId) => ipcRenderer.invoke('register-original-source', filePath, sessionId),
+  listOriginalSources: () => ipcRenderer.invoke('list-original-sources'),
+  acquireOriginalRead: (sourceId, sessionId) => ipcRenderer.invoke('acquire-original-read', sourceId, sessionId),
+  releaseOriginalRead: (token) => ipcRenderer.invoke('release-original-read', token),
+  readOriginalAudio: (token) => ipcRenderer.invoke('read-original-audio', token),
+  previewOriginalRename: (sourceId, sessionId) => ipcRenderer.invoke('preview-original-rename', sourceId, sessionId),
+  previewOriginalUndo: (sourceId, sessionId) => ipcRenderer.invoke('preview-original-undo', sourceId, sessionId),
+  commitOriginalRename: (token) => ipcRenderer.invoke('commit-original-rename', token),
+  onOriginalSourceChanged: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, source: import('../shared/originalSources').OriginalSourceInfo) => callback(source)
+    ipcRenderer.on('original-source-changed', listener)
+    return () => { ipcRenderer.removeListener('original-source-changed', listener) }
+  },
+  markFileRecordDeletion: (sessionId, phase) => ipcRenderer.invoke('mark-file-record-deletion', sessionId, phase),
+  reconcileFileRecordBindings: (contexts, deletedIds) => ipcRenderer.invoke('reconcile-file-record-bindings', contexts, deletedIds),
+  applyMediaMigration: (token) => ipcRenderer.invoke('apply-media-migration', token),
+  resumeMediaMigration: (id) => ipcRenderer.invoke('resume-media-migration', id),
+  cleanupMediaMigration: (id) => ipcRenderer.invoke('cleanup-media-migration', id),
+  abandonMediaMigration: (id) => ipcRenderer.invoke('abandon-media-migration', id),
+  onFileStorageChanged: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: import('../shared/fileStorage').LocalFileChange) => callback(payload)
+    ipcRenderer.on('file-storage-changed', listener)
+    return () => { ipcRenderer.removeListener('file-storage-changed', listener) }
+  },
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
   getProxyPort: () => ipcRenderer.invoke('get-proxy-port') as Promise<number>,
   aiCorrectionRecoveryFetch: (request) => ipcRenderer.invoke('ai-correction-recovery-fetch', request),
@@ -23,6 +63,11 @@ const electronAPI: ElectronAPI = {
   getAutoLaunch: () => ipcRenderer.invoke('get-auto-launch') as Promise<boolean>,
   setAutoLaunch: (enable: boolean) => ipcRenderer.invoke('set-auto-launch', enable) as Promise<boolean>,
   pickFilePath: (options) => ipcRenderer.invoke('pick-file-path', options) as Promise<string | null>,
+  getPathForFile: (file) => {
+    const actualPath = webUtils.getPathForFile(file)
+    if (actualPath) ipcRenderer.send('native-file-selected', actualPath)
+    return actualPath
+  },
   pickDirectoryPath: () => ipcRenderer.invoke('pick-directory-path') as Promise<string | null>,
   pathExists: (targetPath: string) => ipcRenderer.invoke('path-exists', targetPath) as Promise<boolean>,
   writeAutoExportFile: (request) => ipcRenderer.invoke('write-auto-export-file', request),
@@ -32,8 +77,22 @@ const electronAPI: ElectronAPI = {
   appendRecordingArchive: (request) => ipcRenderer.invoke('append-recording-archive', request),
   finalizeRecordingArchive: (request) => ipcRenderer.invoke('finalize-recording-archive', request),
   abortRecordingArchive: (request) => ipcRenderer.invoke('abort-recording-archive', request),
-  recoverRecordingArchives: () => ipcRenderer.invoke('recover-recording-archives'),
+  recoverRecordingArchives: (activeSessionIds) => ipcRenderer.invoke('recover-recording-archives', activeSessionIds),
+  listRecordingRecoveryNotices: (activeSessionIds) => ipcRenderer.invoke('list-recording-recovery-notices', activeSessionIds),
+  acknowledgeRecordingRecovery: (request) => ipcRenderer.invoke('acknowledge-recording-recovery', request),
   revealRecordingArchive: (targetPath: string) => ipcRenderer.invoke('reveal-recording-archive', targetPath),
+  extractMediaAudio: (request) => ipcRenderer.invoke('extract-media-audio', request),
+  cancelMediaExtraction: (taskId) => ipcRenderer.invoke('cancel-media-extraction', taskId),
+  getMediaAudio: (sessionId) => ipcRenderer.invoke('get-media-audio', sessionId),
+  listMediaAudio: () => ipcRenderer.invoke('list-media-audio'),
+  readMediaAudio: (sessionId) => ipcRenderer.invoke('read-media-audio', sessionId),
+  revealMediaAudio: (sessionId) => ipcRenderer.invoke('reveal-media-audio', sessionId),
+  deleteMediaAudio: (sessionId) => ipcRenderer.invoke('delete-media-audio', sessionId),
+  onMediaExtractionProgress: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, progress: Parameters<typeof callback>[0]) => callback(progress)
+    ipcRenderer.on('media-extraction-progress', listener)
+    return () => ipcRenderer.removeListener('media-extraction-progress', listener)
+  },
 
   localRuntimeGetStatus: (runtimeId: string, options) =>
     ipcRenderer.invoke('local-runtime-get-status', runtimeId, options),
@@ -184,53 +243,53 @@ const electronAPI: ElectronAPI = {
     ipcRenderer.send('api-notify-session-end', sessionId)
   },
 
-  onApiGetSessions: (callback: (event: unknown) => void) => {
-    const listener = (event: Electron.IpcRendererEvent) => callback(event)
+  onApiGetSessions: (callback) => {
+    const listener = (event: Electron.IpcRendererEvent, requestId: string, filter?: import('../shared/apiTypes').ApiSessionFilter) => callback(event, requestId, filter)
     ipcRenderer.on('api-get-sessions', listener)
     return () => ipcRenderer.removeListener('api-get-sessions', listener)
   },
-  apiRespondSessions: (sessions: SessionSummary[]) => {
-    ipcRenderer.send('api-respond-sessions', sessions)
+  apiRespondSessions: (sessions, requestId) => {
+    ipcRenderer.send('api-respond-sessions', sessions, requestId)
   },
-  onApiGetSessionDetail: (callback: (event: unknown, sessionId: string) => void) => {
-    const listener = (_event: Electron.IpcRendererEvent, sessionId: string) => callback(_event, sessionId)
+  onApiGetSessionDetail: (callback) => {
+    const listener = (event: Electron.IpcRendererEvent, sessionId: string, requestId: string) => callback(event, sessionId, requestId)
     ipcRenderer.on('api-get-session-detail', listener)
     return () => ipcRenderer.removeListener('api-get-session-detail', listener)
   },
-  apiRespondSessionDetail: (session: SessionDetail | null) => {
-    ipcRenderer.send('api-respond-session-detail', session)
+  apiRespondSessionDetail: (session, requestId) => {
+    ipcRenderer.send('api-respond-session-detail', session, requestId)
   },
-  onApiSearchSessions: (callback: (event: unknown, query: string) => void) => {
-    const listener = (_event: Electron.IpcRendererEvent, query: string) => callback(_event, query)
+  onApiSearchSessions: (callback) => {
+    const listener = (event: Electron.IpcRendererEvent, query: string, requestId: string, filter?: import('../shared/apiTypes').ApiSessionFilter) => callback(event, query, requestId, filter)
     ipcRenderer.on('api-search-sessions', listener)
     return () => ipcRenderer.removeListener('api-search-sessions', listener)
   },
-  apiRespondSearchSessions: (sessions: SessionSummary[]) => {
-    ipcRenderer.send('api-respond-search-sessions', sessions)
+  apiRespondSearchSessions: (sessions, requestId) => {
+    ipcRenderer.send('api-respond-search-sessions', sessions, requestId)
   },
-  onApiGetTopics: (callback: (event: unknown) => void) => {
-    const listener = (event: Electron.IpcRendererEvent) => callback(event)
+  onApiGetTopics: (callback) => {
+    const listener = (event: Electron.IpcRendererEvent, requestId: string) => callback(event, requestId)
     ipcRenderer.on('api-get-topics', listener)
     return () => ipcRenderer.removeListener('api-get-topics', listener)
   },
-  apiRespondTopics: (topics: ApiTopicData[]) => {
-    ipcRenderer.send('api-respond-topics', topics)
+  apiRespondTopics: (topics, requestId) => {
+    ipcRenderer.send('api-respond-topics', topics, requestId)
   },
-  onApiGetTags: (callback: (event: unknown) => void) => {
-    const listener = (event: Electron.IpcRendererEvent) => callback(event)
+  onApiGetTags: (callback) => {
+    const listener = (event: Electron.IpcRendererEvent, requestId: string) => callback(event, requestId)
     ipcRenderer.on('api-get-tags', listener)
     return () => ipcRenderer.removeListener('api-get-tags', listener)
   },
-  apiRespondTags: (tags: ApiTagData[]) => {
-    ipcRenderer.send('api-respond-tags', tags)
+  apiRespondTags: (tags, requestId) => {
+    ipcRenderer.send('api-respond-tags', tags, requestId)
   },
-  onApiGetRecordingStatus: (callback: (event: unknown) => void) => {
-    const listener = (event: Electron.IpcRendererEvent) => callback(event)
+  onApiGetRecordingStatus: (callback) => {
+    const listener = (event: Electron.IpcRendererEvent, requestId: string) => callback(event, requestId)
     ipcRenderer.on('api-get-recording-status', listener)
     return () => ipcRenderer.removeListener('api-get-recording-status', listener)
   },
-  apiRespondRecordingStatus: (status: ApiRecordingStatus) => {
-    ipcRenderer.send('api-respond-recording-status', status)
+  apiRespondRecordingStatus: (status, requestId) => {
+    ipcRenderer.send('api-respond-recording-status', status, requestId)
   },
 
   apiUpdateOpenApiConfig: (config: { enabled: boolean; token: string }) => {

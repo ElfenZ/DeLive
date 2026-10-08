@@ -1,6 +1,10 @@
 import { type ChangeEvent, type Ref } from 'react'
 import { AlertCircle, Check, Download, Upload } from 'lucide-react'
 import type { Translations } from '../../i18n'
+import { DeletedResultsPanel } from './DeletedResultsPanel'
+import { FileStoragePanel } from './FileStoragePanel'
+import { PerformanceDiagnosticsPanel } from './PerformanceDiagnosticsPanel'
+import { RecordingRecoveryPanel } from './RecordingRecoveryPanel'
 
 interface ImportMessage {
   type: 'success' | 'error'
@@ -30,6 +34,10 @@ export function DataManagementPanel({
 
   return (
     <div className="space-y-6">
+      <DeletedResultsPanel />
+      <FileStoragePanel />
+      <PerformanceDiagnosticsPanel />
+      <RecordingRecoveryPanel />
       <section className="workspace-panel-muted p-4 space-y-3">
         <label className="text-sm font-medium leading-none flex items-center gap-2">
           <Download className="w-3.5 h-3.5 text-muted-foreground" />

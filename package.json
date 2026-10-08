@@ -1,6 +1,6 @@
 {
   "name": "delive",
-  "version": "2.5.10",
+  "version": "2.5.12",
   "description": "DeLive",
   "private": true,
   "main": "dist-electron/electron/main.js",
@@ -10,7 +10,7 @@
     "dev": "concurrently \"npm run dev:client\" \"npm run dev:electron\"",
     "dev:client": "cd frontend && npm run dev",
     "dev:server": "cd server && npm run dev",
-    "dev:electron": "wait-on http://localhost:5173 && npm run build:electron && cross-env NODE_ENV=development electron .",
+    "dev:electron": "wait-on http://localhost:5173 && npm run prepare:ffmpeg-runtime && npm run build:electron && cross-env NODE_ENV=development electron .",
     "build": "npm run generate-icons && npm run build:client && npm run build:electron",
     "build:client": "cd frontend && npm run build",
     "build:electron": "tsc -p electron/tsconfig.json",
@@ -19,14 +19,15 @@
     "check": "npm run lint:frontend && npm run test:frontend && npm run build",
     "fetch:whisper-runtime": "node scripts/fetch-whisper-runtime.mjs",
     "stage:whisper-runtime": "node scripts/stage-whisper-runtime.mjs",
+    "prepare:ffmpeg-runtime": "node scripts/prepare-ffmpeg-runtime.mjs",
     "start": "electron .",
     "prepare:win-code-sign": "node scripts/prepare-win-code-sign-cache.mjs",
-    "pack": "npm run prepare:win-code-sign && npm run build && electron-builder --dir",
-    "dist": "npm run build && electron-builder",
-    "dist:win": "npm run prepare:win-code-sign && npm run build && electron-builder --win",
-    "dist:mac": "npm run build && electron-builder --mac",
-    "dist:linux": "npm run build && electron-builder --linux",
-    "dist:all": "npm run build && electron-builder --win --mac --linux",
+    "pack": "npm run prepare:ffmpeg-runtime && npm run prepare:win-code-sign && npm run build && electron-builder --dir",
+    "dist": "npm run prepare:ffmpeg-runtime && npm run build && electron-builder",
+    "dist:win": "npm run prepare:ffmpeg-runtime -- --target win-x64 && npm run prepare:win-code-sign && npm run build && electron-builder --win",
+    "dist:mac": "npm run prepare:ffmpeg-runtime -- --target mac-x64 --target mac-arm64 && npm run build && electron-builder --mac",
+    "dist:linux": "npm run prepare:ffmpeg-runtime -- --target linux-x64 && npm run build && electron-builder --linux",
+    "dist:all": "npm run prepare:ffmpeg-runtime -- --target win-x64 --target mac-x64 --target mac-arm64 --target linux-x64 && npm run build && electron-builder --win --mac --linux",
     "install:all": "npm install && cd frontend && npm install && cd ../server && npm install",
     "generate-icons": "node scripts/generate-icons.mjs",
     "docs:dev": "vitepress dev docs",
@@ -64,6 +65,7 @@
       "frontend/dist/**/*",
       "frontend/public/**/*",
       "local-runtimes/**/*",
+      "!local-runtimes/ffmpeg/**/*",
       "build/icon.ico",
       "build/icon.png",
       "build/icon.icns",
@@ -71,6 +73,7 @@
     ],
     "asarUnpack": [
       "local-runtimes/**/*",
+      "!local-runtimes/ffmpeg/**/*",
       "build/icon.ico",
       "build/icon.png",
       "build/icon.icns",
@@ -79,7 +82,15 @@
     "extraResources": [
       {
         "from": "local-runtimes",
-        "to": "local-runtimes"
+        "to": "local-runtimes",
+        "filter": [
+          "**/*",
+          "!ffmpeg/**/*"
+        ]
+      },
+      {
+        "from": "local-runtimes/ffmpeg/${os}-${arch}",
+        "to": "ffmpeg"
       },
       {
         "from": "build/icon.png",

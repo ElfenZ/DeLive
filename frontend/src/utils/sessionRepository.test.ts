@@ -3,8 +3,10 @@ import type { TranscriptSession } from '../types'
 
 const sessionStorageMock = vi.hoisted(() => ({
   getSessions: vi.fn<() => Promise<TranscriptSession[]>>(),
+  migrateProjectSessions: vi.fn<() => Promise<boolean>>(),
   saveSessions: vi.fn<(sessions: TranscriptSession[]) => Promise<void>>(),
   upsertSession: vi.fn<(session: TranscriptSession) => Promise<void>>(),
+  upsertSessionStrict: vi.fn<(session: TranscriptSession) => Promise<void>>(),
   upsertSessions: vi.fn<(sessions: TranscriptSession[]) => Promise<void>>(),
   deleteSessionById: vi.fn<(sessionId: string) => Promise<void>>(),
 }))
@@ -29,8 +31,10 @@ describe('sessionRepository persistence strategy', () => {
     vi.resetModules()
     vi.clearAllMocks()
     sessionStorageMock.getSessions.mockResolvedValue([])
+    sessionStorageMock.migrateProjectSessions.mockResolvedValue(false)
     sessionStorageMock.saveSessions.mockResolvedValue(undefined)
     sessionStorageMock.upsertSession.mockResolvedValue(undefined)
+    sessionStorageMock.upsertSessionStrict.mockResolvedValue(undefined)
     sessionStorageMock.upsertSessions.mockResolvedValue(undefined)
     sessionStorageMock.deleteSessionById.mockResolvedValue(undefined)
   })
@@ -167,12 +171,12 @@ describe('sessionRepository persistence strategy', () => {
 
     expect(result.sessions[0]).toEqual(expect.objectContaining({
       id: 'legacy-1',
-      schemaVersion: 7,
+      schemaVersion: 8,
       tagIds: [],
     }))
     expect(sessionStorageMock.upsertSessions).toHaveBeenCalledTimes(1)
     expect(sessionStorageMock.upsertSessions).toHaveBeenCalledWith([
-      expect.objectContaining({ id: 'legacy-1', schemaVersion: 7 }),
+      expect.objectContaining({ id: 'legacy-1', schemaVersion: 8 }),
     ])
   })
 
@@ -213,13 +217,13 @@ describe('sessionRepository persistence strategy', () => {
     await vi.waitFor(() => expect(sessionStorageMock.upsertSession).toHaveBeenCalled())
     sessionStorageMock.upsertSession.mockClear()
     const releases: Array<() => void> = []
-    sessionStorageMock.upsertSession.mockImplementation(() => new Promise<void>((resolve) => releases.push(resolve)))
+    sessionStorageMock.upsertSessionStrict.mockImplementation(() => new Promise<void>((resolve) => releases.push(resolve)))
     const first = sessionRepository.checkpointCorrection('checkpoint-1', { status: 'detecting', mode: 'review' })
     const second = sessionRepository.checkpointCorrection('checkpoint-1', { status: 'error', mode: 'review', error: 'failed' })
-    await vi.waitFor(() => expect(sessionStorageMock.upsertSession).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() => expect(sessionStorageMock.upsertSessionStrict).toHaveBeenCalledTimes(1))
     releases.shift()?.()
-    await vi.waitFor(() => expect(sessionStorageMock.upsertSession).toHaveBeenCalledTimes(2))
-    expect(sessionStorageMock.upsertSession).toHaveBeenCalledTimes(2)
+    await vi.waitFor(() => expect(sessionStorageMock.upsertSessionStrict).toHaveBeenCalledTimes(2))
+    expect(sessionStorageMock.upsertSessionStrict).toHaveBeenCalledTimes(2)
     releases.shift()?.()
     await expect(Promise.all([first, second])).resolves.toHaveLength(2)
   })
@@ -229,13 +233,14 @@ describe('sessionRepository persistence strategy', () => {
     const base = makeSession({ id: 'checkpoint-failure', transcript: 'hello' })
     sessionRepository.createDraft(base)
     await vi.waitFor(() => expect(sessionStorageMock.upsertSession).toHaveBeenCalled())
-    sessionStorageMock.upsertSession.mockRejectedValueOnce(new Error('disk full'))
+    sessionStorageMock.upsertSessionStrict.mockRejectedValueOnce(new Error('disk full'))
 
     await expect(sessionRepository.checkpointCorrection('checkpoint-failure', {
       status: 'detecting', mode: 'review',
     })).rejects.toThrow('disk full')
 
     sessionStorageMock.upsertSession.mockResolvedValue(undefined)
+    sessionStorageMock.upsertSessionStrict.mockResolvedValue(undefined)
     const sessions = sessionRepository.updateMetadata('checkpoint-failure', { title: 'Still committed' })
     expect(sessions[0].correction).toBeUndefined()
   })

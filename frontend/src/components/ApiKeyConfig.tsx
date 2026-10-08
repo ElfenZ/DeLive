@@ -5,6 +5,9 @@ import { useUIStore } from '../stores/uiStore'
 import { useSettingsStore } from '../stores/settingsStore'
 import { useSessionStore } from '../stores/sessionStore'
 import { useTagStore } from '../stores/tagStore'
+import { useTopicStore } from '../stores/topicStore'
+import { reconcileFileRecordBindings } from '../utils/fileRecordBindings'
+import { assertBackupRestoreIdle } from '../utils/backupRestoreGuard'
 import {
   exportAllData,
   getBackupValidationErrors,
@@ -70,8 +73,8 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
     availableProviders,
     updateProviderConfig,
   } = useSettingsStore()
-  const { loadSessions } = useSessionStore()
-  const { loadTags } = useTagStore()
+  const loadSessions = useSessionStore((state) => state.loadSessions)
+  const loadTags = useTagStore((state) => state.loadTags)
 
   const [activeGroup, setActiveGroup] = useState<SettingsGroup>('provider')
 
@@ -95,6 +98,8 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
 
   const [importMessage, setImportMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const [pendingImportData, setPendingImportData] = useState<{ data: BackupData } | null>(null)
+  const [importing, setImporting] = useState(false)
+  const importingRef = useRef(false)
   const [autoLaunch, setAutoLaunch] = useState(false)
   const [testStatus, setTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle')
   const [testMessage, setTestMessage] = useState('')
@@ -256,14 +261,6 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
       const normalizedAiConfig = aiPostProcessConfig.autoAiPostProcess
         ? { ...aiPostProcessConfig, autoCorrectionDetection: false }
         : aiPostProcessConfig
-      if (normalizedAiConfig.autoExportCorrectedMarkdown) {
-        if (!window.electronAPI?.writeAutoExportFile) {
-          throw new Error(language === 'zh' ? '自动导出仅在桌面应用中可用' : 'Automatic export is available only in the desktop app')
-        }
-        if (!normalizedAiConfig.autoExportDirectory?.trim()) {
-          throw new Error(language === 'zh' ? '请先选择纠错稿自动导出目录' : 'Choose a corrected Markdown export folder first')
-        }
-      }
       assertValidMeetingContext(meetingContextConfig, normalizedAiConfig.glossary, { includeDisabled: true })
       updateMeetingContextConfig(meetingContextConfig)
       await updateAiPostProcessConfig(normalizedAiConfig)
@@ -334,8 +331,11 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
   }
 
   const handleApplyImport = useCallback(async (importMode: 'overwrite' | 'merge') => {
-    if (!pendingImportData) return
+    if (!pendingImportData || importingRef.current) return
+    importingRef.current = true
+    setImporting(true)
     try {
+      assertBackupRestoreIdle()
       if (importMode === 'overwrite') {
         const result = await importDataOverwrite(pendingImportData.data)
         setImportMessage({ type: 'success', text: t.settings.importedOverwrite(result.sessions, result.tags) })
@@ -345,16 +345,22 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
       }
       await loadSessions()
       loadTags()
+      useTopicStore.getState().loadTopics()
+      await useSettingsStore.getState().loadSettings()
+      await reconcileFileRecordBindings()
     } catch (error) {
       setImportMessage({ type: 'error', text: error instanceof Error ? error.message : t.settings.importFailed })
     } finally {
       setPendingImportData(null)
+      importingRef.current = false
+      setImporting(false)
     }
   }, [loadSessions, loadTags, pendingImportData, t.settings])
 
   useEffect(() => {
     if (!isOpen) return undefined
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || document.querySelector('#action-dialog-title')) return
       if (event.key === 'Escape') onClose()
     }
     document.addEventListener('keydown', handleKeyDown)
@@ -364,9 +370,9 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
   if (!isOpen && !isViewMode) return null
 
   const settingsContent = (
-    <div className="flex h-full">
+    <div className="flex h-full min-w-0 flex-col sm:flex-row">
       {/* Left navigation */}
-      <nav className="w-48 shrink-0 border-r border-border/40 p-3 space-y-1 overflow-y-auto">
+      <nav aria-label={t.nav.settings} className="flex shrink-0 gap-1 overflow-x-auto border-b border-border/40 p-2 sm:block sm:w-40 sm:space-y-1 sm:overflow-y-auto sm:border-b-0 sm:border-r">
         {NAV_ITEMS.map(item => {
           const Icon = item.icon
           const label = (t.settings as unknown as Record<string, string>)?.[item.labelKey] ?? item.id
@@ -374,9 +380,12 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
           return (
             <button
               key={item.id}
+              title={label}
+              aria-label={label}
+              aria-current={active ? 'page' : undefined}
               onClick={() => setActiveGroup(item.id)}
               className={`
-                w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm font-medium transition-colors
+                shrink-0 sm:w-full flex items-center gap-2 px-2 py-2 rounded-lg text-sm font-medium transition-colors
                 ${active
                   ? 'bg-primary/10 text-primary'
                   : 'text-muted-foreground hover:text-foreground hover:bg-accent'
@@ -392,8 +401,8 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
 
       {/* Right content */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
-        <div className="flex-1 overflow-y-auto p-6">
-          <div className="mx-auto max-w-2xl space-y-6">
+        <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
+          <div className="max-w-5xl space-y-6 [&_input]:max-w-2xl [&_.relative:has(>input)]:max-w-2xl [&_textarea]:max-w-3xl">
             {activeGroup === 'provider' && (
               <ServiceSettingsPanel
                 t={t}
@@ -533,11 +542,11 @@ export function ApiKeyConfig({ isOpen, onClose, mode = 'modal', onViewChangelog 
           ? t.settings.importConfirm(pendingImportData.data.sessions.length, pendingImportData.data.tags.length)
           : ''
         }
-        onClose={() => setPendingImportData(null)}
+        onClose={() => { if (!importingRef.current) setPendingImportData(null) }}
         actions={[
-          { label: t.common.cancel, onClick: () => setPendingImportData(null), variant: 'secondary' },
-          { label: t.electron.mergeImport, onClick: () => void handleApplyImport('merge'), variant: 'secondary' },
-          { label: t.electron.overwriteImport, onClick: () => void handleApplyImport('overwrite'), variant: 'primary' },
+          { label: t.common.cancel, disabled: importing, onClick: () => setPendingImportData(null), variant: 'secondary' },
+          { label: t.electron.mergeImport, disabled: importing, onClick: () => void handleApplyImport('merge'), variant: 'secondary' },
+          { label: t.electron.overwriteImport, disabled: importing, onClick: () => void handleApplyImport('overwrite'), variant: 'danger' },
         ]}
       />
     </div>

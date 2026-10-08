@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { persist } from 'zustand/middleware'
 import {
   type Language,
   type Translations,
@@ -7,9 +8,28 @@ import {
   saveLanguage
 } from '../i18n'
 import { type ColorThemeId, defaultColorTheme, applyColorThemeToDOM } from '../themes'
+import { useTopicStore } from './topicStore'
+import { useTagStore } from './tagStore'
+import type { ReviewFolder } from '../utils/projectSchema'
 
 type Theme = 'light' | 'dark' | 'system'
 type ResolvedTheme = 'light' | 'dark'
+
+export const DEFAULT_REVIEW_LIST_WIDTH = 380
+export const MIN_REVIEW_LIST_WIDTH = 280
+export const MAX_REVIEW_LIST_WIDTH = 2000
+export function normalizeReviewListWidth(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= MIN_REVIEW_LIST_WIDTH && value <= MAX_REVIEW_LIST_WIDTH
+    ? value : DEFAULT_REVIEW_LIST_WIDTH
+}
+
+export const DEFAULT_REVIEW_FOLDER_WIDTH = 176
+export const MIN_REVIEW_FOLDER_WIDTH = 160
+export const MAX_REVIEW_FOLDER_WIDTH = 260
+export function normalizeReviewFolderWidth(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= MIN_REVIEW_FOLDER_WIDTH && value <= MAX_REVIEW_FOLDER_WIDTH
+    ? value : DEFAULT_REVIEW_FOLDER_WIDTH
+}
 
 const getSystemTheme = (): ResolvedTheme => {
   if (typeof window !== 'undefined' && window.matchMedia) {
@@ -58,6 +78,17 @@ export interface UIState {
 
   currentView: WorkspaceView
   reviewSessionId: string | null
+  reviewDocumentOpen: boolean
+  setReviewSelection: (id: string | null) => void
+  reviewConversation: { sessionId: string; conversationId: string } | null
+  setReviewConversation: (sessionId: string, conversationId: string) => void
+  reviewFolder: ReviewFolder
+  reviewListWidth: number
+  setReviewListWidth: (width: number) => void
+  reviewFolderWidth: number
+  setReviewFolderWidth: (width: number) => void
+  setReviewFolder: (folder: ReviewFolder) => void
+  openTopicCreation: (topicId: string, view: 'live' | 'file') => void
   setView: (view: WorkspaceView, reviewSessionId?: string | null) => void
   openReview: (sessionId: string) => void
   backToLive: () => void
@@ -66,7 +97,7 @@ export interface UIState {
   setCommandPaletteOpen: (open: boolean) => void
 }
 
-export const useUIStore = create<UIState>((set, get) => ({
+export const useUIStore = create<UIState>()(persist((set, get) => ({
   language: getSavedLanguage(),
   t: getTranslations(getSavedLanguage()),
   setLanguage: (lang) => {
@@ -94,9 +125,39 @@ export const useUIStore = create<UIState>((set, get) => ({
   },
   currentView: 'live',
   reviewSessionId: null,
-  setView: (view, reviewSessionId = null) => set({ currentView: view, reviewSessionId }),
-  openReview: (sessionId) => set({ currentView: 'review', reviewSessionId: sessionId }),
-  backToLive: () => set({ currentView: 'live', reviewSessionId: null }),
+  reviewDocumentOpen: false,
+  setReviewSelection: (id) => set({ reviewSessionId: id }),
+  reviewConversation: null,
+  setReviewConversation: (sessionId, conversationId) => set({ reviewConversation: { sessionId, conversationId } }),
+  reviewFolder: { kind: 'all' },
+  reviewListWidth: DEFAULT_REVIEW_LIST_WIDTH,
+  setReviewListWidth: (width) => set({ reviewListWidth: normalizeReviewListWidth(width) }),
+  reviewFolderWidth: DEFAULT_REVIEW_FOLDER_WIDTH,
+  setReviewFolderWidth: (width) => set({ reviewFolderWidth: normalizeReviewFolderWidth(width) }),
+  setReviewFolder: (reviewFolder) => set({ reviewFolder }),
+  setView: (view, reviewSessionId = null) => {
+    if (view === 'live' || view === 'file') useTopicStore.getState().clearActiveTopic()
+    const selected = useTopicStore.getState().selectedTopicId
+    set({ currentView: view === 'topics' ? 'review' : view, reviewSessionId, reviewDocumentOpen: Boolean(reviewSessionId),
+      ...(view === 'topics' ? { reviewFolder: selected ? { kind: 'topic' as const, topicId: selected } : { kind: 'all' as const } } : {}),
+    })
+  },
+  openTopicCreation: (topicId, view) => {
+    const topic = useTopicStore.getState().topics.find((item) => item.id === topicId)
+    if (!topic || topic.archivedAt) return
+    useTopicStore.getState().setActiveTopic(topicId)
+    set({ currentView: view, reviewSessionId: null })
+  },
+  openReview: (sessionId) => {
+    if (get().currentView !== 'review' && get().currentView !== 'topics') {
+      useTagStore.getState().setSearchQuery('')
+      useTagStore.getState().clearTagFilter()
+      useTagStore.getState().setSelectedReviewDate(null)
+      set({ reviewFolder: { kind: 'all' } })
+    }
+    set({ currentView: 'review', reviewSessionId: sessionId, reviewDocumentOpen: true })
+  },
+  backToLive: () => get().setView('live'),
 
   commandPaletteOpen: false,
   setCommandPaletteOpen: (open) => set({ commandPaletteOpen: open }),
@@ -121,5 +182,16 @@ export const useUIStore = create<UIState>((set, get) => ({
         }
       })
     }
+  },
+}), {
+  name: 'delive-review-view',
+  partialize: (state) => ({ reviewFolder: state.reviewFolder, reviewListWidth: state.reviewListWidth, reviewFolderWidth: state.reviewFolderWidth }),
+  merge: (persisted, current) => {
+    const folder = (persisted as { reviewFolder?: ReviewFolder } | undefined)?.reviewFolder
+    const reviewFolder: ReviewFolder = folder?.kind === 'unclassified' ? { kind: 'unclassified' }
+      : folder?.kind === 'topic' && typeof folder.topicId === 'string' && folder.topicId ? { kind: 'topic', topicId: folder.topicId } : { kind: 'all' }
+    const width = (persisted as { reviewListWidth?: unknown } | undefined)?.reviewListWidth
+    const folderWidth = (persisted as { reviewFolderWidth?: unknown } | undefined)?.reviewFolderWidth
+    return { ...current, reviewFolder, reviewListWidth: normalizeReviewListWidth(width), reviewFolderWidth: normalizeReviewFolderWidth(folderWidth) }
   },
 }))

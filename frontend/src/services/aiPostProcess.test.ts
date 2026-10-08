@@ -1,5 +1,10 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  askQuestionForSession,
+  askQuestionForSessionStreaming,
+  fetchAvailableModels,
+  generateSessionBriefing,
+  generateSessionMindMap,
   parseAiBriefingResponse,
   parseSessionMindMapResponse,
   parseSessionQaResponse,
@@ -11,12 +16,13 @@ import {
   resolveTranscriptText,
   extractSessionQaStreamChunk,
 } from './aiPostProcess'
-import type { TranscriptSession } from '../types'
+import type { AppSettings, TranscriptSession } from '../types'
 
 describe('aiPostProcess', () => {
   it('ignores non-JSON SSE data frames but surfaces JSON error envelopes', () => {
     expect(extractSessionQaStreamChunk('ping')).toBeUndefined()
     expect(extractSessionQaStreamChunk('{"choices":[{"delta":{"content":"hello"}}]}')).toBe('hello')
+    expect(extractSessionQaStreamChunk('{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}', 'anthropic-compatible')).toBe('hi')
     expect(() => extractSessionQaStreamChunk('{"error":{"message":"invalid token"}}'))
       .toThrow('invalid token')
   })
@@ -189,6 +195,91 @@ describe('aiPostProcess', () => {
       generatedAt: expect.any(Number),
       updatedAt: expect.any(Number),
     })
+  })
+})
+
+describe('aiPostProcess protocol requests', () => {
+  const session = {
+    id: 'protocol-session',
+    title: 'Protocol Session',
+    transcript: 'Discussed the release plan.',
+    createdAt: 1,
+  } as TranscriptSession
+  const settings: AppSettings = {
+    apiKey: '',
+    languageHints: [],
+    aiPostProcess: {
+      enabled: true,
+      provider: 'anthropic-compatible',
+      thinkingMode: 'disabled',
+      baseUrl: 'https://api.example.com/anthropic',
+      apiKey: 'secret',
+      defaultModel: 'claude-test',
+      promptLanguage: 'en',
+    },
+  }
+
+  beforeEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it('uses Anthropic model discovery headers and endpoint', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ data: [{ id: 'claude-test' }] })))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(fetchAvailableModels(settings.aiPostProcess!.baseUrl!, 'secret', 'anthropic-compatible'))
+      .resolves.toEqual(['claude-test'])
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://api.example.com/anthropic/v1/models',
+      expect.objectContaining({ headers: expect.objectContaining({ 'x-api-key': 'secret' }) }),
+    )
+  })
+
+  it('routes briefing, chat, and mind map through Anthropic request and response shapes', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ content: [{ type: 'text', text: '{"summary":"Brief"}' }] })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ content: [{ type: 'text', text: '{"answer":"Answer"}' }] })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ content: [{ type: 'text', text: '{"title":"Map","markdown":"# Map"}' }] })))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(generateSessionBriefing(session, settings)).resolves.toMatchObject({ postProcess: { summary: 'Brief' } })
+    await expect(askQuestionForSession(session, 'What happened?', settings)).resolves.toMatchObject({ answer: 'Answer' })
+    await expect(generateSessionMindMap(session, settings)).resolves.toMatchObject({ mindMap: { title: 'Map' } })
+
+    for (const [, init] of fetchMock.mock.calls) {
+      const body = JSON.parse(init.body as string)
+      expect(body).toMatchObject({
+        max_tokens: 8192,
+        thinking: { type: 'disabled' },
+        messages: [{ role: 'user' }],
+      })
+      expect(body).toHaveProperty('system')
+      expect(body).not.toHaveProperty('temperature')
+    }
+  })
+
+  it('parses Anthropic streaming chat text', async () => {
+    const stream = [
+      'event: content_block_delta',
+      'data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"private"}}',
+      '',
+      'event: content_block_delta',
+      'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"{\\"answer\\":\\"Streamed\\"}"}}',
+      '',
+    ].join('\n')
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(stream, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    })))
+    const onDone = vi.fn()
+    await askQuestionForSessionStreaming(session, 'Question?', settings, {
+      onChunk: vi.fn(),
+      onDone,
+      onError: vi.fn((error) => { throw error }),
+    })
+    expect(onDone).toHaveBeenCalledWith(
+      '{"answer":"Streamed"}',
+      expect.objectContaining({ answer: 'Streamed' }),
+    )
   })
 })
 

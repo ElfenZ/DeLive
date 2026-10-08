@@ -294,15 +294,16 @@ export function TagFilter() {
         return (
           <button
             key={tag.id}
+            title={tag.name}
             onClick={() => toggleTagFilter(tag.id)}
-            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium border
+            className={`inline-flex max-w-full min-w-0 items-center gap-1 px-2 py-0.5 rounded text-xs font-medium border
                       transition-all ${isSelected 
                         ? `${color.bg} ${color.text} border-primary/50 ring-1 ring-primary/20` 
                         : 'bg-muted/50 border-transparent text-muted-foreground hover:bg-muted hover:text-foreground'
                       }`}
           >
-            {tag.name}
-            {isSelected && <X className="w-3 h-3" />}
+            <span className="truncate">{tag.name}</span>
+            {isSelected && <X className="w-3 h-3 shrink-0" />}
           </button>
         )
       })}

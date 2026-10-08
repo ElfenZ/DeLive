@@ -1,7 +1,10 @@
 import { useState, useEffect, useRef } from 'react'
 import { X } from 'lucide-react'
 import { useUIStore } from '../stores/uiStore'
+import { useTopicStore } from '../stores/topicStore'
+import { getProjectSubtreeIds } from '../utils/projectSchema'
 import type { Topic } from '../types'
+import { useDialogFocus } from '../hooks/useDialogFocus'
 
 const EMOJI_PRESETS = [
   '📖', '📚', '🎓', '💼', '🎧', '🎤', '🎵', '📝',
@@ -13,44 +16,47 @@ interface TopicDialogProps {
   open: boolean
   topic?: Topic | null
   onClose: () => void
-  onSave: (name: string, emoji: string, description?: string) => void
+  onSave: (name: string, emoji: string, description?: string, parentId?: string) => void
 }
 
 export function TopicDialog({ open, topic, onClose, onSave }: TopicDialogProps) {
   const { t } = useUIStore()
+  const topics = useTopicStore((state) => state.topics)
   const [name, setName] = useState('')
   const [emoji, setEmoji] = useState(EMOJI_PRESETS[0])
   const [description, setDescription] = useState('')
+  const [parentId, setParentId] = useState('')
+  const [error, setError] = useState('')
   const inputRef = useRef<HTMLInputElement>(null)
+  const dialogRef = useRef<HTMLDivElement>(null)
+  useDialogFocus(open, dialogRef, onClose)
 
   useEffect(() => {
     if (open) {
       setName(topic?.name ?? '')
       setEmoji(topic?.emoji ?? EMOJI_PRESETS[0])
       setDescription(topic?.description ?? '')
+      setParentId(topic?.parentId ?? '')
+      setError('')
       setTimeout(() => inputRef.current?.focus(), 100)
     }
   }, [open, topic])
-
-  useEffect(() => {
-    if (!open) return
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
-    }
-    document.addEventListener('keydown', handleKeyDown)
-    return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [open, onClose])
 
   if (!open) return null
 
   const isEdit = !!topic
   const canSave = name.trim().length > 0
+  const excludedParents = topic ? getProjectSubtreeIds(topics, topic.id) : new Set<string>()
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     if (canSave) {
-      onSave(name.trim(), emoji, description.trim() || undefined)
-      onClose()
+      try {
+        onSave(name.trim(), emoji, description.trim() || undefined, parentId || undefined)
+        onClose()
+      } catch (error) {
+        setError(error instanceof Error ? error.message : String(error))
+      }
     }
   }
 
@@ -61,6 +67,7 @@ export function TopicDialog({ open, topic, onClose, onSave }: TopicDialogProps) 
     >
       <div
         role="dialog"
+        ref={dialogRef}
         aria-modal="true"
         aria-labelledby="topic-dialog-title"
         className="w-full max-w-md rounded-2xl border border-border bg-card text-card-foreground shadow-2xl dark:ring-1 dark:ring-white/[0.08]"
@@ -81,6 +88,14 @@ export function TopicDialog({ open, topic, onClose, onSave }: TopicDialogProps) 
         </div>
 
         <form onSubmit={handleSubmit} className="px-5 py-4 space-y-4">
+          {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
+          <label className="block space-y-1.5 text-sm">
+            <span>{t.topics.parentProject}</span>
+            <select value={parentId} onChange={(event) => setParentId(event.target.value)} className="w-full rounded-lg border border-input bg-background px-3 py-2">
+              <option value="">{t.topics.rootProject}</option>
+              {topics.filter((item) => !excludedParents.has(item.id)).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+            </select>
+          </label>
           <div>
             <label className="block text-sm font-medium text-foreground mb-1.5">{t.topics.topicEmoji}</label>
             <div className="flex flex-wrap gap-1.5">

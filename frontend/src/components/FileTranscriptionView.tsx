@@ -1,7 +1,8 @@
-import { useCallback, useMemo, useState, useEffect } from 'react'
-import { FileAudio, ChevronDown, Check, Cloud, HardDrive, X } from 'lucide-react'
+import { useCallback, useMemo, useState, useEffect, useRef } from 'react'
+import { FileAudio, ChevronDown, Check, Cloud, HardDrive, X, FolderOpen, Trash2 } from 'lucide-react'
 import { createPortal } from 'react-dom'
 import { FileDropZone } from './FileDropZone'
+import { TopicPicker } from './TopicPicker'
 import { FileTranscriptionProgress } from './FileTranscriptionProgress'
 import { useFileTranscription } from '../hooks/useFileTranscription'
 import { useFileTranscriptionStore } from '../stores/fileTranscriptionStore'
@@ -17,9 +18,12 @@ import { MeetingContextEditor } from './MeetingContextEditor'
 import { getDefaultSettings } from '../utils/storageShared'
 import { resolveMeetingContextSnapshot } from '../utils/meetingContext'
 import { createSonioxRecognitionSnapshot, parseSonioxConfig } from '../utils/sonioxConfig'
+import type { MediaArchivedAudio } from '../../../shared/electronApi'
 
 export function FileTranscriptionView() {
-  const { jobs, submitFile, cancelJob, openResult } = useFileTranscription()
+  const { jobs, submitFile, retryJob, reselectOriginal, cancelJob, openResult, revealAudio, deleteAudio, deleteManagedAudio } = useFileTranscription()
+  const reselectInput = useRef<HTMLInputElement>(null)
+  const reselectJobId = useRef<string | undefined>(undefined)
   const removeJob = useFileTranscriptionStore((s) => s.removeJob)
   const { t } = useUIStore()
   const { settings, availableProviders } = useSettingsStore()
@@ -35,17 +39,35 @@ export function FileTranscriptionView() {
   })
   const [isOpen, setIsOpen] = useState(false)
   const [meetingContextOverride, setMeetingContextOverride] = useState<MeetingContextOverride>({ mode: 'inherit' })
+  const [managedAudios, setManagedAudios] = useState<MediaArchivedAudio[]>([])
+  const [managedAudioErrors, setManagedAudioErrors] = useState<string[]>([])
 
   const selectedProvider = fileProviders.find((p) => p.id === selectedProviderId) ?? fileProviders[0]
   const providerConfig = useSettingsStore((s) => s.getProviderConfig(selectedProviderId))
-  const hasApiKey = selectedProviderId === 'cloudflare'
-    ? Boolean(providerConfig?.apiToken && providerConfig?.accountId)
-    : selectedProviderId === 'volc'
-      ? Boolean(providerConfig?.appKey && providerConfig?.accessKey)
-      : Boolean(providerConfig?.apiKey)
+  const hasApiKey = isProviderConfigured(selectedProvider, buildProviderConnectConfig(selectedProvider, providerConfig, settings))
 
   const activeJobs = useFileTranscriptionStore((s) => s.getActiveJobs())
   const isProcessing = activeJobs.length > 0
+  const managedAudioKey = useMemo(
+    () => jobs.map(job => `${job.sessionId || ''}:${job.audioPath || ''}:${job.audioAvailable ? 1 : 0}`).join('|'),
+    [jobs],
+  )
+
+  const refreshManagedAudios = useCallback(async () => {
+    const result = await window.electronAPI?.listMediaAudio()
+    if (!result) return
+    if (result.ok) {
+      setManagedAudios(result.audios || [])
+      setManagedAudioErrors((result.errors || []).map((item) => `${item.sessionId}: ${item.error}`))
+    } else {
+      setManagedAudios([])
+      setManagedAudioErrors([result.error || 'Managed audio storage is unavailable'])
+    }
+  }, [])
+
+  useEffect(() => {
+    void refreshManagedAudios()
+  }, [managedAudioKey, refreshManagedAudios])
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
@@ -60,7 +82,7 @@ export function FileTranscriptionView() {
     setIsOpen(false)
   }
 
-  const handleFilesSelected = useCallback((files: File[]) => {
+  const buildConfig = useCallback((): FileTranscriptionConfig => {
     const rawHints: unknown = providerConfig?.languageHints
     let languageHints: string[] | undefined
     if (Array.isArray(rawHints)) {
@@ -97,7 +119,7 @@ export function FileTranscriptionView() {
       }
     }
 
-    const config: FileTranscriptionConfig = {
+    return {
       provider: selectedProviderId as FileTranscriptionConfig['provider'],
       languageHints: languageHints?.length ? languageHints : undefined,
       enableSpeakerDiarization: Boolean(providerConfig?.enableSpeakerDiarization),
@@ -108,6 +130,10 @@ export function FileTranscriptionView() {
       meetingContext,
       recognitionConfig,
     }
+  }, [meetingContextOverride, providerConfig, selectedProviderId, settings.aiPostProcess?.glossary, settings.meetingContext])
+
+  const handleFilesSelected = useCallback((files: File[]) => {
+    const config = buildConfig()
 
     for (const file of files) {
       submitFile(file, config).catch((err) => {
@@ -115,7 +141,30 @@ export function FileTranscriptionView() {
       })
     }
     setMeetingContextOverride({ mode: 'inherit' })
-  }, [meetingContextOverride, providerConfig, selectedProviderId, settings.aiPostProcess?.glossary, settings.meetingContext, submitFile])
+  }, [buildConfig, submitFile])
+
+  const handleRetry = useCallback((jobId: string) => {
+    retryJob(jobId, buildConfig()).catch((error) => {
+      window.alert(error instanceof Error ? error.message : String(error))
+    })
+  }, [buildConfig, retryJob])
+
+  const handleDeleteAudio = useCallback((jobId: string) => {
+    if (!window.confirm(t.file?.deleteAudioConfirm || 'Delete the extracted local audio? The transcript task record will be kept.')) return
+    deleteAudio(jobId).then((deleted) => {
+      if (!deleted) window.alert(t.file?.deleteAudioFailed || 'Failed to delete the extracted audio.')
+    }).catch((error) => {
+      window.alert(error instanceof Error ? error.message : String(error))
+    })
+  }, [deleteAudio, t.file])
+
+  const handleDeleteManagedAudio = useCallback((audio: MediaArchivedAudio) => {
+    if (!window.confirm(t.file?.deleteAudioConfirm || 'Delete the extracted local audio?')) return
+    void deleteManagedAudio(audio.sessionId).then((deleted) => {
+      if (!deleted) window.alert(t.file?.deleteAudioFailed || 'Failed to delete the extracted audio.')
+      void refreshManagedAudios()
+    })
+  }, [deleteManagedAudio, refreshManagedAudios, t.file])
 
   const getExecutionModeBadge = (provider: ASRProviderInfo): { label: string; className: string } | null => {
     const workloads = provider.capabilities.workloads
@@ -341,18 +390,83 @@ export function FileTranscriptionView() {
         )}
 
         {/* Drop Zone */}
+        <TopicPicker />
         <FileDropZone
           onFilesSelected={handleFilesSelected}
           disabled={!hasApiKey || isProcessing}
         />
 
         {/* Job Progress */}
+        <input
+          ref={reselectInput}
+          type="file"
+          className="hidden"
+          aria-label="Reselect original input"
+          onChange={(event) => {
+            const file = event.target.files?.[0]
+            const jobId = reselectJobId.current
+            event.target.value = ''
+            reselectJobId.current = undefined
+            if (file && jobId) void reselectOriginal(jobId, file).catch((error: unknown) => {
+              window.alert(error instanceof Error ? error.message : String(error))
+            })
+          }}
+        />
         <FileTranscriptionProgress
           jobs={jobs}
           onCancel={cancelJob}
           onOpenResult={openResult}
           onRemove={removeJob}
+          onRetry={handleRetry}
+          onReselectOriginal={(jobId) => {
+            reselectJobId.current = jobId
+            reselectInput.current?.click()
+          }}
+          onRevealAudio={revealAudio}
+          onDeleteAudio={handleDeleteAudio}
         />
+
+        {managedAudioErrors.length > 0 && <div role="alert" className="rounded-lg border border-destructive/30 p-3 text-xs text-destructive">{managedAudioErrors.map((error) => <p key={error}>{error}</p>)}</div>}
+        {managedAudios.length > 0 && !isProcessing && (
+          <details className="rounded-xl border border-border/70 bg-muted/20 p-4">
+            <summary className="cursor-pointer text-sm font-semibold text-foreground">
+              {t.file?.localAudioManager?.(managedAudios.length) || `Local managed audio (${managedAudios.length})`}
+            </summary>
+            <p className="mt-2 text-xs text-muted-foreground">
+              {t.file?.localAudioManagerDesc || 'Audio files stay on this device and are not included in JSON or cloud backups.'}
+            </p>
+            <div className="mt-3 space-y-2">
+              {managedAudios.map((audio) => {
+                const task = jobs.find(job => job.sessionId === audio.sessionId)
+                return (
+                  <div key={audio.sessionId} className="flex items-center gap-2 rounded-lg border border-border bg-background p-2.5">
+                    <FileAudio className="h-4 w-4 text-muted-foreground" />
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm font-medium">{task?.fileName || audio.sessionId}</p>
+                      <p className="text-xs text-muted-foreground">{Math.max(1, Math.round(audio.size / 1024))} KB</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void window.electronAPI?.revealMediaAudio(audio.sessionId)}
+                      className="rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground"
+                      title={t.file?.openAudioFolder || 'Open audio folder'}
+                    >
+                      <FolderOpen className="h-4 w-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteManagedAudio(audio)}
+                      className="rounded-md p-1.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                      title={t.file?.deleteLocalAudio || 'Delete local audio'}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </div>
+                )
+              })}
+            </div>
+          </details>
+        )}
 
         {/* Help */}
         {jobs.length === 0 && (

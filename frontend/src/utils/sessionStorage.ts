@@ -217,6 +217,60 @@ export async function upsertSession(session: TranscriptSession): Promise<void> {
   }
 }
 
+export async function upsertSessionStrict(session: TranscriptSession): Promise<void> {
+  if (!supportsIndexedDb()) {
+    upsertLegacySessionInLocalStorageStrict(session)
+    return
+  }
+  await ensureSessionMigration()
+  await upsertSessionInIndexedDb(session)
+}
+
+const PROJECT_UPGRADE_SNAPSHOT_KEY = 'project_upgrade_v1_snapshot'
+const PROJECT_UPGRADE_COMPLETED_KEY = 'project_upgrade_v1_completed'
+
+export async function migrateProjectSessions(original: TranscriptSession[], upgraded: TranscriptSession[]): Promise<boolean> {
+  const indexed = supportsIndexedDb()
+  const read = async <T>(key: string): Promise<T | undefined> => indexed
+    ? getMetaValue<T>(key)
+    : JSON.parse(localStorage.getItem(`delive_${key}`) || 'null') as T | undefined
+  const write = async (key: string, value: unknown): Promise<void> => {
+    if (indexed) await setMetaValue(key, value)
+    else localStorage.setItem(`delive_${key}`, JSON.stringify(value))
+  }
+  if (await read<boolean>(PROJECT_UPGRADE_COMPLETED_KEY)) return false
+  const savedSnapshot = await read<{ sessions: TranscriptSession[]; topics: string | null }>(PROJECT_UPGRADE_SNAPSHOT_KEY)
+  const requiresUpgrade = original.some((session) => !Array.isArray(session.projectIds) || (session.schemaVersion || 0) < 8)
+  if (!requiresUpgrade && !savedSnapshot) return false
+  const nextById = new Map(upgraded.map((session) => [session.id, session]))
+  if (nextById.size !== original.length || upgraded.length !== original.length) throw new Error('Session ID set changed during project upgrade')
+  for (const session of original) {
+    const next = nextById.get(session.id)
+    if (!next || (session.transcript || '') !== next.transcript
+      || session.correction?.published?.correctedText !== next.correction?.published?.correctedText
+      || session.correction?.legacy?.correctedText !== next.correction?.legacy?.correctedText) {
+      throw new Error('Transcript content changed during project upgrade')
+    }
+  }
+  if (!savedSnapshot) {
+    const snapshot = { sessions: original, topics: localStorage.getItem(STORAGE_KEYS.TOPICS) }
+    await write(PROJECT_UPGRADE_SNAPSHOT_KEY, snapshot)
+    if (JSON.stringify(await read(PROJECT_UPGRADE_SNAPSHOT_KEY)) !== JSON.stringify(snapshot)) {
+      throw new Error('Cannot verify Session upgrade snapshot')
+    }
+  }
+  if (indexed) await upsertSessionsInIndexedDb(upgraded)
+  else upsertLegacySessionsInLocalStorageStrict(upgraded)
+  const persisted = indexed ? await readSessionsFromIndexedDb() : getLegacySessionsFromLocalStorage()
+  const persistedById = new Map(persisted.map((session) => [session.id, session]))
+  if (persistedById.size !== nextById.size || upgraded.some((session) => JSON.stringify(persistedById.get(session.id)) !== JSON.stringify(session))) {
+    throw new Error('Project Session migration read-back failed')
+  }
+  await write(PROJECT_UPGRADE_COMPLETED_KEY, true)
+  if (!await read<boolean>(PROJECT_UPGRADE_COMPLETED_KEY)) throw new Error('Cannot verify Session upgrade completion')
+  return true
+}
+
 export async function upsertSessions(sessions: TranscriptSession[]): Promise<void> {
   const sortedSessions = sortSessions(sessions)
 

@@ -1,10 +1,12 @@
-import { useEffect } from 'react'
+import { useRef } from 'react'
 import { X } from 'lucide-react'
+import { useDialogFocus } from '../hooks/useDialogFocus'
 
 interface ActionDialogAction {
   label: string
   onClick: () => void
   variant?: 'primary' | 'secondary' | 'danger'
+  disabled?: boolean
 }
 
 interface ActionDialogProps {
@@ -28,18 +30,8 @@ export function ActionDialog({
   actions,
   onClose,
 }: ActionDialogProps) {
-  useEffect(() => {
-    if (!open) return undefined
-
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        onClose()
-      }
-    }
-
-    document.addEventListener('keydown', handleKeyDown)
-    return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [onClose, open])
+  const dialogRef = useRef<HTMLDivElement>(null)
+  useDialogFocus(open, dialogRef, onClose)
 
   if (!open) return null
 
@@ -50,6 +42,7 @@ export function ActionDialog({
     >
       <div
         role="dialog"
+        ref={dialogRef}
         aria-modal="true"
         aria-labelledby="action-dialog-title"
         className="w-full max-w-md rounded-2xl border border-border bg-card text-card-foreground shadow-2xl dark:ring-1 dark:ring-white/[0.08]"
@@ -60,7 +53,7 @@ export function ActionDialog({
             <h3 id="action-dialog-title" className="text-base font-semibold tracking-tight text-foreground">
               {title}
             </h3>
-            <p className="text-sm leading-6 text-muted-foreground">
+            <p className="whitespace-pre-line text-sm leading-6 text-muted-foreground">
               {description}
             </p>
           </div>
@@ -80,6 +73,7 @@ export function ActionDialog({
               key={`${action.label}-${index}`}
               type="button"
               onClick={action.onClick}
+              disabled={action.disabled}
               className={`inline-flex h-10 items-center justify-center rounded-lg px-4 text-sm font-medium transition-colors ${
                 actionClassMap[action.variant || 'secondary']
               }`}

@@ -380,6 +380,7 @@ export function useASR(options: UseASROptions = {}) {
             audioMimeType: result.mimeType || 'audio/wav',
             audioFileName: result.fileName || 'source-audio.wav',
             audioSize: result.size,
+            managedAsset: result.managedAsset,
             captureAudioSource,
           }
         }
@@ -432,6 +433,7 @@ export function useASR(options: UseASROptions = {}) {
         audioMimeType: result.mimeType || mimeType,
         audioFileName: result.fileName || fileName,
         audioSize: result.size || blob.size,
+        managedAsset: result.managedAsset,
         captureAudioSource,
       }
     } catch (error) {
@@ -936,9 +938,13 @@ export function useASR(options: UseASROptions = {}) {
 
   // ── 开始录制 ──────────────────────────────────────
 
-  const startRecording = useCallback(async (meetingContextOverride?: MeetingContextOverride) => {
-    if (!transitionRecordingState('starting')) return
+  const startRecording = useCallback(async (meetingContextOverride?: MeetingContextOverride): Promise<boolean> => {
+    if (!transitionRecordingState('starting')) return false
     resetRecordingTimeline()
+
+    const projectSelection = useTopicStore.getState()
+    const projectIds = [...projectSelection.activeProjectIds]
+    const defaultSaveProjectId = projectSelection.defaultSaveProjectId || undefined
 
     const vendorId = (settings.currentVendor || 'soniox') as ASRVendor
     const psm = providerSessionRef.current
@@ -954,7 +960,7 @@ export function useASR(options: UseASROptions = {}) {
     } catch (e) {
       transitionRecordingState('idle')
       options.onError?.((e as Error).message)
-      return
+      return false
     }
 
     captionRef.current.clear()
@@ -991,7 +997,7 @@ export function useASR(options: UseASROptions = {}) {
         options.onError?.('获取音频源失败')
       }
       activeCaptureAudioOptionsRef.current = null
-      return
+      return false
     }
 
     // Phase 2: Prepare archive output behind a closed gate, connect the
@@ -999,6 +1005,8 @@ export function useASR(options: UseASROptions = {}) {
     let sessionId: string | null = null
     try {
       sessionId = startNewSession({
+        projectIds,
+        defaultSaveProjectId,
         captureMode: capture.currentCaptureMode,
         providerId: vendorId,
         meetingContext: setup.meetingContext,
@@ -1042,12 +1050,6 @@ export function useASR(options: UseASROptions = {}) {
       archiveDeliveryEnabledRef.current = true
       if (!transitionRecordingState('recording')) setRecordingState('recording')
 
-      const activeTopicId = useTopicStore.getState().activeTopicId
-      if (activeTopicId) {
-        const sid = useSessionStore.getState().currentSessionId
-        if (sid) useSessionStore.getState().updateSessionTopic(sid, activeTopicId)
-      }
-
       options.onStarted?.()
       recordRuntimeDiagnostic('recording', 'start-complete', {
         providerId: vendorId,
@@ -1055,6 +1057,7 @@ export function useASR(options: UseASROptions = {}) {
         captureMode: capture.currentCaptureMode,
       })
       console.log('[useASR] 录制已开始')
+      return true
     } catch (error) {
       console.error('[useASR] 启动失败:', error)
       await abortSourceAudioArchive()
@@ -1075,6 +1078,7 @@ export function useASR(options: UseASROptions = {}) {
         options.onError?.('启动录制失败')
       }
       activeCaptureAudioOptionsRef.current = null
+      return false
     }
   }, [
     settings,

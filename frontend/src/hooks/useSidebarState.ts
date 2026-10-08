@@ -2,9 +2,14 @@ import { useState, useCallback, useEffect } from 'react'
 
 const STORAGE_KEY = 'sidebar-collapsed'
 
+export const COLLAPSED_SIDEBAR_WIDTH = 56
+export const EXPANDED_SIDEBAR_WIDTH = 176
+export const getSidebarWidth = (collapsed: boolean) => collapsed ? COLLAPSED_SIDEBAR_WIDTH : EXPANDED_SIDEBAR_WIDTH
+export const parseSidebarPreference = (value: string | null) => value !== 'false'
+
 export function useSidebarState() {
   const [collapsed, setCollapsed] = useState(() => {
-    return localStorage.getItem(STORAGE_KEY) === 'true'
+    return parseSidebarPreference(localStorage.getItem(STORAGE_KEY))
   })
 
   const toggle = useCallback(() => {
